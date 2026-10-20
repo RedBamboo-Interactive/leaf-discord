@@ -1,0 +1,408 @@
+# Leaf Discord
+
+Multi-Agent Discord transport for externally scoped Leaf Agent conversations.
+Each configured Agent owns a dedicated Discord application, token, access scope,
+and Gateway runtime. Each allowlisted DM, guild channel, or thread owns one
+isolated binding generation. Discord participants are external requestors, never
+owner delegates.
+
+The plugin owns Discord Gateway/REST delivery, durable inbox/outbox records,
+binding generations, deterministic egress checks, independent Discord avatar profiles,
+and a compact editable progress message for commentary and tool
+activity. The selected Leaf Agent owns the persistent model session and ordered transcript through
+`IExternalAgentConversationProvider`. A separately configured one-shot Sentinel
+AI Session reviews each inbound message for prompt-injection signals before the
+main turn starts.
+
+Discord remains an independently installable extension. Settings contains only its
+backend setup: credentials, runtime, compute, access, intents, and optional presence
+integration. Its conversation browser and Agent behavior editor are contributed to
+Nova's `app-section` slot at `/apps/nova/discord`, so Agent conversations and their
+Discord configuration live with the Agent surface instead of appearing as a standalone
+Leaf app. The former `/apps/leaf-discord` route redirects to the contributed section.
+
+Existing singleton installations migrate to one per-Agent bot Entity without
+changing application IDs, binding IDs, generations, sessions, transcript cursors,
+or durable delivery identities. Discord avatars are explicit bot configuration and
+never follow the Agent Entity's base `avatar` or the optional Outfits extension.
+
+## Set up your own bot
+
+Prerequisites: a running Leaf source installation with Nova installed, plus access
+to its private Settings surface. Each Leaf Agent needs its own Discord application.
+
+1. In the Discord Developer Portal, create an application and add a bot. Copy the
+   application ID and interaction public key from the application's general page,
+   then create or reset the bot token and keep it private.
+2. On the bot page, enable **Message Content Intent**. This is the only privileged
+   intent used in the default `off` context mode. If you later select `active` in
+   Leaf, also enable **Presence Intent**. If you select `roster`, enable both
+   **Presence Intent** and **Server Members Intent**. The code also requests the
+   ordinary Guilds, Guild Messages, Guild Message Reactions, Direct Messages, and,
+   for active context, Guild Voice States intents.
+3. In OAuth2 > URL Generator, select the `bot` and `applications.commands` scopes.
+   For normal bound conversations, grant **View Channels**, **Send Messages**,
+   **Send Messages in Threads**, **Read Message History**, **Attach Files**, and
+   **Add Reactions**. Grant **Create Public Threads** if the Agent will create forum
+   posts and **Manage Messages** if it will pin delivered messages. The optional
+   channel create/edit tools require **Manage Channels**; Commons webhooks and
+   per-channel avatar delivery require **Manage Webhooks**. Open the generated URL
+   and invite the bot to the server you own.
+4. In Leaf Settings > Discord, choose **Add bot**. Enter the application ID,
+   interaction public key, and bot token; select the Leaf Agent and quality modes;
+   then create the configuration. The token is stored as an encrypted Entity secret
+   and is never returned by the plugin API. Add exact Discord user IDs to the
+   **DM allowlist** to permit those users to open or use direct-message bindings.
+   Add exact user IDs to the **Clear allowlist** to permit those users to run
+   `/clear`, which starts a fresh conversation generation. Finally enable the bot.
+5. Bind each guild text channel explicitly while authenticated to Leaf. Get the bot
+   Entity ID from `GET /api/apps/leaf-discord/bots`, list usable channels with
+   `GET /api/apps/leaf-discord/bots/{botEntityId}/guild-channels`, then create or
+   reuse the binding:
+
+   ```http
+   POST /api/apps/leaf-discord/bots/{botEntityId}/bindings
+   Content-Type: application/json
+
+   {"guildId":"<guild snowflake>","channelId":"<channel snowflake>"}
+   ```
+
+6. Verify that Settings reports **connected** and shows the bot user and guild
+   count. `GET /api/apps/leaf-discord/bots/{botEntityId}/commands` should report the
+   core commands as registered. In a bound channel, `/status` reports transport and
+   binding health. A missing application ID or token leaves the runtime in
+   `not-configured` with an explicit settings error instead of starting it.
+
+## Security boundary
+
+- The primary session has the selected Agent's normal workspace and tools so it can perform real
+  troubleshooting. Discord participants do not become Leaf users, operators, or
+  delegates for the installation owner.
+- Messages, attachments, web pages, logs, and tool results remain untrusted data.
+- Primary and Sentinel quality modes are independently configurable; their provider,
+  model and effort may use Codex, Claude, OpenCode, or another compatible RedCompute provider.
+- The Sentinel is isolated, read-only, requests no network, and has no Leaf execution
+  credential or writable private workspace. Provider-native tool availability is not the
+  security boundary. Its verdict is advisory; the selected Agent remains responsible for every action.
+- The selected Agent must not disclose its owner's personal information or private context, and
+  consequential actions on the owner's behalf require confirmation on a private Leaf surface.
+- The bot token is a RedLeaf secret field and is never returned by plugin APIs.
+
+## Optional guild context
+
+Each bot has an independent presence-context mode:
+
+- `off` is the default and requests no presence or member data.
+- `active` adds bounded online status, activity (including game or Spotify details), and
+  voice-channel context. Enable **Presence Intent** for that application in the Discord
+  Developer Portal before selecting it.
+- `roster` also includes cached offline members, capped at 100 human members per turn.
+  Enable both **Presence Intent** and **Server Members Intent** first.
+
+The bridge excludes bots, labels this snapshot as untrusted social context, and captures it
+with the inbound delivery so retries see the same facts. Discord does not expose who is
+currently reading a text channel, and invisible users appear offline.
+
+Guild turns always include a bounded map of the categories, channels, forums, active
+threads, topics, and forum tags visible to that bot. This map is navigation context, not a
+merged transcript.
+
+The full map is only sent when the session needs it: on the first guild turn of a binding
+generation (after creation or `/clear`), whenever the map's content hash changes, and again
+after 25 turns so model-side context compaction cannot silently drop it. Other turns replace
+`server_map` with a compact reference to the map the session already holds:
+
+```json
+{"schema":"leaf-discord-guild-map-ref/v1","unchanged":true,"hash":"<16 hex>","turns_since_full":3,"refresh":"GET /api/apps/leaf-discord/guild/context"}
+```
+
+Full maps carry the same `hash`. The hash is SHA-256 over a key-sorted serialization that
+ignores `captured_at`. The last disclosed hash and turn counter are stored durably on the
+binding and recorded only after a turn is handed to the session, so a filtered, duplicate, or
+failed turn never hides a change. The inbound delivery keeps the full captured map, so a retry
+re-plans against what the session actually holds. Presence members are unaffected.
+
+A bound Discord Agent session can refresh the map and inspect relevant history inside its own
+application and guild:
+
+```text
+GET /api/apps/leaf-discord/guild/context
+GET /api/apps/leaf-discord/guild/channels/{channelId}/messages?limit=50
+GET /api/apps/leaf-discord/guild/forums/{forumId}/posts?limit=50&includeArchived=true
+GET /api/apps/leaf-discord/guild/forums/{forumId}/posts/{postId}/messages?limit=50
+```
+
+These routes require the current signed external-conversation session. The source binding
+must be enabled and match the exact session, owner, and Agent. Targets are then resolved only
+inside the source binding's guild and are limited to history visible to the same bot. DMs,
+other applications, and other guilds cannot use this path. Returned Discord structure and
+content are explicitly untrusted.
+
+Discord forum posts are Discord thread channels. The first inbound message in a human-created
+post therefore creates or reuses a normal `thread` binding with the forum as its parent. That
+post gets its own persistent Agent session and durable delivery stream, and replies use the
+same channel-ID transport as ordinary threads. This lets a public conversation move into a
+focused workstream without losing the rest of the server as navigable context.
+
+Each bot may also opt into a private owner feed for the optional Presence extension.
+The owner is resolved only through the bot's canonical Leaf owner and that user's exact
+`discord_user_id`. Only guilds with an enabled binding for that bot contribute data.
+Leaf Discord publishes a bounded, expiring game/music/voice observation; Presence remains
+the authority that composes it into Nova context and LIVE. The feed is off by default and
+requires `active` or `roster` guild context.
+
+## Agent behavior
+
+Each Discord bot has a versioned `leaf-discord-behavior` Entity for its safe default and
+DM default, plus optional overrides for a server, channel/forum/post, or an existing DM.
+Behavior inheritance is deterministic:
+
+- Guild channels and posts: exact channel or post, parent channel or forum, server, Agent default.
+- Direct messages: exact DM, DM default, Agent default.
+
+Participation is structured rather than buried in prompt prose: `direct` requires a mention
+or reply in guilds, `selective` lets the Agent see each message and decline with no Discord
+reply, `participate` normally answers each human message, and `context_only` starts no Agent
+turn. Prompt text lives in a separately versioned `leaf-discord-prompt` Entity referenced by
+the behavior Entity. It describes tone, purpose, topical boundaries, and off-topic redirection.
+
+The selected Agent's generated workspace remains authoritative for identity, capabilities,
+memory, Skills, privacy, and action authority. Leaf Discord supplies the resolved behavior as
+a separate trusted owner-configuration block on each admitted turn. Discord-authored names,
+topics, and messages stay inside the untrusted envelope. The resolved behavior snapshot is
+stored with the inbound delivery, so a retry cannot silently adopt a newer configuration.
+
+Owners edit this in Nova's Discord tab. The editor shows the Agent, the live permission-filtered
+server/channel/forum/post map that bot can see, inherited participation at every scope, and the
+existing DM conversations eligible for overrides.
+
+## Owner-created guild bindings
+
+Owners and administrators can inspect command registration without changing Discord:
+
+```text
+GET /api/apps/leaf-discord/bots/{botEntityId}/commands
+```
+
+This uses the selected bot's existing connected REST client to read authoritative global
+application commands. It applies the same owner/admin and bot ownership checks as the
+guild-channel management route. It returns only the bot/application identity, matching
+explicit handler count, expected core and matching contributed command names with their
+registration flags, actual command names/types/contexts, and missing expected names.
+`expected_commands_missing` means at least one expected slash command is absent;
+`no_matching_explicit_handlers` means all core commands exist but no loaded explicit handler
+matches this bot and Agent; `remote_present` means all expected commands exist and at least
+one explicit handler matches. Inspect `expected` and `registered` for the specific command.
+Contexts are Discord's returned values; `null` preserves an omitted context list.
+Remote presence does not prove visibility in a particular Discord client or guild.
+
+Missing configuration returns 404, disconnected or mismatched identity returns a sanitized
+503 `discord_bot_unavailable`, and a failed Discord read returns a sanitized 502
+`discord_commands_read_failed`. No token, command descriptions/options, raw responses, or
+exception details are returned or logged by this diagnostic. It never registers commands,
+executes explicit actions, or starts/reconnects a client.
+
+An authenticated installation owner can discover the text channels a connected bot can
+actually use:
+
+```text
+GET /api/apps/leaf-discord/bots/{botEntityId}/guild-channels
+```
+
+The response is limited to guild text channels where that bot has both `ViewChannel` and
+`SendMessages`. Each item includes stable guild/channel IDs and names plus any existing
+binding Entity ID and session ID.
+
+The same owner can create or reuse one binding and initialize its durable Agent session:
+
+```text
+POST /api/apps/leaf-discord/bots/{botEntityId}/bindings
+Content-Type: application/json
+
+{
+  "guildId": "<Discord guild snowflake>",
+  "channelId": "<Discord text-channel snowflake>"
+}
+```
+
+The route resolves the channel through the selected bot's live Gateway cache; callers cannot
+supply names, Agent IDs, ownership, audience profiles, or quality modes. It refuses another
+owner's bot and channels the bot cannot view or send to. Repeating the same request reuses the
+existing application/channel binding and session. Creating a binding does not send a Discord
+message.
+
+From a signed private Nova Agent discussion, the bot's owner can also ask that Agent
+to edit reversible guild-channel metadata through stable IDs returned by navigation:
+
+```text
+PATCH /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels/{channelId}
+Content-Type: application/json
+
+{
+  "name": "new-channel-name",
+  "topic": "Updated channel topic",
+  "parentCategoryId": "<category snowflake>",
+  "position": 3,
+  "nsfw": false,
+  "slowModeSeconds": 0
+}
+```
+
+Every property is optional, but at least one change is required. `clearTopic` and
+`clearParentCategory` explicitly clear nullable values. The route requires the exact
+enabled Agent bot and owner, a private Leaf execution identity, a bot-visible target in
+the named guild, and Discord's **Manage Channels** permission. It supports text, forum,
+voice, stage, and category channels; incompatible fields fail closed. Successful renames
+also refresh an existing Leaf Discord binding's display metadata without rotating its
+generation or Agent session.
+
+Permission overwrites are deliberately outside this capability because they change who
+can see or use a channel. They require a separate, explicit access-management contract.
+
+The same signed private Nova Agent boundary can create a public text channel without
+permission overwrites:
+
+```text
+POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels
+Content-Type: application/json
+
+{
+  "name": "showcase",
+  "topic": "Share projects built with Leaf and Nova.",
+  "parentCategoryId": "<category snowflake>",
+  "position": 5,
+  "nsfw": false,
+  "slowModeSeconds": 0
+}
+```
+
+The route requires the same exact Agent/owner match and Discord **Manage Channels**
+permission as channel editing. It creates only ordinary text channels and inherits the
+selected category's permissions; it cannot create or alter permission overwrites. Use the
+existing binding route afterward when Nova should participate in the new channel.
+
+Nova Commons is a separate, optional host-only path. Fresh installations have no
+relay URL and an empty guild allowlist. Once an owner explicitly configures both,
+messages in an allowlisted guild are diverted before binding lookup: they can never
+create or enter a native Nova Agent session, and any old/manual binding for that
+guild is barred from outbound delivery. The host durably forwards human messages,
+webhook echoes, stop reactions, and the guild-scoped `/ask`, `/pause`, and `/resume`
+commands to the configured HTTPS relay.
+
+The bot owner or local administrator configures the relay without receiving secrets
+back in a response:
+
+```text
+GET /api/apps/leaf-discord/bots/{botEntityId}/commons
+PUT /api/apps/leaf-discord/bots/{botEntityId}/commons
+```
+
+`host_credential` and the channel-to-webhook URL map are encrypted Entity secret
+fields. The safe view exposes only `hostCredentialConfigured` and webhook channel
+IDs. A signed private Nova Agent can create a forum with the same ownership and
+Manage Channels checks as text-channel creation:
+
+```text
+POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/forums
+```
+
+For an allowlisted text or forum channel, the host creates or reuses one managed
+webhook and stores its URL without returning it:
+
+```text
+POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels/{channelId}/commons-webhook
+POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels/{channelId}/commons-webhook/install-secret
+```
+
+The second route is a one-shot, owner-authorized operation. It writes the encrypted
+URL directly to `wrangler secret put --env lab` over stdin; stdout, stderr, and the
+URL are not returned. Commons webhooks are never used by the native Nova delivery
+path.
+
+## Avatar profiles
+
+An authenticated installation owner can set each Discord bot's default avatar from a
+canonical RedLeaf image Asset, independently of the Agent's Leaf avatar:
+
+```text
+PUT    /api/apps/leaf-discord/bots/{botEntityId}/avatar
+DELETE /api/apps/leaf-discord/bots/{botEntityId}/avatar
+
+{ "assetId": "<RedLeaf Asset ID or /api/assets/... path>" }
+```
+
+A guild-native member avatar can override that default for one server:
+
+```text
+PUT    /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/avatar
+DELETE /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/avatar
+```
+
+Finally, an existing guild-channel binding can opt into its own avatar:
+
+```text
+PUT    /api/apps/leaf-discord/bindings/{bindingEntityId}/avatar
+DELETE /api/apps/leaf-discord/bindings/{bindingEntityId}/avatar
+```
+
+Discord has no native per-channel bot avatar. Leaf Discord therefore creates one managed
+incoming webhook only for a binding with an explicit channel avatar. That binding's outbound
+messages use the webhook identity; deleting the override removes the webhook and returns the
+binding to normal bot delivery. Other bindings remain on the native bot transport and retain
+the enforced-nonce recovery path. The bot needs Discord's **Manage Webhooks** permission in
+that channel. Webhook execution has no Discord nonce field, so an opted-in channel does not
+have the native path's crash-recovery deduplication guarantee.
+
+
+## Agent delivery
+
+The bridge has two authenticated proactive paths. A bound Discord Agent session may open or
+reuse an allowlisted DM through `POST /outreach/dm`. A private Leaf Agent discussion may
+address an existing owned DM, guild channel, or thread through
+`POST /bindings/{entityId}/messages`. One exact Nova Automation may use that same route only
+when its Entity ID appears in the binding's `authorized_automation_ids`; the signed actor,
+beneficiary, binding owner, and Agent must still match, and external-conversation contexts are
+rejected. The route never creates or clears a binding or Agent session; it appends an assistant
+turn to that session's canonical transcript and uses the normal idempotent Discord outbox.
+For an image, `content` keeps the canonical Markdown, while `deliveryContent` supplies the
+Discord text and `outputAssets` supplies canonical RedLeaf Asset IDs plus descriptions. This
+keeps the transcript faithful while ensuring the immediate outreach outbox uses multipart
+attachments instead of sending private Asset Markdown as text:
+
+```json
+{
+  "content": "A quiet corner.\n\n![Reading nook](/api/assets/example.png)",
+  "deliveryContent": "A quiet corner.",
+  "outputAssets": [
+    { "assetId": "example.png", "description": "Reading nook" }
+  ],
+  "idempotencyKey": "stable-exact-retry-key"
+}
+```
+
+The same signed private-Nova or explicitly binding-authorized Automation identity can
+correct its own existing delivery through these narrowly scoped routes:
+
+```text
+POST   /bindings/{entityId}/messages/{messageUid}/edit
+DELETE /bindings/{entityId}/messages/{messageUid}
+```
+
+The edit body accepts optional `content`, `deliveryContent`, and `outputAssets`; at least one
+must be present. Omitted text or attachments remain unchanged, while an explicit empty
+`outputAssets` array removes attachments. Both routes resolve only outbound message delivery
+rows for the binding's current generation and canonical message UID. Inbound messages,
+another binding or generation, progress messages, and arbitrary Discord IDs are never valid
+targets. Corrections pass through the ordinary Discord egress guard. Successful edits and
+deletions set delivery state to `edited` or `deleted` with an audit timestamp; repeated deletes
+return success without another Discord request.
+
+## Development
+
+```powershell
+dotnet restore src/Leaf.Plugins.LeafDiscord/Leaf.Plugins.LeafDiscord.csproj --locked-mode -p:LeafSdkProject=<path-to-Leaf.Sdk.csproj>
+dotnet build src/Leaf.Plugins.LeafDiscord/Leaf.Plugins.LeafDiscord.csproj -c Release --no-restore -p:LeafSdkProject=<path-to-Leaf.Sdk.csproj>
+corepack pnpm --dir web install --frozen-lockfile
+corepack pnpm --dir web run build:pkg
+./build-leafpkg.ps1
+```

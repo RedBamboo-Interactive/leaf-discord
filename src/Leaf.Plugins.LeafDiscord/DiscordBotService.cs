@@ -1,0 +1,3341 @@
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json.Nodes;
+using Discord;
+using Discord.Net;
+using Discord.WebSocket;
+using Leaf.Sdk.Services;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace Leaf.Plugins.LeafDiscord;
+
+public sealed record DiscordBotStatus(
+    string State,
+    bool Configured,
+    bool Enabled,
+    string? BotUser,
+    int Guilds,
+    DateTimeOffset? ConnectedAt,
+    string? LastError)
+{
+    public Guid BotId { get; init; }
+    public string ApplicationId { get; init; } = "";
+    public string AgentId { get; init; } = "";
+    public string? AgentName { get; init; }
+    public string? AgentAvatarUrl { get; init; }
+    public string? ProfileWarning { get; init; }
+}
+
+public sealed record DiscordDirectMessageResult(
+    DiscordBinding Binding,
+    string MessageUid);
+
+public sealed record DiscordMessageMutationResult(
+    string MessageUid,
+    IReadOnlyList<string> DiscordMessageIds,
+    int ChangedCount);
+
+public sealed record DiscordUserProfile(
+    string ExternalId,
+    string DisplayName,
+    string Username,
+    string AvatarUrl);
+
+public sealed record DiscordGuildChannel(
+    string GuildId,
+    string GuildName,
+    string ChannelId,
+    string ChannelName);
+
+public sealed record DiscordCommonsWebhookResult(
+    string GuildId,
+    string ChannelId,
+    string ChannelName,
+    string Kind,
+    bool Reused);
+
+public sealed record DiscordForumPostResult(
+    DiscordBinding Binding,
+    string MessageUid,
+    string GuildId,
+    string ForumId,
+    string PostId,
+    string Title);
+
+internal sealed record DiscordAvatarPayload(
+    string AssetId, string DataUri, string Fingerprint);
+
+/// <summary>
+/// Supervises one isolated Discord Gateway runtime per configured Agent bot.
+/// Bindings route by immutable Discord application ID, never by whichever client
+/// happened to connect first.
+/// </summary>
+public sealed class DiscordBotService(
+    DiscordBotConfigurationStore configurations,
+    DiscordBindingStore bindings,
+    DiscordBehaviorStore behaviors,
+    DiscordDeliveryStore deliveries,
+    DiscordConversationCoordinator conversations,
+    DiscordAgentResolver agents,
+    DiscordAttachmentIngestor attachmentIngestor,
+    DiscordRestTransport rest,
+    DiscordTypingLeases typing,
+    DiscordOwnerPresencePublisher ownerPresence,
+    DiscordCommonsRelayService commons,
+    DiscordCommonsConfigurationStore commonsConfigurations,
+    IAssets assets,
+    ILoggerFactory loggerFactory,
+    IEnumerable<IDiscordExplicitAction> explicitActions) : IAsyncDisposable
+{
+    private readonly SemaphoreSlim lifecycle = new(1, 1);
+    private readonly ConcurrentDictionary<Guid, DiscordBotRuntime> runtimes = new();
+
+    public async Task<IReadOnlyList<DiscordBotStatus>> GetStatusesAsync(
+        CancellationToken ct = default)
+    {
+        var configs = await configurations.ListAsync(ct);
+        var result = new List<DiscordBotStatus>(configs.Count);
+        foreach (var config in configs)
+        {
+            var status = runtimes.TryGetValue(config.EntityId, out var runtime)
+                ? await runtime.GetStatusAsync(ct)
+                : new DiscordBotStatus(
+                    config.Enabled && DescribeConfigurationIssue(config) is not null
+                        ? "not-configured"
+                        : config.Enabled ? "stopped" : "disabled",
+                    !string.IsNullOrWhiteSpace(config.BotToken),
+                    config.Enabled,
+                    null,
+                    0,
+                    null,
+                    config.Enabled ? DescribeConfigurationIssue(config) : null);
+            var agent = await agents.ResolveAsync(config.AgentId, ct);
+            result.Add(status with
+            {
+                BotId = config.EntityId,
+                ApplicationId = config.ApplicationId,
+                AgentId = config.AgentId,
+                AgentName = agent?.Name,
+                AgentAvatarUrl = agent is null ? null : JsonRead.String(agent.Data, "avatar"),
+            });
+        }
+        return result;
+    }
+
+    public async Task<DiscordBotStatus> GetStatusAsync(CancellationToken ct = default)
+        => (await GetStatusesAsync(ct)).FirstOrDefault()
+           ?? new DiscordBotStatus("not-configured", false, false, null, 0, null, null);
+
+    internal static string? DescribeConfigurationIssue(LeafDiscordConfig config)
+    {
+        var missing = new List<string>();
+        if (string.IsNullOrWhiteSpace(config.ApplicationId)) missing.Add("application ID");
+        if (string.IsNullOrWhiteSpace(config.BotToken)) missing.Add("bot token");
+        if (string.IsNullOrWhiteSpace(config.AgentId)) missing.Add("Agent");
+        return missing.Count == 0
+            ? null
+            : $"Discord bot cannot start because the {string.Join(", ", missing)} "
+              + (missing.Count == 1 ? "is" : "are") + " missing.";
+    }
+
+    public async Task StartAsync(CancellationToken stoppingToken)
+    {
+        await lifecycle.WaitAsync(stoppingToken);
+        try
+        {
+            foreach (var config in await configurations.ListAsync(stoppingToken))
+                await GetOrCreateRuntime(config).StartAsync(stoppingToken);
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    public async Task RestartAsync(CancellationToken stoppingToken)
+    {
+        await lifecycle.WaitAsync(stoppingToken);
+        try
+        {
+            foreach (var runtime in runtimes.Values)
+                await runtime.StopAsync();
+            foreach (var config in await configurations.ListAsync(stoppingToken))
+                await GetOrCreateRuntime(config).StartAsync(stoppingToken);
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    public async Task RestartAsync(Guid botId, CancellationToken stoppingToken)
+    {
+        var config = await configurations.GetAsync(botId, stoppingToken)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        await lifecycle.WaitAsync(stoppingToken);
+        try
+        {
+            var runtime = GetOrCreateRuntime(config);
+            await runtime.StopAsync();
+            await runtime.StartAsync(stoppingToken);
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    public async Task<DiscordUserProfile?> GetUserProfileAsync(
+        DiscordBinding binding, string externalId, CancellationToken ct = default)
+    {
+        try
+        {
+            return await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+                .GetUserProfileAsync(externalId, ct);
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Reads the author of one message in the binding's own Discord conversation. Used only
+    /// for transcript turns admitted before the bridge retained inbound attribution.
+    /// </summary>
+    public async Task<DiscordInboundAttribution?> GetMessageAttributionAsync(
+        DiscordBinding binding, string messageId, CancellationToken ct = default)
+    {
+        try
+        {
+            return await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+                .GetMessageAttributionAsync(binding, messageId, ct);
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    public async Task<string?> GetConversationIconUrlAsync(
+        DiscordBinding binding, CancellationToken ct = default)
+    {
+        try
+        {
+            return await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+                .GetConversationIconUrlAsync(binding, ct);
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    public async Task<DiscordDirectMessageResult> SendDirectMessageAsync(
+        DiscordBinding source,
+        string recipientUserId,
+        string content,
+        string idempotencyKey,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(source.ApplicationId, ct))
+            .SendDirectMessageAsync(recipientUserId, content, idempotencyKey, ct);
+
+    public async Task<DiscordDirectMessageResult> SendExistingBindingMessageAsync(
+        DiscordBinding binding,
+        string content,
+        string idempotencyKey,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .SendExistingBindingMessageAsync(binding, content, idempotencyKey, ct);
+
+    public async Task<DiscordDirectMessageResult> SendExistingBindingMessageAsync(
+        DiscordBinding binding,
+        string content,
+        string idempotencyKey,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .SendExistingBindingMessageAsync(
+                binding, content, idempotencyKey, deliveryContent, outputAssets, ct);
+
+    public async Task AddReactionAsync(
+        DiscordBinding binding, string messageId, string emoji, CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .AddReactionAsync(binding, messageId, emoji, ct);
+
+    public async Task<string> PinExistingBindingMessageAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .PinExistingBindingMessageAsync(binding, messageUid, ct);
+
+    public async Task<DiscordMessageMutationResult> EditExistingBindingMessageAsync(
+        DiscordBinding binding,
+        string messageUid,
+        string? content,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset>? outputAssets,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .EditExistingBindingMessageAsync(
+                binding, messageUid, content, deliveryContent, outputAssets, ct);
+
+    public async Task<DiscordMessageMutationResult> DeleteExistingBindingMessageAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .DeleteExistingBindingMessageAsync(binding, messageUid, ct);
+
+    public async Task<DiscordCommandReport> GetCommandsAsync(
+        Guid botId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(botId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.GetCommandsAsync(config, ct);
+    }
+
+    public async Task<IReadOnlyList<DiscordGuildChannel>> ListGuildChannelsAsync(
+        Guid botId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return runtime.ListGuildChannels();
+    }
+
+    public async Task<IReadOnlyList<JsonObject>> ListGuildNavigationAsync(
+        Guid botId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return runtime.ListGuildNavigation();
+    }
+
+    public async Task<DiscordForumPostResult> CreateForumPostAsync(
+        Guid botId,
+        string guildId,
+        string forumId,
+        string title,
+        string content,
+        string idempotencyKey,
+        string ownerUserId,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.CreateForumPostAsync(
+            guildId, forumId, title, content, idempotencyKey, ownerUserId, ct);
+    }
+
+    public async Task<DiscordChannelEditResult> EditGuildChannelAsync(
+        Guid botId,
+        string guildId,
+        string channelId,
+        DiscordChannelEditRequest request,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.EditGuildChannelAsync(
+            guildId, channelId, request, ct);
+    }
+
+    public async Task<DiscordGuildChannelCreateResult> CreateGuildTextChannelAsync(
+        Guid botId,
+        string guildId,
+        DiscordGuildChannelCreateRequest request,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.CreateGuildTextChannelAsync(guildId, request, ct);
+    }
+
+    public async Task<DiscordGuildChannelCreateResult> CreateGuildForumChannelAsync(
+        Guid botId,
+        string guildId,
+        DiscordGuildForumChannelCreateRequest request,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.CreateGuildForumChannelAsync(guildId, request, ct);
+    }
+
+    public async Task<DiscordCommonsWebhookResult> EnsureCommonsWebhookAsync(
+        Guid botId,
+        string guildId,
+        string channelId,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.EnsureCommonsWebhookAsync(guildId, channelId, ct);
+    }
+
+    public async Task<DiscordBinding> CreateGuildChannelBindingAsync(
+        Guid botId, string guildId, string channelId, string ownerUserId,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        if (await commons.IsCommonsGuildAsync(botId, guildId, ct))
+            throw new UnauthorizedAccessException(
+                "Native Agent bindings are disabled in Commons guilds.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        var channel = runtime.ResolveGuildChannel(guildId, channelId);
+        var behavior = await behaviors.ResolveAsync(
+            config, "guild_channel", channel.GuildId, channel.ChannelId,
+            null, DiscordResponseModes.Direct, ct);
+        var binding = await bindings.GetOrCreateAsync(new CreateDiscordBinding(
+            config.ApplicationId, channel.ChannelId, "guild_channel", channel.GuildId, null,
+            config.AgentId, ownerUserId, config.AudienceProfile, behavior.ResponseMode,
+            channel.ChannelName, channel.GuildName, null,
+            config.SessionQualityMode, config.SentinelQualityMode), ct);
+        return await conversations.EnsureReadyAsync(binding, ct);
+    }
+
+    internal async Task<JsonObject> GetGuildNavigationAsync(
+        DiscordBinding source, CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(source.ApplicationId, ct))
+            .GetGuildNavigationAsync(source, ct);
+
+    internal async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
+        DiscordBinding source, string channelId, int limit,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(source.ApplicationId, ct))
+            .ReadGuildChannelMessagesAsync(source, channelId, limit, ct);
+
+    internal async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
+        Guid botId, string guildId, string channelId, int limit,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        return await (await ResolveRuntimeAsync(config.ApplicationId, ct))
+            .ReadGuildChannelMessagesAsync(guildId, channelId, limit, ct);
+    }
+
+    internal async Task<IReadOnlyList<DiscordForumPostView>> ListForumPostsAsync(
+        DiscordBinding source, string forumId, int limit, bool includeArchived,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(source.ApplicationId, ct))
+            .ListForumPostsAsync(source, forumId, limit, includeArchived, ct);
+
+    internal async Task<IReadOnlyList<DiscordGuildMessageView>> ReadForumPostMessagesAsync(
+        DiscordBinding source, string forumId, string postId, int limit,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(source.ApplicationId, ct))
+            .ReadForumPostMessagesAsync(source, forumId, postId, limit, ct);
+
+    public async Task<LeafDiscordConfig> SetBotAvatarAsync(
+        Guid botId, string? avatarAssetId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.SetBotAvatarAsync(avatarAssetId, ct);
+    }
+
+    public async Task<LeafDiscordConfig> SetGuildAvatarAsync(
+        Guid botId, string guildId, string? avatarAssetId,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.SetGuildAvatarAsync(guildId, avatarAssetId, ct);
+    }
+
+    public async Task<DiscordBinding> SetChannelAvatarAsync(
+        DiscordBinding binding, string? avatarAssetId,
+        CancellationToken ct = default)
+        => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
+            .SetChannelAvatarAsync(binding, avatarAssetId, ct);
+
+    public async Task StopAsync()
+    {
+        await lifecycle.WaitAsync();
+        try
+        {
+            foreach (var runtime in runtimes.Values)
+                await runtime.StopAsync();
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    private DiscordBotRuntime GetOrCreateRuntime(LeafDiscordConfig config)
+        => runtimes.GetOrAdd(config.EntityId, id => new DiscordBotRuntime(
+            id,
+            configurations,
+            bindings,
+            behaviors,
+            deliveries,
+            conversations,
+            agents,
+            attachmentIngestor,
+            rest,
+            typing,
+            ownerPresence,
+            commons,
+            commonsConfigurations,
+            assets,
+            loggerFactory.CreateLogger<DiscordBotRuntime>(),
+            explicitActions));
+
+    private async Task<DiscordBotRuntime> ResolveRuntimeAsync(
+        string applicationId, CancellationToken ct)
+    {
+        var config = await configurations.FindByApplicationIdAsync(applicationId, ct)
+            ?? throw new InvalidOperationException(
+                $"Discord application '{applicationId}' is not configured.");
+        return runtimes.TryGetValue(config.EntityId, out var runtime)
+            ? runtime
+            : throw new InvalidOperationException(
+                $"Discord bot for application '{applicationId}' is not running.");
+    }
+
+    internal static void ValidateApplicationId(string configuredApplicationId, ulong botUserId)
+        => DiscordBotRuntime.ValidateApplicationId(configuredApplicationId, botUserId);
+
+    internal static DiscordTransportStatus ReconcileTransportStatus(
+        string cachedState, string? cachedError, ConnectionState? observedState)
+        => DiscordBotRuntime.ReconcileTransportStatus(cachedState, cachedError, observedState);
+
+    internal static string DescribeDisconnect(Exception exception)
+        => DiscordBotRuntime.DescribeDisconnect(exception);
+
+    internal static DiscordSocketConfig CreateSocketConfig(string presenceContextMode)
+        => DiscordBotRuntime.CreateSocketConfig(presenceContextMode);
+
+    internal static void ValidateExistingBindingTarget(
+        DiscordBinding binding, IReadOnlySet<string> dmAllowlist)
+        => DiscordBotRuntime.ValidateExistingBindingTarget(binding, dmAllowlist);
+
+    internal static CreateDiscordBinding? BuildExistingDmBackfill(
+        DiscordBinding existing,
+        string authenticatedAuthorId,
+        string authenticatedAuthorName,
+        bool authorAllowed)
+        => DiscordBotRuntime.BuildExistingDmBackfill(
+            existing, authenticatedAuthorId, authenticatedAuthorName, authorAllowed);
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync();
+        foreach (var runtime in runtimes.Values)
+            await runtime.DisposeAsync();
+        runtimes.Clear();
+        lifecycle.Dispose();
+    }
+}
+
+internal sealed class DiscordBotRuntime(
+    Guid configId,
+    DiscordBotConfigurationStore configStore,
+    DiscordBindingStore bindings,
+    DiscordBehaviorStore behaviors,
+    DiscordDeliveryStore deliveries,
+    DiscordConversationCoordinator conversations,
+    DiscordAgentResolver agents,
+    DiscordAttachmentIngestor attachmentIngestor,
+    DiscordRestTransport rest,
+    DiscordTypingLeases typing,
+    DiscordOwnerPresencePublisher ownerPresence,
+    DiscordCommonsRelayService commons,
+    DiscordCommonsConfigurationStore commonsConfigurations,
+    IAssets assets,
+    ILogger logger,
+    IEnumerable<IDiscordExplicitAction> explicitActions) : IAsyncDisposable
+{
+    private static readonly TimeSpan InitialReadyTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan UserProfileCacheTtl = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan MaintenanceRecoveryInterval = TimeSpan.FromSeconds(30);
+    private const int GuildStartupBackfillLimit = 25;
+    private const int DmStartupBackfillLimit = 50;
+    private static readonly TimeSpan GuildStartupBackfillMaxAge = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan DmStartupBackfillMaxAge = TimeSpan.FromHours(24);
+    private readonly SemaphoreSlim lifecycle = new(1, 1);
+    private readonly DiscordMaintenanceQueue maintenance = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> outboxGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> forumPostGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> channelEditGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> channelCreateGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<ulong, CachedUserProfile> userProfiles = new();
+    private DiscordSocketClient? client;
+    private Func<Task>? clientConnectedHandler;
+    private Func<Task>? clientReadyHandler;
+    private Func<Exception, Task>? clientDisconnectedHandler;
+    private Func<SocketUser, SocketPresence, SocketPresence, Task>? clientPresenceHandler;
+    private Func<SocketUser, SocketVoiceState, SocketVoiceState, Task>? clientVoiceHandler;
+    private Action<DiscordBinding>? conversationReconciledHandler;
+    private string? maintenanceApplicationId;
+    private CancellationTokenSource? runCts;
+    private Task? outboxLoop;
+    private Task? presenceLoop;
+    private string state = "stopped";
+    private DateTimeOffset? connectedAt;
+    private string? lastError;
+    private string? profileWarning;
+
+    public async Task<DiscordBotStatus> GetStatusAsync(CancellationToken ct = default)
+    {
+        var config = await GetConfigAsync(ct);
+        var current = client;
+        var reported = ReconcileTransportStatus(
+            state, lastError, current?.ConnectionState);
+        return new DiscordBotStatus(
+            reported.State,
+            !string.IsNullOrWhiteSpace(config.BotToken),
+            config.Enabled,
+            current?.CurrentUser?.Username,
+            current?.Guilds.Count ?? 0,
+            connectedAt,
+            reported.LastError)
+        {
+            ProfileWarning = profileWarning,
+        };
+    }
+
+    public async Task<DiscordCommandReport> GetCommandsAsync(
+        LeafDiscordConfig config, CancellationToken ct)
+    {
+        var current = client;
+        if (current is null || current.ConnectionState != ConnectionState.Connected
+            || current.CurrentUser is null)
+            throw new InvalidOperationException("Discord bot is not connected.");
+        DiscordCommandDiagnostics.ValidateIdentity(config, configId, current.CurrentUser.Id);
+        // Use REST directly: Gateway connectivity and cached commands are not registration evidence.
+        var commands = await ((IDiscordClient)current.Rest).GetGlobalApplicationCommandsAsync(
+            options: new RequestOptions { CancelToken = ct });
+        if (commands.Any(command => command.ApplicationId.ToString() != config.ApplicationId))
+            throw new InvalidOperationException("Discord command application does not match its configuration.");
+        var registered = commands.Select(command => new DiscordRegisteredCommand(
+            command.Name, command.Type.ToString(),
+            command.ContextTypes?.Select(context => context.ToString()).ToArray())).ToArray();
+        return DiscordCommandDiagnostics.Compare(config, explicitActions, registered);
+    }
+
+    public IReadOnlyList<DiscordGuildChannel> ListGuildChannels()
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        return current.Guilds
+            .SelectMany(guild => guild.TextChannels
+                .Where(channel => CanUse(guild, channel))
+                .Select(channel => new DiscordGuildChannel(
+                    guild.Id.ToString(), guild.Name,
+                    channel.Id.ToString(), channel.Name)))
+            .OrderBy(channel => channel.GuildName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(channel => channel.ChannelName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public IReadOnlyList<JsonObject> ListGuildNavigation()
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        var capturedAt = DateTimeOffset.UtcNow;
+        return current.Guilds
+            .OrderBy(guild => guild.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(guild => BuildGuildNavigation(guild, "", capturedAt))
+            .ToArray();
+    }
+
+    public async Task<DiscordForumPostResult> CreateForumPostAsync(
+        string guildId,
+        string forumId,
+        string title,
+        string content,
+        string idempotencyKey,
+        string ownerUserId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(title) || title.Trim().Length > 100)
+            throw new ArgumentException("Discord forum post title must contain 1 to 100 characters.");
+        if (string.IsNullOrWhiteSpace(content) || content.Trim().Length > 2_000)
+            throw new ArgumentException("Discord forum starter must contain 1 to 2,000 characters.");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Trim().Length > 160)
+            throw new ArgumentException("A bounded idempotency key is required.");
+        if (string.IsNullOrWhiteSpace(ownerUserId))
+            throw new ArgumentException("The Leaf owner user ID is required.");
+        if (await commons.IsCommonsGuildAsync(configId, guildId, ct))
+            throw new UnauthorizedAccessException(
+                "Native Agent forum posts are disabled in Commons guilds.");
+
+        title = title.Trim();
+        content = content.Trim();
+        idempotencyKey = idempotencyKey.Trim();
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var config = await GetConfigAsync(ct);
+        var forum = ResolveWritableForum(activeClient, guildId, forumId);
+        var gateKey = $"{config.ApplicationId}:{guildId}:{forumId}:{idempotencyKey}";
+        var gate = forumPostGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var operation = await deliveries.ReserveForumPostAsync(
+                config.ApplicationId, guildId, forumId, idempotencyKey,
+                title, content, ct);
+            var thread = await FindForumPostAsync(
+                forum, operation.DiscordId, title, content,
+                activeClient.CurrentUser.Id, operation.CreatedAt, ct);
+            if (thread is null && operation.State == "sent")
+                throw new InvalidOperationException(
+                    "The recorded Discord forum post is no longer visible to this bot.");
+            thread ??= await forum.CreatePostAsync(
+                title,
+                forum.DefaultAutoArchiveDuration,
+                text: content,
+                options: new RequestOptions { CancelToken = ct },
+                allowedMentions: AllowedMentions.None);
+
+            var binding = await bindings.GetOrCreateAsync(new CreateDiscordBinding(
+                config.ApplicationId,
+                thread.Id.ToString(),
+                "thread",
+                guildId,
+                forumId,
+                config.AgentId,
+                ownerUserId,
+                config.AudienceProfile,
+                (await behaviors.ResolveAsync(
+                    config, "thread", guildId, thread.Id.ToString(), forumId,
+                    DiscordResponseModes.Direct, ct)).ResponseMode,
+                title,
+                forum.Guild.Name,
+                null,
+                config.SessionQualityMode,
+                config.SentinelQualityMode), ct);
+            binding = await conversations.EnsureReadyAsync(binding, ct);
+            var recorded = await conversations.RecordDeliveredProactiveAsync(
+                binding, idempotencyKey, content, thread.Id.ToString(), ct);
+            await deliveries.MarkSentAsync(operation, thread.Id.ToString(), ct);
+            return new DiscordForumPostResult(
+                recorded.Binding, recorded.MessageUid, guildId, forumId,
+                thread.Id.ToString(), title);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    public async Task<DiscordChannelEditResult> EditGuildChannelAsync(
+        string guildId,
+        string channelId,
+        DiscordChannelEditRequest request,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0
+            || !ulong.TryParse(channelId, out var parsedChannelId) || parsedChannelId == 0)
+            throw new ArgumentException("Discord guild and channel IDs must be snowflakes.");
+
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var guild = activeClient.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var channel = guild.GetChannel(parsedChannelId)
+            ?? throw new KeyNotFoundException("Discord channel was not found in that guild.");
+        var kind = EditableChannelKind(channel);
+        var permissions = guild.CurrentUser.GetPermissions(channel);
+        if (!permissions.ViewChannel || !permissions.ManageChannel)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs View Channel and Manage Channels for that channel.");
+
+        var patch = DiscordChannelEdits.BuildPatch(request, kind);
+        if (request.ParentCategoryId is not null)
+        {
+            var categoryId = ulong.Parse(request.ParentCategoryId);
+            var category = guild.GetCategoryChannel(categoryId)
+                ?? throw new KeyNotFoundException(
+                    "Discord parent category was not found in that guild.");
+            if (!guild.CurrentUser.GetPermissions(category).ViewChannel)
+                throw new UnauthorizedAccessException(
+                    "The Discord bot cannot view the requested parent category.");
+        }
+
+        var config = await GetConfigAsync(ct);
+        var botToken = config.BotToken
+            ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        var gateKey = $"{config.ApplicationId}:{guildId}:{channelId}";
+        var gate = channelEditGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var response = await rest.ModifyGuildChannelAsync(
+                botToken,
+                channelId,
+                patch,
+                "Leaf owner requested this channel edit through Nova",
+                ct);
+            var result = ProjectEditedChannel(guild, channel, kind, response);
+            try
+            {
+                var binding = await bindings.FindAsync(
+                    config.ApplicationId, channelId, ct);
+                if (binding is not null
+                    && !string.Equals(binding.ConversationName, result.ChannelName,
+                        StringComparison.Ordinal))
+                    await bindings.UpdateConversationMetadataAsync(
+                        binding, result.ChannelName, guild.Name, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex,
+                    "Discord channel {ChannelId} was edited but its Leaf binding metadata could not be refreshed",
+                    channelId);
+            }
+            return result;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    public async Task<DiscordGuildChannelCreateResult> CreateGuildTextChannelAsync(
+        string guildId,
+        DiscordGuildChannelCreateRequest request,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+
+        var payload = DiscordChannelEdits.BuildTextChannelCreatePayload(request);
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var guild = activeClient.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        if (!guild.CurrentUser.GuildPermissions.ManageChannels)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs Manage Channels for that server.");
+
+        if (request.ParentCategoryId is not null)
+        {
+            var categoryId = ulong.Parse(request.ParentCategoryId);
+            var category = guild.GetCategoryChannel(categoryId)
+                ?? throw new KeyNotFoundException(
+                    "Discord parent category was not found in that guild.");
+            var permissions = guild.CurrentUser.GetPermissions(category);
+            if (!permissions.ViewChannel || !permissions.SendMessages)
+                throw new UnauthorizedAccessException(
+                    "The Discord bot must be able to view and send messages in the requested parent category.");
+        }
+
+        var config = await GetConfigAsync(ct);
+        var botToken = config.BotToken
+            ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        var gateKey = $"{config.ApplicationId}:{guildId}";
+        var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var response = await rest.CreateGuildChannelAsync(
+                botToken,
+                guildId,
+                payload,
+                "Leaf owner requested this channel creation through Nova",
+                ct);
+            return ProjectCreatedTextChannel(guild, response);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    public async Task<DiscordGuildChannelCreateResult> CreateGuildForumChannelAsync(
+        string guildId,
+        DiscordGuildForumChannelCreateRequest request,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+        var payload = DiscordChannelEdits.BuildForumChannelCreatePayload(request);
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var guild = activeClient.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        if (!guild.CurrentUser.GuildPermissions.ManageChannels)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs Manage Channels for that server.");
+        if (request.ParentCategoryId is not null)
+        {
+            var categoryId = ulong.Parse(request.ParentCategoryId);
+            var category = guild.GetCategoryChannel(categoryId)
+                ?? throw new KeyNotFoundException(
+                    "Discord parent category was not found in that guild.");
+            var permissions = guild.CurrentUser.GetPermissions(category);
+            if (!permissions.ViewChannel || !permissions.SendMessages)
+                throw new UnauthorizedAccessException(
+                    "The Discord bot must be able to view and send messages in the requested parent category.");
+        }
+
+        var config = await GetConfigAsync(ct);
+        var botToken = config.BotToken
+            ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        var gateKey = $"{config.ApplicationId}:{guildId}";
+        var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var response = await rest.CreateGuildChannelAsync(
+                botToken,
+                guildId,
+                payload,
+                "Leaf owner requested this forum creation through Nova",
+                ct);
+            return ProjectCreatedForumChannel(guild, response);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    public async Task<DiscordCommonsWebhookResult> EnsureCommonsWebhookAsync(
+        string guildId,
+        string channelId,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0
+            || !ulong.TryParse(channelId, out var parsedChannelId) || parsedChannelId == 0)
+            throw new ArgumentException("Discord guild and channel IDs must be snowflakes.");
+        var commonsConfig = await commonsConfigurations.GetAsync(configId, ct)
+            ?? throw new InvalidOperationException("Discord Commons is not configured.");
+        if (!commonsConfig.GuildAllowlist.Contains(guildId))
+            throw new UnauthorizedAccessException(
+                "That Discord guild is not in the Commons allowlist.");
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var guild = activeClient.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var channel = guild.GetChannel(parsedChannelId)
+            ?? throw new KeyNotFoundException("Discord channel was not found in that guild.");
+        var kind = channel switch
+        {
+            SocketTextChannel => "text",
+            SocketForumChannel => "forum",
+            _ => throw new ArgumentException(
+                "Commons webhooks are supported only for text and forum channels."),
+        };
+        var permissions = guild.CurrentUser.GetPermissions(channel);
+        if (!permissions.ViewChannel || !permissions.SendMessages || !permissions.ManageWebhooks)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs View Channel, Send Messages, and Manage Webhooks for that channel.");
+        if (commonsConfig.WebhookUrls.ContainsKey(channelId))
+            return new DiscordCommonsWebhookResult(
+                guildId, channelId, channel.Name, kind, true);
+
+        var config = await GetConfigAsync(ct);
+        var botToken = config.BotToken
+            ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        var gateKey = $"commons-webhook:{config.ApplicationId}:{channelId}";
+        var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            commonsConfig = await commonsConfigurations.GetAsync(configId, ct)
+                ?? throw new InvalidOperationException("Discord Commons is not configured.");
+            if (commonsConfig.WebhookUrls.ContainsKey(channelId))
+                return new DiscordCommonsWebhookResult(
+                    guildId, channelId, channel.Name, kind, true);
+            var created = await rest.CreateWebhookAsync(
+                botToken, channelId, "Nova Commons Relay", null, ct);
+            var webhookUrl = $"https://discord.com/api/webhooks/{Uri.EscapeDataString(created.Id)}/{Uri.EscapeDataString(created.Token)}";
+            _ = await commonsConfigurations.SetWebhookUrlAsync(
+                configId, channelId, webhookUrl, ct);
+            return new DiscordCommonsWebhookResult(
+                guildId, channelId, channel.Name, kind, false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static string EditableChannelKind(SocketGuildChannel channel)
+        => channel switch
+        {
+            SocketCategoryChannel => "category",
+            SocketForumChannel => "forum",
+            SocketStageChannel => "stage",
+            SocketVoiceChannel => "voice",
+            SocketTextChannel => "text",
+            _ => throw new ArgumentException(
+                $"Discord channel type '{channel.GetType().Name}' is not editable through this capability."),
+        };
+
+    private static DiscordChannelEditResult ProjectEditedChannel(
+        SocketGuild guild,
+        SocketGuildChannel original,
+        string kind,
+        JsonObject response)
+    {
+        var returnedId = response["id"]?.GetValue<string>()
+            ?? throw new InvalidOperationException("Discord channel edit response has no id.");
+        if (!string.Equals(returnedId, original.Id.ToString(), StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "Discord returned a different channel after the edit.");
+        var name = response["name"]?.GetValue<string>()
+            ?? throw new InvalidOperationException(
+                "Discord channel edit response has no name.");
+        return new DiscordChannelEditResult(
+            guild.Id.ToString(),
+            guild.Name,
+            returnedId,
+            name,
+            kind,
+            response["parent_id"]?.GetValue<string>(),
+            response["topic"]?.GetValue<string>(),
+            response["position"]?.GetValue<int>() ?? original.Position,
+            response["nsfw"]?.GetValue<bool>(),
+            response["rate_limit_per_user"]?.GetValue<int>());
+    }
+
+    private static DiscordGuildChannelCreateResult ProjectCreatedTextChannel(
+        SocketGuild guild,
+        JsonObject response)
+    {
+        var channelId = response["id"]?.GetValue<string>()
+            ?? throw new InvalidOperationException(
+                "Discord channel creation response has no id.");
+        if (!ulong.TryParse(channelId, out var parsedChannelId) || parsedChannelId == 0)
+            throw new InvalidOperationException(
+                "Discord channel creation response has an invalid id.");
+        var channelName = response["name"]?.GetValue<string>()
+            ?? throw new InvalidOperationException(
+                "Discord channel creation response has no name.");
+        if (response["type"]?.GetValue<int>() is not 0)
+            throw new InvalidOperationException(
+                "Discord did not create a text channel.");
+        return new DiscordGuildChannelCreateResult(
+            guild.Id.ToString(),
+            guild.Name,
+            channelId,
+            channelName,
+            "text",
+            response["parent_id"]?.GetValue<string>(),
+            response["topic"]?.GetValue<string>(),
+            response["position"]?.GetValue<int>() ?? 0,
+            response["nsfw"]?.GetValue<bool>() ?? false,
+            response["rate_limit_per_user"]?.GetValue<int>() ?? 0);
+    }
+
+    private static DiscordGuildChannelCreateResult ProjectCreatedForumChannel(
+        SocketGuild guild,
+        JsonObject response)
+    {
+        if (response["type"]?.GetValue<int>() is not 15)
+            throw new InvalidOperationException("Discord did not create a forum channel.");
+        var channelId = response["id"]?.GetValue<string>()
+            ?? throw new InvalidOperationException(
+                "Discord channel creation response has no id.");
+        if (!ulong.TryParse(channelId, out var parsedChannelId) || parsedChannelId == 0)
+            throw new InvalidOperationException(
+                "Discord channel creation response has an invalid id.");
+        return new DiscordGuildChannelCreateResult(
+            guild.Id.ToString(),
+            guild.Name,
+            channelId,
+            response["name"]?.GetValue<string>()
+                ?? throw new InvalidOperationException(
+                    "Discord channel creation response has no name."),
+            "forum",
+            response["parent_id"]?.GetValue<string>(),
+            response["topic"]?.GetValue<string>(),
+            response["position"]?.GetValue<int>() ?? 0,
+            response["nsfw"]?.GetValue<bool>() ?? false,
+            response["rate_limit_per_user"]?.GetValue<int>() ?? 0);
+    }
+
+    private static SocketForumChannel ResolveWritableForum(
+        DiscordSocketClient current, string guildId, string forumId)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0
+            || !ulong.TryParse(forumId, out var parsedForumId) || parsedForumId == 0)
+            throw new ArgumentException("Discord guild and forum IDs must be snowflakes.");
+        var guild = current.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var forum = guild.GetChannel(parsedForumId) as SocketForumChannel
+            ?? throw new KeyNotFoundException("Discord forum was not found in that guild.");
+        var permissions = guild.CurrentUser.GetPermissions(forum);
+        if (!permissions.ViewChannel || !permissions.SendMessages
+            || !permissions.ReadMessageHistory || !permissions.SendMessagesInThreads)
+            throw new UnauthorizedAccessException(
+                "The Discord bot cannot create and continue posts in that forum.");
+        return forum;
+    }
+
+    private static async Task<IThreadChannel?> FindForumPostAsync(
+        SocketForumChannel forum,
+        string? expectedPostId,
+        string title,
+        string content,
+        ulong botUserId,
+        DateTimeOffset createdAt,
+        CancellationToken ct)
+    {
+        var options = new RequestOptions { CancelToken = ct };
+        IEnumerable<IThreadChannel> threads = await forum.GetActiveThreadsAsync(options);
+        threads = threads.Concat(await forum.GetPublicArchivedThreadsAsync(100, null, options));
+        var candidates = threads
+            .GroupBy(thread => thread.Id)
+            .Select(group => group.First())
+            .Where(thread => expectedPostId is not null
+                ? string.Equals(thread.Id.ToString(), expectedPostId, StringComparison.Ordinal)
+                : string.Equals(thread.Name, title, StringComparison.Ordinal)
+                  && thread.CreatedAt >= createdAt.AddMinutes(-1))
+            .ToArray();
+        var matches = new List<IThreadChannel>();
+        foreach (var thread in candidates)
+        {
+            var starter = await thread.GetMessageAsync(
+                thread.Id, CacheMode.AllowDownload, options);
+            if (starter is not null && starter.Author.Id == botUserId
+                && string.Equals(starter.Content, content, StringComparison.Ordinal))
+                matches.Add(thread);
+        }
+        return matches.Count switch
+        {
+            0 => null,
+            1 => matches[0],
+            _ => throw new InvalidOperationException(
+                "Discord forum-post recovery found multiple matching posts."),
+        };
+    }
+
+    public DiscordGuildChannel ResolveGuildChannel(string guildId, string channelId)
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        if (!ulong.TryParse(guildId, out var parsedGuildId)
+            || !ulong.TryParse(channelId, out var parsedChannelId))
+            throw new ArgumentException("Discord guild and channel IDs must be snowflakes.");
+        var guild = current.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var channel = guild.GetTextChannel(parsedChannelId)
+            ?? throw new KeyNotFoundException("Discord text channel was not found in that guild.");
+        if (!CanUse(guild, channel))
+            throw new UnauthorizedAccessException(
+                "The Discord bot cannot view and send messages in that channel.");
+        return new DiscordGuildChannel(
+            guild.Id.ToString(), guild.Name, channel.Id.ToString(), channel.Name);
+    }
+
+    public Task<JsonObject> GetGuildNavigationAsync(
+        DiscordBinding source, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var guild = ResolveGuild(source);
+        return Task.FromResult(BuildGuildNavigation(
+            guild, source.ConversationId, DateTimeOffset.UtcNow));
+    }
+
+    public async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
+        DiscordBinding source, string channelId, int limit,
+        CancellationToken ct = default)
+    {
+        var guild = ResolveGuild(source);
+        return await ReadGuildChannelMessagesAsync(guild, channelId, limit, ct);
+    }
+
+    public async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
+        string guildId, string channelId, int limit,
+        CancellationToken ct = default)
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+        var guild = current.GetGuild(parsedGuildId)
+            ?? throw new UnauthorizedAccessException(
+                "The requested guild is unavailable to this Discord bot.");
+        return await ReadGuildChannelMessagesAsync(guild, channelId, limit, ct);
+    }
+
+    private static async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
+        SocketGuild guild, string channelId, int limit, CancellationToken ct)
+    {
+        var target = ResolveActiveGuildChannel(guild, channelId);
+        if (target is SocketForumChannel)
+            throw new ArgumentException(
+                "Forum parents contain posts rather than messages; list the forum posts first.");
+        if (target is not IMessageChannel messages)
+            throw new ArgumentException("The selected Discord channel has no readable messages.");
+        EnsureReadable(guild, target);
+        return await ReadMessagesAsync(messages, limit, ct);
+    }
+
+    public async Task<IReadOnlyList<DiscordForumPostView>> ListForumPostsAsync(
+        DiscordBinding source, string forumId, int limit, bool includeArchived,
+        CancellationToken ct = default)
+    {
+        var guild = ResolveGuild(source);
+        var forum = ResolveForum(guild, forumId);
+        EnsureReadable(guild, forum);
+        limit = BoundedReadLimit(limit);
+        var options = new RequestOptions { CancelToken = ct };
+        IEnumerable<IThreadChannel> threads = await forum.GetActiveThreadsAsync(options);
+        if (includeArchived)
+            threads = threads.Concat(await forum.GetPublicArchivedThreadsAsync(
+                limit, null, options));
+
+        var tagNames = forum.Tags.ToDictionary(tag => tag.Id);
+        return threads
+            .GroupBy(thread => thread.Id)
+            .Select(group => group.First())
+            .OrderByDescending(thread => thread.CreatedAt)
+            .Take(limit)
+            .Select(thread => ProjectForumPost(thread, tagNames))
+            .ToArray();
+    }
+
+    public async Task<IReadOnlyList<DiscordGuildMessageView>> ReadForumPostMessagesAsync(
+        DiscordBinding source, string forumId, string postId, int limit,
+        CancellationToken ct = default)
+    {
+        var guild = ResolveGuild(source);
+        var forum = ResolveForum(guild, forumId);
+        EnsureReadable(guild, forum);
+        if (!ulong.TryParse(postId, out var parsedPostId) || parsedPostId == 0)
+            throw new ArgumentException("Discord post ID must be a snowflake.");
+        var options = new RequestOptions { CancelToken = ct };
+        IThreadChannel? thread = (await forum.GetActiveThreadsAsync(options))
+            .FirstOrDefault(item => item.Id == parsedPostId);
+        if (thread is null)
+            thread = (await forum.GetPublicArchivedThreadsAsync(100, null, options))
+                .FirstOrDefault(item => item.Id == parsedPostId);
+        if (thread is null)
+            throw new KeyNotFoundException(
+                "Discord forum post was not found or is not visible to this bot.");
+        return await ReadMessagesAsync(thread, limit, ct);
+    }
+
+    private static bool CanUse(SocketGuild guild, SocketTextChannel channel)
+    {
+        var permissions = guild.CurrentUser.GetPermissions(channel);
+        return permissions.ViewChannel && permissions.SendMessages;
+    }
+
+    private SocketGuild ResolveGuild(DiscordBinding source)
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        if (source.Kind == "dm" || string.IsNullOrWhiteSpace(source.GuildId)
+            || !ulong.TryParse(source.GuildId, out var guildId))
+            throw new UnauthorizedAccessException(
+                "Guild navigation is available only from a bound guild conversation.");
+        return current.GetGuild(guildId)
+            ?? throw new UnauthorizedAccessException(
+                "The source binding guild is unavailable to this Discord bot.");
+    }
+
+    private static SocketGuildChannel ResolveActiveGuildChannel(
+        SocketGuild guild, string channelId)
+    {
+        if (!ulong.TryParse(channelId, out var parsedChannelId) || parsedChannelId == 0)
+            throw new ArgumentException("Discord channel ID must be a snowflake.");
+        return guild.GetChannel(parsedChannelId)
+            ?? guild.ThreadChannels.FirstOrDefault(thread => thread.Id == parsedChannelId)
+            ?? throw new KeyNotFoundException(
+                "Discord channel was not found or is not active in this guild.");
+    }
+
+    private static SocketForumChannel ResolveForum(SocketGuild guild, string forumId)
+        => ResolveActiveGuildChannel(guild, forumId) as SocketForumChannel
+           ?? throw new KeyNotFoundException("Discord forum was not found in this guild.");
+
+    private static void EnsureReadable(SocketGuild guild, SocketGuildChannel channel)
+    {
+        var permissionTarget = channel is SocketThreadChannel thread
+            ? thread.ParentChannel
+            : channel;
+        var permissions = guild.CurrentUser.GetPermissions(permissionTarget);
+        if (!permissions.ViewChannel || !permissions.ReadMessageHistory)
+            throw new UnauthorizedAccessException(
+                "The Discord bot cannot view message history in that channel.");
+    }
+
+    private static int BoundedReadLimit(int limit)
+        => Math.Clamp(limit <= 0 ? 50 : limit, 1, 100);
+
+    private static async Task<IReadOnlyList<DiscordGuildMessageView>> ReadMessagesAsync(
+        IMessageChannel channel, int limit, CancellationToken ct)
+    {
+        var options = new RequestOptions { CancelToken = ct };
+        var messages = await channel.GetMessagesAsync(
+            BoundedReadLimit(limit), CacheMode.AllowDownload, options).FlattenAsync();
+        return messages
+            .OrderBy(message => message.Id)
+            .Select(message => new DiscordGuildMessageView(
+                message.Id.ToString(),
+                message.Timestamp,
+                message.EditedTimestamp,
+                message.Author.Id.ToString(),
+                message.Author.GlobalName ?? message.Author.Username,
+                message.Author.Username,
+                message.Author.IsBot,
+                message.Source.ToString(),
+                message.Content,
+                message.Attachments.Select(attachment =>
+                    new DiscordGuildMessageAttachmentView(
+                        attachment.Id.ToString(),
+                        attachment.Filename,
+                        attachment.ContentType,
+                        attachment.Size)).ToArray()))
+            .ToArray();
+    }
+
+    private static DiscordForumPostView ProjectForumPost(
+        IThreadChannel thread,
+        IReadOnlyDictionary<ulong, ForumTag> availableTags)
+        => new(
+            thread.Id.ToString(),
+            thread.Name,
+            thread.CreatedAt,
+            thread.IsArchived,
+            thread.IsLocked,
+            thread.MessageCount,
+            thread.AppliedTags.Select(tagId =>
+            {
+                var found = availableTags.TryGetValue(tagId, out var tag);
+                return new DiscordGuildForumTagSnapshot(
+                    tagId.ToString(),
+                    found ? tag.Name : tagId.ToString(),
+                    found ? tag.Emoji?.Name : null,
+                    found && tag.IsModerated);
+            }).ToArray());
+
+    private static JsonObject BuildGuildNavigation(
+        SocketGuild guild, string currentChannelId, DateTimeOffset capturedAt)
+    {
+        var categories = guild.CategoryChannels
+            .Where(category => guild.CurrentUser.GetPermissions(category).ViewChannel)
+            .Select(category => new DiscordGuildCategorySnapshot(
+                category.Id.ToString(), category.Name, category.Position))
+            .ToArray();
+        var channels = guild.Channels
+            .Concat<SocketGuildChannel>(guild.ThreadChannels)
+            .GroupBy(channel => channel.Id)
+            .Select(group => group.First())
+            .Where(channel => channel is not SocketCategoryChannel)
+            .Select(channel => ProjectGuildChannel(guild, channel))
+            .Where(channel => channel is not null)
+            .Select(channel => channel!)
+            .ToArray();
+        return DiscordGuildNavigationBuilder.Build(
+            guild.Id.ToString(), guild.Name, currentChannelId,
+            categories, channels, capturedAt);
+    }
+
+    private static DiscordGuildChannelSnapshot? ProjectGuildChannel(
+        SocketGuild guild, SocketGuildChannel channel)
+    {
+        var permissionTarget = channel is SocketThreadChannel thread
+            ? thread.ParentChannel
+            : channel;
+        var permissions = guild.CurrentUser.GetPermissions(permissionTarget);
+        if (!permissions.ViewChannel) return null;
+
+        var kind = channel switch
+        {
+            SocketThreadChannel post when post.ParentChannel is SocketForumChannel => "forum_post",
+            SocketThreadChannel => "thread",
+            SocketForumChannel => "forum",
+            SocketStageChannel => "stage",
+            SocketVoiceChannel => "voice",
+            SocketTextChannel => "text",
+            _ => "other",
+        };
+        var parentId = channel switch
+        {
+            SocketThreadChannel post => post.ParentChannel.Id.ToString(),
+            SocketForumChannel forum when forum.CategoryId is { } id => id.ToString(),
+            SocketTextChannel text when text.CategoryId is { } id => id.ToString(),
+            SocketVoiceChannel voice when voice.CategoryId is { } id => id.ToString(),
+            SocketStageChannel stage when stage.CategoryId is { } id => id.ToString(),
+            _ => null,
+        };
+        var topic = channel switch
+        {
+            SocketForumChannel forum => forum.Topic,
+            SocketTextChannel text => text.Topic,
+            _ => null,
+        };
+        var tags = channel is SocketForumChannel forumChannel
+            ? forumChannel.Tags.Select(tag => new DiscordGuildForumTagSnapshot(
+                tag.Id.ToString(), tag.Name, tag.Emoji?.Name, tag.IsModerated)).ToArray()
+            : [];
+        var canPost = channel is SocketForumChannel
+            ? permissions.SendMessages
+            : channel is SocketTextChannel && permissions.SendMessages;
+        var canReply = channel is SocketThreadChannel
+            ? permissions.SendMessagesInThreads
+            : canPost;
+
+        return new DiscordGuildChannelSnapshot(
+            channel.Id.ToString(), channel.Name, kind, parentId, topic,
+            channel.Position, permissions.ReadMessageHistory, canPost, canReply, tags);
+    }
+
+    public async Task<DiscordUserProfile?> GetUserProfileAsync(
+        string externalId, CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(externalId, out var userId)) return null;
+        if (userProfiles.TryGetValue(userId, out var cached)
+            && cached.ExpiresAt > DateTimeOffset.UtcNow)
+            return cached.Profile;
+        var current = client;
+        if (current is null) return null;
+        try
+        {
+            IUser? user = current.GetUser(userId);
+            user ??= await ((IDiscordClient)current).GetUserAsync(
+                userId, CacheMode.AllowDownload, new RequestOptions { CancelToken = ct });
+            if (user is null) return null;
+            var profile = new DiscordUserProfile(
+                externalId,
+                user.GlobalName ?? user.Username,
+                user.Username,
+                user.GetDisplayAvatarUrl(ImageFormat.Auto, 128));
+            userProfiles[userId] = new CachedUserProfile(
+                profile, DateTimeOffset.UtcNow.Add(UserProfileCacheTtl));
+            return profile;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogDebug(ex, "Could not resolve Discord profile {UserId}", externalId);
+            return null;
+        }
+    }
+
+    public async Task<DiscordInboundAttribution?> GetMessageAttributionAsync(
+        DiscordBinding binding, string messageId, CancellationToken ct = default)
+    {
+        var current = client;
+        if (current is null
+            || !ulong.TryParse(binding.ConversationId, out var channelId)
+            || !ulong.TryParse(messageId, out var id))
+            return null;
+        try
+        {
+            var options = new RequestOptions { CancelToken = ct };
+            var channel = current.GetChannel(channelId) as IMessageChannel
+                ?? await current.GetChannelAsync(channelId, options) as IMessageChannel;
+            if (channel is null) return null;
+            var message = await channel.GetMessageAsync(id, CacheMode.AllowDownload, options);
+            if (message is null) return null;
+            // Without attachments the admitted display text is exactly the trimmed content;
+            // attachment lines carry ingest-time hashes that cannot be reconstructed here.
+            return new DiscordInboundAttribution(
+                message.Author.Id.ToString(),
+                message.Author.GlobalName ?? message.Author.Username,
+                message.Author.Username,
+                AttachmentCount: message.Attachments.Count,
+                ContentLength: message.Attachments.Count == 0
+                    ? message.Content.Trim().Length
+                    : null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogDebug(ex, "Could not read Discord message {MessageId}", messageId);
+            return null;
+        }
+    }
+
+    public async Task<string?> GetConversationIconUrlAsync(
+        DiscordBinding binding, CancellationToken ct = default)
+    {
+        var current = client;
+        if (current is null) return null;
+        if (binding.Kind == "dm")
+        {
+            var userId = binding.CounterpartyUserId;
+            if (string.IsNullOrWhiteSpace(userId)
+                && ulong.TryParse(binding.ConversationId, out var channelId)
+                && current.GetChannel(channelId) is IDMChannel dm)
+                userId = dm.Recipient.Id.ToString();
+            return string.IsNullOrWhiteSpace(userId)
+                ? null
+                : (await GetUserProfileAsync(userId, ct))?.AvatarUrl;
+        }
+
+        return ulong.TryParse(binding.GuildId, out var guildId)
+            ? current.GetGuild(guildId)?.IconUrl
+            : null;
+    }
+
+    public async Task StartAsync(CancellationToken stoppingToken)
+    {
+        await lifecycle.WaitAsync(stoppingToken);
+        DiscordSocketClient? startingClient = null;
+        try
+        {
+            if (client is not null) return;
+            var config = await GetConfigAsync(stoppingToken);
+            if (!config.Ready)
+            {
+                state = config.Enabled ? "not-configured" : "disabled";
+                lastError = config.Enabled
+                    ? DiscordBotService.DescribeConfigurationIssue(config)
+                    : null;
+                return;
+            }
+
+            state = "connecting";
+            lastError = null;
+            var next = new DiscordSocketClient(CreateSocketConfig(
+                config.PresenceContextMode));
+            next.Log += OnLogAsync;
+            Func<Task> connectedHandler = () => OnConnectedAsync(next);
+            Func<Exception, Task> disconnectedHandler =
+                exception => OnDisconnectedAsync(next, exception);
+            clientConnectedHandler = connectedHandler;
+            clientDisconnectedHandler = disconnectedHandler;
+            next.Connected += connectedHandler;
+            next.Disconnected += disconnectedHandler;
+            var ready = new TaskCompletionSource<SocketSelfUser>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            Task CaptureInitialReadyAsync()
+            {
+                if (next.CurrentUser is { } current)
+                    ready.TrySetResult(current);
+                else
+                    ready.TrySetException(new InvalidOperationException(
+                        "Discord Gateway became ready without an authenticated bot user."));
+                return Task.CompletedTask;
+            }
+            Task CaptureInitialDisconnectAsync(Exception exception)
+            {
+                ready.TrySetException(new InvalidOperationException(
+                    "Discord Gateway disconnected before becoming ready.", exception));
+                return Task.CompletedTask;
+            }
+            next.Ready += CaptureInitialReadyAsync;
+            next.Disconnected += CaptureInitialDisconnectAsync;
+            startingClient = next;
+            client = next;
+            SocketSelfUser readyUser;
+            try
+            {
+                await next.LoginAsync(TokenType.Bot, config.BotToken);
+                await next.StartAsync();
+                try
+                {
+                    readyUser = await ready.Task.WaitAsync(InitialReadyTimeout, stoppingToken);
+                }
+                catch (TimeoutException ex)
+                {
+                    throw new InvalidOperationException(
+                        "Discord Gateway did not become ready within 30 seconds.", ex);
+                }
+            }
+            finally
+            {
+                next.Ready -= CaptureInitialReadyAsync;
+                next.Disconnected -= CaptureInitialDisconnectAsync;
+            }
+            ValidateApplicationId(config.ApplicationId, readyUser.Id);
+            if (next.ConnectionState != ConnectionState.Connected)
+                throw new InvalidOperationException("Discord Gateway disconnected during startup.");
+
+            Func<Task> readyHandler = () => OnReadyAsync(next);
+            clientReadyHandler = readyHandler;
+            next.Ready += readyHandler;
+            next.MessageReceived += OnMessageAsync;
+            next.ReactionAdded += OnReactionAddedAsync;
+            next.SlashCommandExecuted += OnSlashCommandAsync;
+            Func<SocketUser, SocketPresence, SocketPresence, Task> presenceHandler =
+                (_, _, _) => PublishOwnerPresenceAsync(next);
+            Func<SocketUser, SocketVoiceState, SocketVoiceState, Task> voiceHandler =
+                (_, _, _) => PublishOwnerPresenceAsync(next);
+            clientPresenceHandler = presenceHandler;
+            clientVoiceHandler = voiceHandler;
+            next.PresenceUpdated += presenceHandler;
+            next.UserVoiceStateUpdated += voiceHandler;
+            conversations.Start();
+            maintenanceApplicationId = config.ApplicationId;
+            conversationReconciledHandler = binding =>
+            {
+                if (string.Equals(binding.ApplicationId, maintenanceApplicationId,
+                        StringComparison.Ordinal))
+                    maintenance.RequestDrain(binding.BindingId);
+            };
+            conversations.Reconciled += conversationReconciledHandler;
+            runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            outboxLoop = RunOutboxLoopAsync(runCts.Token);
+            presenceLoop = RunPresenceLoopAsync(next, runCts.Token);
+            await OnReadyAsync(next);
+        }
+        catch (Exception ex)
+        {
+            state = "error";
+            lastError = ex.Message;
+            logger.LogError(ex, "Discord bot failed to start");
+            DetachConversationReconciledHandler();
+            if (startingClient is not null) await DisposeClientAsync(startingClient);
+            client = null;
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    internal static void ValidateApplicationId(string configuredApplicationId, ulong botUserId)
+    {
+        if (!string.Equals(configuredApplicationId, botUserId.ToString(), StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "The configured Discord application ID does not match the bot token.");
+    }
+
+    public async Task<DiscordDirectMessageResult> SendDirectMessageAsync(
+        string recipientUserId,
+        string content,
+        string idempotencyKey,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(recipientUserId, out var recipientId) || recipientId == 0)
+            throw new ArgumentException("Recipient Discord user ID must be a snowflake.");
+        if (string.IsNullOrWhiteSpace(content))
+            throw new ArgumentException("Discord DM content is required.");
+        if (content.Length > 32_000)
+            throw new ArgumentException("Discord DM content exceeds the 32,000 character safety limit.");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 160)
+            throw new ArgumentException("A bounded idempotency key is required.");
+
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var config = await GetConfigAsync(ct);
+        if (!config.DmAllowlist.Contains(recipientUserId))
+            throw new UnauthorizedAccessException(
+                "Recipient is not in the configured Discord DM allowlist.");
+
+        IUser? recipient = activeClient.GetUser(recipientId);
+        recipient ??= await activeClient.Rest.GetUserAsync(recipientId);
+        if (recipient is null)
+            throw new InvalidOperationException("Discord user could not be resolved.");
+        var dm = await recipient.CreateDMChannelAsync();
+        var ownerId = config.OwnerUserId
+            ?? await agents.ResolveOwnerUserIdAsync(config.AgentId, ct)
+            ?? throw new InvalidOperationException(
+                $"Discord could not resolve the owner of Agent '{config.AgentId}'.");
+        var binding = await bindings.GetOrCreateAsync(new CreateDiscordBinding(
+            config.ApplicationId,
+            dm.Id.ToString(),
+            "dm",
+            null,
+            null,
+            config.AgentId,
+            ownerId,
+            config.AudienceProfile,
+            "direct",
+            recipient.GlobalName ?? recipient.Username,
+            null,
+            recipientUserId,
+            config.SessionQualityMode,
+            config.SentinelQualityMode), ct);
+        var sent = await conversations.SendProactiveAsync(
+            binding, idempotencyKey.Trim(), content.Trim(), ct);
+        await DrainBindingAsync(sent.Binding, ct);
+        return new DiscordDirectMessageResult(sent.Binding, sent.MessageUid);
+    }
+
+    public async Task<DiscordDirectMessageResult> SendExistingBindingMessageAsync(
+        DiscordBinding binding,
+        string content,
+        string idempotencyKey,
+        CancellationToken ct = default)
+        => await SendExistingBindingMessageAsync(
+            binding, content, idempotencyKey, null, [], ct);
+
+    public async Task<DiscordDirectMessageResult> SendExistingBindingMessageAsync(
+        DiscordBinding binding,
+        string content,
+        string idempotencyKey,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+            throw new ArgumentException("Discord message content is required.");
+        if (content.Length > 32_000)
+            throw new ArgumentException("Discord message content exceeds the 32,000 character safety limit.");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 160)
+            throw new ArgumentException("A bounded idempotency key is required.");
+        if (deliveryContent is not null && deliveryContent.Length > 32_000)
+            throw new ArgumentException(
+                "Discord delivery content exceeds the 32,000 character safety limit.");
+        if (outputAssets.Count > 10)
+            throw new ArgumentException("A Discord message can contain at most 10 output Assets.");
+        if (outputAssets.Count > 0 && deliveryContent is null)
+            throw new ArgumentException(
+                "Discord output Assets require explicit delivery content.");
+
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var config = await GetConfigAsync(ct);
+        ValidateExistingBindingTarget(binding, config.DmAllowlist);
+
+        var sent = await conversations.SendExistingProactiveAsync(
+            binding, idempotencyKey.Trim(), content.Trim(), deliveryContent,
+            outputAssets, ct);
+        await DrainBindingAsync(sent.Binding, ct);
+        return new DiscordDirectMessageResult(sent.Binding, sent.MessageUid);
+    }
+
+    internal static void ValidateExistingBindingTarget(
+        DiscordBinding binding,
+        IReadOnlySet<string> dmAllowlist)
+    {
+        if (binding.Kind != "dm") return;
+        if (string.IsNullOrWhiteSpace(binding.CounterpartyUserId)
+            || !dmAllowlist.Contains(binding.CounterpartyUserId))
+            throw new UnauthorizedAccessException(
+                "The Discord DM counterpart is not in the configured allowlist.");
+    }
+
+    public async Task RestartAsync(CancellationToken stoppingToken)
+    {
+        await StopAsync();
+        await StartAsync(stoppingToken);
+    }
+
+    public async Task StopAsync()
+    {
+        await lifecycle.WaitAsync();
+        try
+        {
+            DetachConversationReconciledHandler();
+            runCts?.Cancel();
+            if (outboxLoop is not null)
+            {
+                try { await outboxLoop; } catch (OperationCanceledException) { }
+            }
+            if (presenceLoop is not null)
+            {
+                try { await presenceLoop; } catch (OperationCanceledException) { }
+            }
+            if (client is not null)
+            {
+                await DisposeClientAsync(client);
+            }
+            client = null;
+            runCts?.Dispose();
+            runCts = null;
+            outboxLoop = null;
+            presenceLoop = null;
+            connectedAt = null;
+            state = "stopped";
+        }
+        finally
+        {
+            lifecycle.Release();
+        }
+    }
+
+    private Task OnConnectedAsync(DiscordSocketClient source)
+    {
+        if (!ReferenceEquals(client, source)) return Task.CompletedTask;
+        state = "connected";
+        connectedAt = DateTimeOffset.UtcNow;
+        lastError = null;
+        return Task.CompletedTask;
+    }
+
+    private async Task OnReadyAsync(DiscordSocketClient source)
+    {
+        if (!ReferenceEquals(client, source)) return;
+        await OnConnectedAsync(source);
+        await SynchronizeConfiguredAvatarsAsync(source);
+        await RegisterCommandsAsync();
+        await BackfillBindingsAsync();
+        await PublishOwnerPresenceAsync(source, forceRefresh: true);
+    }
+
+    internal static DiscordSocketConfig CreateSocketConfig(string presenceContextMode)
+    {
+        var mode = DiscordPresenceContextModes.Normalize(presenceContextMode);
+        var intents = GatewayIntents.Guilds
+            | GatewayIntents.GuildMessages
+            | GatewayIntents.GuildMessageReactions
+            | GatewayIntents.DirectMessages
+            | GatewayIntents.MessageContent;
+        if (mode is DiscordPresenceContextModes.Active or DiscordPresenceContextModes.Roster)
+            intents |= GatewayIntents.GuildPresences | GatewayIntents.GuildVoiceStates;
+        if (mode == DiscordPresenceContextModes.Roster)
+            intents |= GatewayIntents.GuildMembers;
+        return new DiscordSocketConfig
+        {
+            GatewayIntents = intents,
+            AlwaysDownloadUsers = mode == DiscordPresenceContextModes.Roster,
+            MessageCacheSize = 0,
+            LogGatewayIntentWarnings = true,
+        };
+    }
+
+    private async Task SynchronizeConfiguredAvatarsAsync(DiscordSocketClient source)
+    {
+        try
+        {
+            var config = await GetConfigAsync();
+            if (config.AvatarManaged)
+            {
+                var payload = await ReadAvatarAsync(config.AvatarAssetId);
+                var fingerprint = payload?.Fingerprint ?? "none";
+                if (!string.Equals(
+                        fingerprint, config.AvatarFingerprint,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    await rest.ModifyCurrentUserAvatarAsync(
+                        config.BotToken!, payload?.DataUri);
+                    await configStore.MarkAvatarSynchronizedAsync(
+                        config.EntityId, fingerprint);
+                }
+            }
+
+            foreach (var (guildId, assetId) in config.GuildAvatarAssetIds)
+            {
+                if (!source.Guilds.Any(guild => guild.Id.ToString() == guildId))
+                    continue;
+                var payload = await ReadAvatarAsync(assetId)
+                    ?? throw new InvalidOperationException(
+                        $"Guild avatar Asset '{assetId}' could not be resolved.");
+                if (config.GuildAvatarFingerprints.TryGetValue(guildId, out var fingerprint)
+                    && string.Equals(
+                        fingerprint, payload.Fingerprint,
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+                await rest.ModifyCurrentGuildMemberAvatarAsync(
+                    config.BotToken!, guildId, payload.DataUri);
+                await configStore.MarkGuildAvatarSynchronizedAsync(
+                    config.EntityId, guildId, payload.Fingerprint);
+            }
+            profileWarning = null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            profileWarning = $"Configured avatar synchronization failed: {ex.Message}";
+            logger.LogWarning(ex,
+                "Discord configured avatar synchronization failed for bot {BotConfigurationId}",
+                configId);
+        }
+    }
+
+    public async Task<LeafDiscordConfig> SetBotAvatarAsync(
+        string? avatarAssetId, CancellationToken ct = default)
+    {
+        var payload = await ReadAvatarAsync(avatarAssetId, ct);
+        var saved = await configStore.SetAvatarAsync(
+            configId, payload?.AssetId, ct);
+        await rest.ModifyCurrentUserAvatarAsync(
+            saved.BotToken!, payload?.DataUri, ct);
+        await configStore.MarkAvatarSynchronizedAsync(
+            configId, payload?.Fingerprint ?? "none", ct);
+        profileWarning = null;
+        return await GetConfigAsync(ct);
+    }
+
+    public async Task<LeafDiscordConfig> SetGuildAvatarAsync(
+        string guildId, string? avatarAssetId, CancellationToken ct = default)
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+        if (current.GetGuild(parsedGuildId) is null)
+            throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var config = await GetConfigAsync(ct);
+        var payload = await ReadAvatarAsync(avatarAssetId, ct);
+        await rest.ModifyCurrentGuildMemberAvatarAsync(
+            config.BotToken!, guildId, payload?.DataUri, ct);
+        var saved = await configStore.SetGuildAvatarAsync(
+            configId, guildId, payload?.AssetId, ct);
+        if (payload is not null)
+        {
+            await configStore.MarkGuildAvatarSynchronizedAsync(
+                configId, guildId, payload.Fingerprint, ct);
+            saved = await GetConfigAsync(ct);
+        }
+        profileWarning = null;
+        return saved;
+    }
+
+    public async Task<DiscordBinding> SetChannelAvatarAsync(
+        DiscordBinding binding, string? avatarAssetId,
+        CancellationToken ct = default)
+    {
+        if (binding.Kind != "guild_channel")
+            throw new ArgumentException(
+                "Channel avatars are supported only for guild-channel bindings.");
+        _ = ResolveGuildChannel(binding.GuildId ?? "", binding.ConversationId);
+        var config = await GetConfigAsync(ct);
+        if (string.IsNullOrWhiteSpace(avatarAssetId))
+        {
+            if (!string.IsNullOrWhiteSpace(binding.WebhookId))
+                await rest.DeleteWebhookAsync(config.BotToken!, binding.WebhookId, ct);
+            return await bindings.ClearChannelAvatarAsync(binding, ct);
+        }
+
+        var payload = await ReadAvatarAsync(avatarAssetId, ct)
+            ?? throw new ArgumentException("A channel avatar Asset is required.");
+        var name = client?.CurrentUser?.Username
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        if (!string.IsNullOrWhiteSpace(binding.WebhookId)
+            && !string.IsNullOrWhiteSpace(binding.WebhookToken))
+        {
+            await rest.ModifyWebhookAsync(
+                config.BotToken!, binding.WebhookId, name, payload.DataUri, ct);
+            return await bindings.SetChannelAvatarAsync(
+                binding, payload.AssetId,
+                binding.WebhookId, binding.WebhookToken, ct);
+        }
+
+        var webhook = await rest.CreateWebhookAsync(
+            config.BotToken!, binding.ConversationId, name, payload.DataUri, ct);
+        return await bindings.SetChannelAvatarAsync(
+            binding, payload.AssetId, webhook.Id, webhook.Token, ct);
+    }
+
+    private async Task<DiscordAvatarPayload?> ReadAvatarAsync(
+        string? avatarAssetId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(avatarAssetId)) return null;
+        var assetId = CanonicalAssetId(avatarAssetId)
+            ?? throw new ArgumentException(
+                "Avatar must identify a canonical RedLeaf Asset.");
+        var file = await assets.ReadAsync(assetId, ct);
+        if (file is null)
+            throw new ArgumentException("Avatar Asset was not found.");
+        var contentType = file.ContentType.Trim().ToLowerInvariant();
+        if (contentType is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp"))
+            throw new ArgumentException(
+                "Avatar Asset must be a PNG, JPEG, GIF, or WebP image.");
+        if (file.Bytes.Length == 0 || file.Bytes.Length > 10 * 1024 * 1024)
+            throw new ArgumentException(
+                "Avatar Asset must contain between 1 byte and 10 MiB.");
+        var fingerprint = Convert.ToHexString(
+            SHA256.HashData(file.Bytes)).ToLowerInvariant();
+        return new DiscordAvatarPayload(
+            assetId,
+            $"data:{contentType};base64,{Convert.ToBase64String(file.Bytes)}",
+            fingerprint);
+    }
+
+    internal static string? CanonicalAssetId(string? avatar)
+    {
+        if (string.IsNullOrWhiteSpace(avatar)) return null;
+        var value = avatar.Trim();
+        const string prefix = "/api/assets/";
+        if (value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            value = Uri.UnescapeDataString(value[prefix.Length..]);
+        else if (value.Contains("://", StringComparison.Ordinal)
+                 || value.Contains('/') || value.Contains('\\'))
+            return null;
+        return string.IsNullOrWhiteSpace(value)
+            || value.Contains("..", StringComparison.Ordinal)
+            ? null
+            : value;
+    }
+
+    private Task OnDisconnectedAsync(
+        DiscordSocketClient source, Exception exception)
+    {
+        if (!ReferenceEquals(client, source)) return Task.CompletedTask;
+        state = "reconnecting";
+        lastError = DescribeDisconnect(exception);
+        logger.LogWarning(exception, "Discord Gateway disconnected");
+        return Task.CompletedTask;
+    }
+
+    internal static DiscordTransportStatus ReconcileTransportStatus(
+        string cachedState,
+        string? cachedError,
+        ConnectionState? observedState)
+    {
+        if (observedState == ConnectionState.Connected)
+            return new DiscordTransportStatus("connected", null);
+
+        if (cachedState == "connected"
+            && observedState is ConnectionState.Connecting
+                or ConnectionState.Disconnecting
+                or ConnectionState.Disconnected)
+        {
+            return new DiscordTransportStatus(
+                "reconnecting",
+                cachedError ?? "Discord Gateway is disconnected.");
+        }
+
+        return new DiscordTransportStatus(cachedState, cachedError);
+    }
+
+    internal static string DescribeDisconnect(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is not WebSocketClosedException closed) continue;
+            var reason = string.IsNullOrWhiteSpace(closed.Reason)
+                ? null
+                : closed.Reason.ReplaceLineEndings(" ").Trim();
+            if (reason?.Length > 160) reason = reason[..160] + "...";
+            return reason is null
+                ? $"Discord Gateway closed with code {closed.CloseCode}."
+                : $"Discord Gateway closed with code {closed.CloseCode}: {reason}";
+        }
+
+        return string.IsNullOrWhiteSpace(exception.Message)
+            ? exception.GetType().Name
+            : exception.Message;
+    }
+
+    private Task OnLogAsync(LogMessage message)
+    {
+        var level = message.Severity switch
+        {
+            LogSeverity.Critical or LogSeverity.Error => LogLevel.Error,
+            LogSeverity.Warning => LogLevel.Warning,
+            LogSeverity.Info => LogLevel.Information,
+            _ => LogLevel.Debug,
+        };
+        logger.Log(level, message.Exception, "Discord: {Message}", message.Message);
+        return Task.CompletedTask;
+    }
+
+    private Task OnMessageAsync(SocketMessage raw)
+    {
+        return raw is IUserMessage message ? ProcessMessageAsync(message) : Task.CompletedTask;
+    }
+
+    private async Task ProcessMessageAsync(IUserMessage message)
+    {
+        var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id.ToString();
+        if (await commons.IsCommonsGuildAsync(configId, guildId))
+        {
+            await ForwardCommonsMessageAsync(message);
+            return;
+        }
+        if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
+        var current = client?.CurrentUser;
+        if (current is null) return;
+        var config = await GetConfigAsync();
+        var conversationId = message.Channel.Id.ToString();
+        var binding = await FindOrCreateBindingAsync(message, config);
+        if (binding is null || !binding.Enabled) return;
+        if (binding.Kind == "dm" && !config.DmAllowlist.Contains(message.Author.Id.ToString()))
+        {
+            await bindings.MarkReceivedAsync(binding, message.Id.ToString());
+            return;
+        }
+        var behavior = await behaviors.ResolveAsync(config, binding);
+        if (behavior.ResponseMode == DiscordResponseModes.ContextOnly)
+        {
+            await bindings.MarkReceivedAsync(binding, message.Id.ToString());
+            return;
+        }
+        var mentioned = message.MentionedUserIds.Contains(current.Id);
+        var repliesToBot = message.ReferencedMessage?.Author.Id == current.Id;
+        if (!ShouldAdmitMessage(
+                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot))
+        {
+            await bindings.MarkReceivedAsync(binding, message.Id.ToString());
+            return;
+        }
+
+        var typingAdmission = typing.Begin(
+            binding.BindingId,
+            () => message.Channel.EnterTypingState(),
+            ShouldStartTypingImmediately(
+                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot));
+        try
+        {
+            var submittedAttachments = await attachmentIngestor.IngestAsync(
+                config, message.Id.ToString(), message.Attachments.Select(attachment =>
+                    new DiscordAttachmentSource(
+                        attachment.Id.ToString(), attachment.Filename, attachment.ContentType,
+                        attachment.Size, attachment.Url)).ToArray());
+            var attachmentLines = submittedAttachments.Select(attachment =>
+                $"[Discord attachment: {attachment.Name}, {attachment.MediaType}, {attachment.Size} bytes, sha256 {attachment.Sha256}, quarantined asset {attachment.ScopeToken}]");
+            var content = string.Join('\n', new[] { message.Content }.Concat(attachmentLines)).Trim();
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                typing.Cancel(typingAdmission);
+                return;
+            }
+            var guildContext = BuildGuildContext(message, config);
+            var admission = await conversations.SubmitAsync(binding, message.Id.ToString(),
+                new ExternalRequestor(message.Author.Id.ToString(),
+                    message.Author.GlobalName ?? message.Author.Username, message.Author.Username),
+                content, submittedAttachments, guildContext: guildContext,
+                behaviorContext: behavior.ToTrustedMetadata());
+            if (admission is null)
+                typing.Cancel(typingAdmission);
+            else
+            {
+                typing.MarkAdmitted(typingAdmission, admission.MessageUid);
+                maintenance.RequestFull(binding.BindingId);
+            }
+        }
+        catch (Exception ex)
+        {
+            typing.Cancel(typingAdmission);
+            maintenance.RequestFull(binding.BindingId);
+            logger.LogError(ex, "Discord message {MessageId} failed", message.Id);
+            try
+            {
+                await conversations.EnqueueNoticeAsync(binding, message.Id.ToString(),
+                    "I could not admit that message. The failure has been recorded in Leaf.");
+                maintenance.RequestDrain(binding.BindingId);
+            }
+            catch (Exception noticeError)
+            {
+                logger.LogError(noticeError,
+                    "Discord failure notice could not be queued for message {MessageId}", message.Id);
+            }
+        }
+    }
+
+    private async Task ForwardCommonsMessageAsync(IUserMessage message)
+    {
+        var location = CommonsLocation(message.Channel);
+        if (location is null) return;
+        if (message.Source == MessageSource.Webhook)
+        {
+            await commons.EnqueueAsync(configId, message.Id.ToString(), new JsonObject
+            {
+                ["type"] = "webhook_echo",
+                ["eventId"] = message.Id.ToString(),
+                ["messageId"] = message.Id.ToString(),
+                ["channel"] = location.Value.Channel,
+                ["threadRef"] = location.Value.ThreadRef,
+                ["timestamp"] = message.Timestamp.ToUnixTimeMilliseconds(),
+            });
+            return;
+        }
+        if (message.Author.IsBot) return;
+        var mentions = message.MentionedUserIds
+            .Select(value => value.ToString())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        await commons.EnqueueAsync(configId, message.Id.ToString(), new JsonObject
+        {
+            ["type"] = "human_message",
+            ["eventId"] = message.Id.ToString(),
+            ["authorId"] = message.Author.Id.ToString(),
+            ["displayName"] = message.Author is SocketGuildUser member
+                ? member.DisplayName
+                : message.Author.GlobalName ?? message.Author.Username,
+            ["content"] = message.Content,
+            ["mentions"] = new JsonArray(mentions
+                .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
+            ["channel"] = location.Value.Channel,
+            ["threadRef"] = location.Value.ThreadRef,
+            ["opensFloor"] = location.Value.ThreadRef is not null && mentions.Length == 0,
+            ["timestamp"] = message.Timestamp.ToUnixTimeMilliseconds(),
+        });
+    }
+
+    private async Task OnReactionAddedAsync(
+        Cacheable<IUserMessage, ulong> _,
+        Cacheable<IMessageChannel, ulong> channel,
+        SocketReaction reaction)
+    {
+        try
+        {
+            if (!string.Equals(reaction.Emote.Name, "🛑", StringComparison.Ordinal)) return;
+            if (client?.CurrentUser.Id == reaction.UserId) return;
+            var resolved = client?.GetChannel(channel.Id);
+            var location = resolved is null ? null : CommonsLocation(resolved);
+            if (location?.ThreadRef is null) return;
+            var guildId = (resolved as SocketGuildChannel)?.Guild.Id.ToString();
+            if (!await commons.IsCommonsGuildAsync(configId, guildId)) return;
+            if ((resolved as SocketGuildChannel)?.Guild.GetUser(reaction.UserId)?.IsBot == true)
+                return;
+            var eventId = $"reaction:{reaction.MessageId}:{reaction.UserId}:stop";
+            await commons.EnqueueAsync(configId, eventId, new JsonObject
+            {
+                ["type"] = "stop_reaction",
+                ["eventId"] = eventId,
+                ["actorId"] = reaction.UserId.ToString(),
+                ["threadRef"] = location.Value.ThreadRef,
+            });
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Commons stop reaction forwarding failed");
+        }
+    }
+
+    private static (string Channel, string? ThreadRef)? CommonsLocation(
+        IChannel channel)
+        => channel switch
+        {
+            SocketThreadChannel thread => (
+                DiscordCommonsRelayService.ChannelName(thread.ParentChannel.Name),
+                thread.Id.ToString()),
+            SocketGuildChannel guildChannel => (
+                DiscordCommonsRelayService.ChannelName(guildChannel.Name),
+                null),
+            _ => null,
+        };
+
+    public async Task AddReactionAsync(
+        DiscordBinding binding, string messageId, string emoji, CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(messageId, out _))
+            throw new ArgumentException("Discord message id must be a snowflake", nameof(messageId));
+        emoji = emoji.Trim();
+        if (emoji.Length is < 1 or > 128 || emoji.Any(char.IsControl))
+            throw new ArgumentException("Discord reaction emoji is invalid", nameof(emoji));
+        var config = await GetConfigAsync(ct);
+        if (client is null || string.IsNullOrWhiteSpace(config.BotToken))
+            throw new InvalidOperationException("Discord is not connected");
+        await rest.AddReactionAsync(
+            config.BotToken, binding.ConversationId, messageId, emoji, ct);
+    }
+
+    public async Task<string> PinExistingBindingMessageAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(messageUid) || messageUid.Length > 256)
+            throw new ArgumentException("A bounded canonical message UID is required", nameof(messageUid));
+        var config = await GetConfigAsync(ct);
+        if (client is null || string.IsNullOrWhiteSpace(config.BotToken))
+            throw new InvalidOperationException("Discord is not connected");
+        ValidateExistingBindingTarget(binding, config.DmAllowlist);
+        var delivery = await deliveries.FindSentOutboundAsync(
+            binding.BindingId, binding.Generation, messageUid.Trim(), ct)
+            ?? throw new KeyNotFoundException(
+                "No sent Discord delivery exists for this binding and canonical message UID.");
+        await rest.PinMessageAsync(
+            config.BotToken, binding.ConversationId, delivery.DiscordId!, ct);
+        return delivery.DiscordId!;
+    }
+
+    public async Task<DiscordMessageMutationResult> DeleteExistingBindingMessageAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+    {
+        ValidateMessageUid(messageUid);
+        messageUid = messageUid.Trim();
+        var config = await GetConfigAsync(ct);
+        ValidateExistingBindingTarget(binding, config.DmAllowlist);
+
+        var gate = outboxGates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var owned = await deliveries.FindOwnedOutboundAsync(
+                binding.BindingId, binding.Generation, messageUid, ct);
+            if (owned.Count == 0)
+                throw new KeyNotFoundException(
+                    "No bot-authored Discord delivery exists for this binding, generation, and canonical message UID.");
+            if (owned.All(item => item.State == "deleted"))
+                return new DiscordMessageMutationResult(
+                    messageUid, owned.Select(item => item.DiscordId!).ToArray(), 0);
+            if (client is null || client.ConnectionState != ConnectionState.Connected
+                               || string.IsNullOrWhiteSpace(config.BotToken))
+                throw new InvalidOperationException("Discord is not connected");
+
+            var changed = 0;
+            foreach (var delivery in owned)
+            {
+                if (delivery.State == "deleted") continue;
+                try
+                {
+                    await DeleteDiscordMessageAsync(binding, config, delivery.DiscordId!, ct);
+                }
+                catch (DiscordRestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    // Discord already converged to the requested state. Persist that
+                    // fact so every later retry is a local no-op.
+                }
+                await deliveries.MarkDeletedAsync(delivery, ct);
+                changed++;
+            }
+            return new DiscordMessageMutationResult(
+                messageUid, owned.Select(item => item.DiscordId!).ToArray(), changed);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    public async Task<DiscordMessageMutationResult> EditExistingBindingMessageAsync(
+        DiscordBinding binding,
+        string messageUid,
+        string? content,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset>? outputAssets,
+        CancellationToken ct = default)
+    {
+        ValidateMessageUid(messageUid);
+        if (content is null && deliveryContent is null && outputAssets is null)
+            throw new ArgumentException(
+                "A Discord correction must replace text, attachments, or both.");
+        if (content is { Length: > 32_000 })
+            throw new ArgumentException(
+                "Discord correction content exceeds the 32,000 character safety limit.");
+        if (deliveryContent is { Length: > 32_000 })
+            throw new ArgumentException(
+                "Discord correction delivery content exceeds the 32,000 character safety limit.");
+        if (outputAssets is { Count: > 10 })
+            throw new ArgumentException(
+                "A Discord message can contain at most 10 output Assets.");
+        if (outputAssets is { Count: > 0 } && content is not null && deliveryContent is null)
+            throw new ArgumentException(
+                "Discord output Assets accompanying canonical content require explicit delivery content.");
+
+        var prepared = conversations.InspectCorrection(
+            content, deliveryContent, outputAssets);
+        var replacesContent = content is not null || deliveryContent is not null;
+        var chunks = replacesContent
+            ? DiscordMessageChunker.Split(prepared.DeliveryContent ?? "")
+            : [];
+        var replacementCount = replacesContent
+            ? Math.Max(1, chunks.Count)
+            : 0;
+        if (prepared.OutputAssets is not null)
+            replacementCount = Math.Max(1, replacementCount);
+
+        messageUid = messageUid.Trim();
+        var config = await GetConfigAsync(ct);
+        if (client is null || client.ConnectionState != ConnectionState.Connected
+                           || string.IsNullOrWhiteSpace(config.BotToken))
+            throw new InvalidOperationException("Discord is not connected");
+        ValidateExistingBindingTarget(binding, config.DmAllowlist);
+
+        var gate = outboxGates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var owned = await deliveries.FindOwnedOutboundAsync(
+                binding.BindingId, binding.Generation, messageUid, ct);
+            if (owned.Count == 0)
+                throw new KeyNotFoundException(
+                    "No bot-authored Discord delivery exists for this binding, generation, and canonical message UID.");
+            var active = owned.Where(item => item.State != "deleted").ToArray();
+            if (active.Length == 0)
+                throw new InvalidOperationException("The bot-authored Discord message was deleted.");
+            if (replacesContent && replacementCount > active.Length)
+                throw new ArgumentException(
+                    "The corrected text needs more Discord messages than the original delivery.");
+
+            ResolvedOutboundPayload? resolvedAssets = null;
+            if (prepared.OutputAssets is not null)
+            {
+                var payload = new JsonObject
+                {
+                    ["content"] = replacesContent && chunks.Count > 0 ? chunks[0] : "",
+                    ["assets"] = new JsonArray(prepared.OutputAssets.Select(asset =>
+                        (JsonNode?)new JsonObject
+                        {
+                            ["asset_id"] = asset.AssetId,
+                            ["description"] = asset.Description,
+                        }).ToArray()),
+                };
+                resolvedAssets = await ResolveOutboundPayloadAsync(
+                    active[0] with { Payload = payload }, config, assets, ct);
+            }
+
+            var keptCount = replacesContent ? replacementCount : active.Length;
+            var changed = 0;
+            for (var index = 0; index < keptCount; index++)
+            {
+                string? correctedContent = replacesContent
+                    ? index < chunks.Count ? chunks[index] : ""
+                    : null;
+                IReadOnlyList<DiscordOutboundFile>? correctedFiles = null;
+                if (resolvedAssets is not null)
+                {
+                    correctedFiles = index == 0 ? resolvedAssets.Files : [];
+                    if (index == 0
+                        && (!string.IsNullOrEmpty(resolvedAssets.Content) || replacesContent))
+                        correctedContent = resolvedAssets.Content;
+                }
+                await EditDiscordMessageAsync(
+                    binding, config, active[index].DiscordId!, correctedContent,
+                    correctedFiles, ct);
+                await deliveries.MarkEditedAsync(active[index], ct);
+                changed++;
+            }
+
+            if (replacesContent)
+            {
+                for (var index = keptCount; index < active.Length; index++)
+                {
+                    try
+                    {
+                        await DeleteDiscordMessageAsync(
+                            binding, config, active[index].DiscordId!, ct);
+                    }
+                    catch (DiscordRestException ex) when (
+                        ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                    }
+                    await deliveries.MarkDeletedAsync(active[index], ct);
+                    changed++;
+                }
+            }
+
+            return new DiscordMessageMutationResult(
+                messageUid, owned.Select(item => item.DiscordId!).ToArray(), changed);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task EditDiscordMessageAsync(
+        DiscordBinding binding,
+        LeafDiscordConfig config,
+        string discordMessageId,
+        string? content,
+        IReadOnlyList<DiscordOutboundFile>? files,
+        CancellationToken ct)
+    {
+        if (string.Equals(binding.DeliveryMode, "webhook", StringComparison.Ordinal)
+            && !string.IsNullOrWhiteSpace(binding.WebhookId)
+            && !string.IsNullOrWhiteSpace(binding.WebhookToken))
+        {
+            await rest.EditWebhookMessageAsync(
+                binding.WebhookId, binding.WebhookToken, discordMessageId,
+                content, files, ct);
+            return;
+        }
+        await rest.EditMessageAsync(
+            config.BotToken!, binding.ConversationId, discordMessageId,
+            content, files, ct);
+    }
+
+    private async Task DeleteDiscordMessageAsync(
+        DiscordBinding binding,
+        LeafDiscordConfig config,
+        string discordMessageId,
+        CancellationToken ct)
+    {
+        if (string.Equals(binding.DeliveryMode, "webhook", StringComparison.Ordinal)
+            && !string.IsNullOrWhiteSpace(binding.WebhookId)
+            && !string.IsNullOrWhiteSpace(binding.WebhookToken))
+        {
+            await rest.DeleteWebhookMessageAsync(
+                binding.WebhookId, binding.WebhookToken, discordMessageId, ct);
+            return;
+        }
+        await rest.DeleteMessageAsync(
+            config.BotToken!, binding.ConversationId, discordMessageId, ct);
+    }
+
+    private static void ValidateMessageUid(string messageUid)
+    {
+        if (string.IsNullOrWhiteSpace(messageUid) || messageUid.Length > 256)
+            throw new ArgumentException(
+                "A bounded canonical message UID is required", nameof(messageUid));
+    }
+
+    private async Task<DiscordBinding?> FindOrCreateBindingAsync(
+        IUserMessage message, LeafDiscordConfig config)
+    {
+        var existing = await bindings.FindAsync(
+            config.ApplicationId, message.Channel.Id.ToString());
+        if (existing is not null)
+        {
+            var dmBackfill = BuildExistingDmBackfill(
+                existing,
+                message.Author.Id.ToString(),
+                message.Author.GlobalName ?? message.Author.Username,
+                config.DmAllowlist.Contains(message.Author.Id.ToString()));
+            return dmBackfill is null
+                ? existing
+                : await bindings.GetOrCreateAsync(dmBackfill);
+        }
+
+        string kind;
+        string? guildId;
+        string? parentConversationId;
+        string conversationName;
+        string? guildName;
+        string? counterpartyUserId;
+        string responseMode;
+        switch (message.Channel)
+        {
+            case IDMChannel:
+                if (!config.DmAllowlist.Contains(message.Author.Id.ToString()))
+                    return null;
+                kind = "dm";
+                guildId = null;
+                parentConversationId = null;
+                conversationName = message.Author.GlobalName ?? message.Author.Username;
+                guildName = null;
+                counterpartyUserId = message.Author.Id.ToString();
+                responseMode = "direct";
+                break;
+            case SocketThreadChannel thread:
+                kind = "thread";
+                guildId = thread.Guild.Id.ToString();
+                parentConversationId = thread.ParentChannel.Id.ToString();
+                conversationName = thread.Name;
+                guildName = thread.Guild.Name;
+                counterpartyUserId = null;
+                responseMode = "participate";
+                break;
+            case SocketGuildChannel channel:
+                kind = "guild_channel";
+                guildId = channel.Guild.Id.ToString();
+                parentConversationId = null;
+                conversationName = channel.Name;
+                guildName = channel.Guild.Name;
+                counterpartyUserId = null;
+                responseMode = "participate";
+                break;
+            default:
+                return null;
+        }
+
+        var ownerId = config.OwnerUserId
+            ?? await agents.ResolveOwnerUserIdAsync(config.AgentId)
+            ?? throw new InvalidOperationException(
+                $"Discord could not resolve the owner of Agent '{config.AgentId}'.");
+        var behavior = await behaviors.ResolveAsync(
+            config, kind, guildId, message.Channel.Id.ToString(), parentConversationId,
+            responseMode, CancellationToken.None);
+        return await bindings.GetOrCreateAsync(new CreateDiscordBinding(
+            config.ApplicationId,
+            message.Channel.Id.ToString(),
+            kind,
+            guildId,
+            parentConversationId,
+            config.AgentId,
+            ownerId,
+            config.AudienceProfile,
+            behavior.ResponseMode,
+            conversationName,
+            guildName,
+            counterpartyUserId,
+            config.SessionQualityMode,
+            config.SentinelQualityMode));
+    }
+
+    internal static bool ShouldAdmitMessage(
+        string bindingKind,
+        string responseMode,
+        bool mentioned,
+        bool repliesToBot)
+    {
+        if (responseMode == DiscordResponseModes.ContextOnly) return false;
+        if (bindingKind == "dm") return true;
+        return responseMode is DiscordResponseModes.Selective
+                or DiscordResponseModes.Participate
+            || mentioned
+            || repliesToBot;
+    }
+
+    internal static bool ShouldStartTypingImmediately(
+        string bindingKind,
+        string responseMode,
+        bool mentioned,
+        bool repliesToBot)
+        => bindingKind == "dm"
+           || responseMode == DiscordResponseModes.Participate
+           || mentioned
+           || repliesToBot;
+
+    internal static DiscordStartupBackfillPolicy GetStartupBackfillPolicy(string bindingKind)
+        => bindingKind == "dm"
+            ? new(DmStartupBackfillLimit, DmStartupBackfillMaxAge, false)
+            : new(GuildStartupBackfillLimit, GuildStartupBackfillMaxAge, true);
+
+    internal static bool ShouldAdmitStartupBackfillMessage(
+        string bindingKind,
+        DateTimeOffset messageTimestamp,
+        DateTimeOffset observedAt,
+        bool mentioned,
+        bool repliesToBot)
+    {
+        var policy = GetStartupBackfillPolicy(bindingKind);
+        if (messageTimestamp < observedAt - policy.MaxAge) return false;
+        return !policy.RequiresDirectAddress || mentioned || repliesToBot;
+    }
+
+    internal static CreateDiscordBinding? BuildExistingDmBackfill(
+        DiscordBinding existing,
+        string authenticatedAuthorId,
+        string authenticatedAuthorName,
+        bool authorAllowed)
+    {
+        if (existing.Kind != "dm"
+            || !string.IsNullOrWhiteSpace(existing.CounterpartyUserId)
+            || !authorAllowed
+            || string.IsNullOrWhiteSpace(authenticatedAuthorId))
+            return null;
+
+        return new CreateDiscordBinding(
+            existing.ApplicationId,
+            existing.ConversationId,
+            existing.Kind,
+            existing.GuildId,
+            existing.ParentConversationId,
+            existing.AgentId,
+            existing.OwnerId,
+            existing.AudienceProfile,
+            existing.ResponseMode,
+            authenticatedAuthorName,
+            existing.GuildName,
+            authenticatedAuthorId,
+            existing.SessionQualityMode,
+            existing.SentinelQualityMode);
+    }
+
+    private async Task BackfillBindingsAsync()
+    {
+        if (client is null) return;
+        var config = await GetConfigAsync();
+        foreach (var binding in await bindings.ListAsync())
+        {
+            try
+            {
+                if (!string.Equals(
+                        binding.ApplicationId, config.ApplicationId, StringComparison.Ordinal)
+                    || !binding.Enabled
+                    || !ulong.TryParse(binding.LastReceivedSnowflake, out var cursor)
+                    || !ulong.TryParse(binding.ConversationId, out var channelId))
+                    continue;
+                var channel = client.GetChannel(channelId) as IMessageChannel
+                    ?? await client.GetChannelAsync(channelId) as IMessageChannel;
+                if (channel is null) continue;
+
+                var policy = GetStartupBackfillPolicy(binding.Kind);
+                var observedAt = DateTimeOffset.UtcNow;
+                var batch = (await channel.GetMessagesAsync(
+                        policy.MessageLimit, CacheMode.AllowDownload).FlattenAsync())
+                    .Where(message => message.Id > cursor)
+                    .OrderBy(message => message.Id)
+                    .ToArray();
+                if (batch.Length == 0) continue;
+
+                var admitted = 0;
+                foreach (var message in batch.OfType<IUserMessage>())
+                {
+                    var mentioned = message.MentionedUserIds.Contains(client.CurrentUser.Id);
+                    var repliesToBot = message.ReferencedMessage?.Author.Id == client.CurrentUser.Id;
+                    if (!ShouldAdmitStartupBackfillMessage(
+                            binding.Kind, message.Timestamp, observedAt, mentioned, repliesToBot))
+                        continue;
+                    admitted++;
+                    await ProcessMessageAsync(message);
+                }
+
+                await bindings.MarkReceivedAsync(binding, batch[^1].Id.ToString());
+                logger.LogInformation(
+                    "Discord startup backfill admitted {AdmittedCount} of {InspectedCount} recent messages for {BindingId}; cursor advanced through {NewestMessageId}",
+                    admitted, batch.Length, binding.BindingId, batch[^1].Id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Discord startup backfill failed for {BindingId}", binding.BindingId);
+            }
+        }
+    }
+
+    private async Task OnSlashCommandAsync(SocketSlashCommand command)
+    {
+        try
+        {
+            var config = await GetConfigAsync();
+            if (await TryHandleCommonsCommandAsync(command)) return;
+            var action = explicitActions.SingleOrDefault(handler =>
+                handler.CommandName == command.Data.Name && handler.Handles(config.EntityId, config.AgentId));
+            if (action is not null)
+            {
+                await command.DeferAsync(ephemeral: true);
+                var verifiedMember = command.GuildId is { } guildId
+                    && command.User is SocketGuildUser member && member.Guild.Id == guildId;
+                var request = new VerifiedDiscordAction(config.EntityId, config.AgentId,
+                    command.Id.ToString(), command.User.Id.ToString(), command.GuildId?.ToString(),
+                    verifiedMember, command.Data.Options.FirstOrDefault(o => o.Name == "action")?.Value?.ToString() ?? "open");
+                var result = await action.ExecuteAsync(request, async (privateContent, ct) => {
+                    try {
+                        await command.User.SendMessageAsync(privateContent,
+                            options: new RequestOptions { CancelToken = ct }, allowedMentions: AllowedMentions.None);
+                        return true;
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException) { return false; }
+                });
+                await command.FollowupAsync(result, ephemeral: true, allowedMentions: AllowedMentions.None);
+                return;
+            }
+            var binding = command.ChannelId is { } channelId
+                ? await bindings.FindAsync(config.ApplicationId, channelId.ToString())
+                : null;
+            switch (command.Data.Name)
+            {
+                case "clear":
+                    if (binding is null)
+                    {
+                        await command.RespondAsync("This conversation is not bound to an Agent.", ephemeral: true);
+                        return;
+                    }
+                    if (!config.ClearAllowlist.Contains(command.User.Id.ToString()))
+                    {
+                        await command.RespondAsync("You are not allowed to clear this shared conversation.", ephemeral: true);
+                        return;
+                    }
+                    var advanced = await conversations.ClearAsync(binding, command.Id.ToString());
+                    await command.RespondAsync($"Context cleared. This is generation {advanced.Generation}.");
+                    return;
+                case "status":
+                    var status = await GetStatusAsync();
+                    await command.RespondAsync(
+                        $"Leaf Discord: {status.State}. Binding: {(binding is null ? "not configured" : $"generation {binding.Generation}")}",
+                        ephemeral: true);
+                    return;
+                case "privacy":
+                    await command.RespondAsync(
+                        "This is a normal persistent Agent session with its workspace and tools so it can troubleshoot properly. Discord content is treated as untrusted and checked by a separate Sentinel. The Agent will not disclose its owner's private information or accept Discord participants as owner delegates.",
+                        ephemeral: true);
+                    return;
+                default:
+                    await command.RespondAsync(
+                        "Talk to me normally in a bound support channel. Use /clear for a fresh context, /status for health, and /privacy for the boundary.",
+                        ephemeral: true);
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Discord slash command {Command} failed", command.Data.Name);
+            if (!command.HasResponded)
+                await command.RespondAsync("That command failed safely. Check Leaf for details.", ephemeral: true);
+        }
+    }
+
+    private async Task<bool> TryHandleCommonsCommandAsync(SocketSlashCommand command)
+    {
+        if (command.Data.Name is not ("ask" or "pause" or "resume")) return false;
+        var guildId = command.GuildId?.ToString();
+        if (!await commons.IsCommonsGuildAsync(configId, guildId))
+        {
+            await command.RespondAsync(
+                "That Commons command is available only in a configured Commons server.",
+                ephemeral: true);
+            return true;
+        }
+        var channel = command.ChannelId is { } channelId
+            ? client?.GetChannel(channelId)
+            : null;
+        var location = channel is null ? null : CommonsLocation(channel);
+        if (location?.ThreadRef is null)
+        {
+            await command.RespondAsync(
+                "Use this command inside a Commons forum thread.", ephemeral: true);
+            return true;
+        }
+        var eventId = command.Id.ToString();
+        var actorId = command.User.Id.ToString();
+        if (command.Data.Name == "ask")
+        {
+            var envoy = command.Data.Options.FirstOrDefault(option => option.Name == "envoy")
+                ?.Value?.ToString()?.Trim();
+            var content = command.Data.Options.FirstOrDefault(option => option.Name == "question")
+                ?.Value?.ToString()?.Trim();
+            if (string.IsNullOrWhiteSpace(envoy) || string.IsNullOrWhiteSpace(content))
+            {
+                await command.RespondAsync(
+                    "Both an Envoy and a question are required.", ephemeral: true);
+                return true;
+            }
+            await commons.EnqueueAsync(configId, eventId, new JsonObject
+            {
+                ["type"] = "ask",
+                ["eventId"] = eventId,
+                ["authorId"] = actorId,
+                ["displayName"] = command.User is SocketGuildUser member
+                    ? member.DisplayName
+                    : command.User.GlobalName ?? command.User.Username,
+                ["envoy"] = envoy,
+                ["content"] = content,
+                ["channel"] = location.Value.Channel,
+                ["threadRef"] = location.Value.ThreadRef,
+                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            });
+            await command.RespondAsync("Your question was queued for Nova Commons.", ephemeral: true);
+            return true;
+        }
+        await commons.EnqueueAsync(configId, eventId, new JsonObject
+        {
+            ["type"] = command.Data.Name,
+            ["eventId"] = eventId,
+            ["actorId"] = actorId,
+            ["threadRef"] = location.Value.ThreadRef,
+        });
+        await command.RespondAsync(
+            command.Data.Name == "pause"
+                ? "This Commons thread was queued to pause."
+                : "This Commons thread was queued to resume.",
+            ephemeral: true);
+        return true;
+    }
+
+    private async Task RegisterCommandsAsync()
+    {
+        if (client is null) return;
+        var commands = new[]
+        {
+            new SlashCommandBuilder().WithName("clear").WithDescription("Start a fresh context generation").Build(),
+            new SlashCommandBuilder().WithName("status").WithDescription("Show Leaf Discord connection and binding health").Build(),
+            new SlashCommandBuilder().WithName("privacy").WithDescription("Explain the Agent's Discord privacy boundary").Build(),
+            new SlashCommandBuilder().WithName("help").WithDescription("Show Leaf Discord commands").Build(),
+        };
+        var config = await GetConfigAsync();
+        var contributed = explicitActions.Where(handler => handler.Handles(config.EntityId, config.AgentId))
+            .Select(handler => new SlashCommandBuilder().WithName(handler.CommandName)
+                .WithDescription(handler.Description)
+                .AddOption(new SlashCommandOptionBuilder().WithName("action")
+                    .WithDescription("Open, recover/revoke access, or join/leave this server's private atlas")
+                    .WithType(ApplicationCommandOptionType.String).WithRequired(false)
+                    .AddChoice("Open my atlas", "open").AddChoice("Recover and rotate access", "recover")
+                    .AddChoice("Revoke all access", "revoke").AddChoice("Join this server's atlas", "join")
+                    .AddChoice("Leave this server's atlas", "leave")).Build());
+        try
+        {
+            await client.BulkOverwriteGlobalApplicationCommandsAsync(
+                commands.Concat(contributed).ToArray());
+            var commonsCommands = new ApplicationCommandProperties[]
+            {
+                new SlashCommandBuilder().WithName("ask")
+                    .WithDescription("Ask a specific Commons Envoy in this thread")
+                    .AddOption("envoy", ApplicationCommandOptionType.String,
+                        "Envoy ID or persona name", isRequired: true)
+                    .AddOption("question", ApplicationCommandOptionType.String,
+                        "Question for the Envoy", isRequired: true)
+                    .Build(),
+                new SlashCommandBuilder().WithName("pause")
+                    .WithDescription("Pause Envoy replies in this Commons thread").Build(),
+                new SlashCommandBuilder().WithName("resume")
+                    .WithDescription("Resume Envoy replies in this Commons thread").Build(),
+            };
+            var commonsConfig = await commons.GetConfigurationAsync(configId);
+            var commonsGuilds = commonsConfig is null
+                ? Array.Empty<string>()
+                : commonsConfig.GuildAllowlist.ToArray();
+            foreach (var guildId in commonsGuilds)
+            {
+                if (!ulong.TryParse(guildId, out var parsedGuildId)) continue;
+                var guild = client.GetGuild(parsedGuildId);
+                if (guild is not null)
+                    await guild.BulkOverwriteApplicationCommandAsync(commonsCommands);
+            }
+        }
+        catch (HttpException ex)
+        {
+            logger.LogWarning(ex, "Discord application command registration failed");
+        }
+    }
+
+    private async Task RunOutboxLoopAsync(CancellationToken ct)
+    {
+        foreach (var binding in await bindings.ListAsync(ct))
+            maintenance.RetryFull(binding.BindingId);
+
+        var first = true;
+        while (true)
+        {
+            var recoverySweep = false;
+            if (!first)
+                recoverySweep = !await maintenance.WaitAsync(
+                    MaintenanceRecoveryInterval, ct);
+            first = false;
+
+            var config = await GetConfigAsync(ct);
+            if (recoverySweep)
+            {
+                foreach (var binding in await bindings.ListAsync(ct))
+                {
+                    if (binding.Enabled && string.Equals(
+                            binding.ApplicationId, config.ApplicationId,
+                            StringComparison.Ordinal))
+                        maintenance.RetryFull(binding.BindingId);
+                }
+            }
+            foreach (var request in maintenance.TakePending())
+            {
+                var binding = await bindings.FindByBindingIdAsync(request.BindingId, ct);
+                if (binding is null) continue;
+                if (!binding.Enabled || !string.Equals(
+                        binding.ApplicationId, config.ApplicationId, StringComparison.Ordinal))
+                    continue;
+                if (ShouldDeferLegacyOwnerMaintenance(config, binding))
+                    continue;
+                var activeBinding = string.IsNullOrWhiteSpace(config.OwnerUserId)
+                    ? binding
+                    : await bindings.RepairLegacyOwnerAsync(
+                        binding, config.OwnerUserId, ct);
+
+                var retryFull = false;
+                if (request.FullReconciliation)
+                {
+                    try
+                    {
+                        await conversations.RetryPendingAsync(activeBinding, ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        retryFull = true;
+                        logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
+                            "inbound retry", activeBinding.BindingId);
+                    }
+
+                    try
+                    {
+                        if (!await conversations.ReconcileAsync(activeBinding, ct))
+                            retryFull = true;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        retryFull = true;
+                        logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
+                            "transcript reconciliation", activeBinding.BindingId);
+                    }
+
+                    if (retryFull)
+                        maintenance.RetryFull(activeBinding.BindingId);
+                }
+
+                try
+                {
+                    await DrainBindingAsync(activeBinding, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    maintenance.RetryDrain(activeBinding.BindingId);
+                    logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
+                        "outbound drain", activeBinding.BindingId);
+                }
+            }
+        }
+    }
+
+    private void DetachConversationReconciledHandler()
+    {
+        if (conversationReconciledHandler is not null)
+            conversations.Reconciled -= conversationReconciledHandler;
+        conversationReconciledHandler = null;
+        maintenanceApplicationId = null;
+    }
+
+    private async Task RunPresenceLoopAsync(
+        DiscordSocketClient source,
+        CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
+        while (await timer.WaitForNextTickAsync(ct))
+            await PublishOwnerPresenceAsync(source, forceRefresh: true, ct);
+    }
+
+    private async Task PublishOwnerPresenceAsync(
+        DiscordSocketClient source,
+        bool forceRefresh = false,
+        CancellationToken ct = default)
+    {
+        if (!ReferenceEquals(client, source)) return;
+        try
+        {
+            await ownerPresence.PublishAsync(
+                await GetConfigAsync(ct), source, forceRefresh, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Discord owner presence projection failed for bot configuration {ConfigId}",
+                configId);
+        }
+    }
+
+    private static JsonObject? BuildGuildContext(
+        IUserMessage message, LeafDiscordConfig config)
+    {
+        if (message.Channel is not SocketGuildChannel channel)
+            return null;
+        var members = config.PresenceContextMode == DiscordPresenceContextModes.Off
+            ? []
+            : channel.Guild.Users.Select(user =>
+            new DiscordGuildContextMember(
+                user.Id.ToString(),
+                user.DisplayName,
+                user.Status.ToString(),
+                user.Activities.Select(activity => new DiscordGuildContextActivity(
+                    activity.Type.ToString(),
+                    activity is SpotifyGame spotify ? spotify.TrackTitle : activity.Name,
+                    activity is SpotifyGame listening
+                        ? string.Join(", ", listening.Artists)
+                        : activity.Details,
+                    activity is SpotifyGame album
+                        ? album.AlbumTitle
+                        : activity is RichGame rich ? rich.State : null)).ToArray(),
+                user.VoiceChannel?.Name,
+                user.IsBot)).ToArray();
+        var capturedAt = DateTimeOffset.UtcNow;
+        return DiscordGuildContextBuilder.Build(
+            config.PresenceContextMode,
+            channel.Guild.Id.ToString(),
+            channel.Guild.Name,
+            channel.Id.ToString(),
+            channel.Name,
+            members,
+            channel.Guild.Users.Count >= channel.Guild.MemberCount,
+            capturedAt,
+            BuildGuildNavigation(
+                channel.Guild, channel.Id.ToString(), capturedAt));
+    }
+
+    internal static bool ShouldDeferLegacyOwnerMaintenance(
+        LeafDiscordConfig config, DiscordBinding binding)
+        => string.IsNullOrWhiteSpace(config.OwnerUserId)
+            && string.Equals(
+                binding.OwnerId, "local-user", StringComparison.OrdinalIgnoreCase);
+
+    internal static async Task RunBindingMaintenanceAsync(
+        Func<Task> retryInbound,
+        Func<Task> reconcileTranscript,
+        Func<Task> drainOutbound,
+        Action<string, Exception> reportFailure,
+        CancellationToken ct = default)
+    {
+        await RunPhaseAsync("inbound retry", retryInbound, reportFailure, ct);
+        await RunPhaseAsync("transcript reconciliation", reconcileTranscript, reportFailure, ct);
+        await RunPhaseAsync("outbound drain", drainOutbound, reportFailure, ct);
+    }
+
+    private static async Task RunPhaseAsync(
+        string phase,
+        Func<Task> operation,
+        Action<string, Exception> reportFailure,
+        CancellationToken ct)
+    {
+        try
+        {
+            await operation();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            reportFailure(phase, ex);
+        }
+    }
+
+    private async Task DrainBindingAsync(DiscordBinding binding, CancellationToken ct)
+    {
+        if (await commons.IsCommonsGuildAsync(configId, binding.GuildId, ct)) return;
+        var gate = outboxGates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            if (client is null || !ulong.TryParse(binding.ConversationId, out _)) return;
+            var config = await GetConfigAsync(ct);
+            if (string.IsNullOrWhiteSpace(config.BotToken)) return;
+            var useWebhook = string.Equals(
+                    binding.DeliveryMode, "webhook", StringComparison.Ordinal)
+                && !string.IsNullOrWhiteSpace(binding.WebhookId)
+                && !string.IsNullOrWhiteSpace(binding.WebhookToken);
+            var pending = await deliveries.PendingOutboundAsync(binding.BindingId, ct);
+            for (var index = 0; index < pending.Count; index++)
+            {
+                var delivery = pending[index];
+                if (delivery.Generation != binding.Generation) continue;
+                if (delivery.Kind == DiscordDeliveryStore.ProgressKind)
+                {
+                    var batch = new List<DiscordDelivery> { delivery };
+                    while (index + 1 < pending.Count
+                           && pending[index + 1].Generation == delivery.Generation
+                           && pending[index + 1].Kind == DiscordDeliveryStore.ProgressKind
+                           && string.Equals(
+                               pending[index + 1].MessageUid,
+                               delivery.MessageUid,
+                               StringComparison.Ordinal))
+                        batch.Add(pending[++index]);
+
+                    var latest = batch[^1];
+                    var progressContent = latest.Payload?["content"]?.GetValue<string>();
+                    if (string.IsNullOrEmpty(progressContent))
+                    {
+                        foreach (var item in batch)
+                            await deliveries.MarkFailedAsync(
+                                item, "Queued progress payload is missing", ct);
+                        continue;
+                    }
+                    try
+                    {
+                        var receipt = await deliveries.FindProgressReceiptAsync(latest, ct);
+                        if (receipt is null)
+                            receipt = useWebhook
+                                ? await rest.SendWebhookAsync(
+                                    binding.WebhookId!, binding.WebhookToken!,
+                                    progressContent, ct)
+                                : await rest.SendIdempotentAsync(
+                                    config.BotToken,
+                                    binding.ConversationId,
+                                    progressContent,
+                                    DiscordRestTransport.Nonce(latest),
+                                    ct);
+                        else
+                        {
+                            if (useWebhook)
+                                await rest.EditWebhookMessageAsync(
+                                    binding.WebhookId!, binding.WebhookToken!,
+                                    receipt, progressContent, ct);
+                            else
+                                await rest.EditMessageAsync(
+                                    config.BotToken,
+                                    binding.ConversationId,
+                                    receipt,
+                                    progressContent,
+                                    ct);
+                        }
+                        foreach (var item in batch)
+                            await deliveries.MarkSentAsync(item, receipt, ct);
+                    }
+                    catch (DiscordRestException ex) when ((int)ex.StatusCode == 429
+                                                           || (int)ex.StatusCode >= 500)
+                    {
+                        foreach (var item in batch)
+                            await deliveries.MarkRetryAsync(item, ex.Message,
+                                ex.RetryAfter ?? TimeSpan.FromSeconds(
+                                    Math.Min(60, Math.Pow(2, Math.Min(item.Attempts, 5)))), ct);
+                        break;
+                    }
+                    catch (DiscordRestException ex)
+                    {
+                        foreach (var item in batch)
+                            await deliveries.MarkFailedAsync(item, ex.Message, ct);
+                        break;
+                    }
+                    continue;
+                }
+
+                var outbound = await ResolveOutboundPayloadAsync(delivery, config, assets, ct);
+                if (string.IsNullOrEmpty(outbound.Content) && outbound.Files.Count == 0)
+                {
+                    await deliveries.MarkFailedAsync(delivery, "Queued outbound payload is missing", ct);
+                    continue;
+                }
+                try
+                {
+                    var sentId = useWebhook
+                        ? await rest.SendWebhookAsync(
+                            binding.WebhookId!, binding.WebhookToken!, outbound.Content,
+                            outbound.Files, ct)
+                        : await rest.SendIdempotentAsync(config.BotToken,
+                            binding.ConversationId, outbound.Content,
+                            DiscordRestTransport.Nonce(delivery), outbound.Files, ct);
+                    await deliveries.MarkSentAsync(delivery, sentId, ct);
+                }
+                catch (DiscordRestException ex) when ((int)ex.StatusCode == 429
+                                                       || (int)ex.StatusCode >= 500)
+                {
+                    await deliveries.MarkRetryAsync(delivery, ex.Message,
+                        ex.RetryAfter ?? TimeSpan.FromSeconds(
+                            Math.Min(60, Math.Pow(2, Math.Min(delivery.Attempts, 5)))), ct);
+                    break;
+                }
+                catch (DiscordRestException ex)
+                {
+                    await deliveries.MarkFailedAsync(delivery, ex.Message, ct);
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    internal static async Task<ResolvedOutboundPayload> ResolveOutboundPayloadAsync(
+        DiscordDelivery delivery, LeafDiscordConfig config, IAssets assetStore,
+        CancellationToken ct = default)
+    {
+        var content = delivery.Payload?["content"]?.GetValue<string>() ?? "";
+        var files = new List<DiscordOutboundFile>();
+        if (delivery.Payload?["assets"] is not JsonArray assetsPayload)
+            return new ResolvedOutboundPayload(content, files);
+
+        var unavailable = new List<string>();
+        foreach (var (assetNode, index) in assetsPayload.Select((node, index) => (node, index)))
+        {
+            var asset = assetNode as JsonObject;
+            var assetId = asset?["asset_id"]?.GetValue<string>();
+            var description = asset?["description"]?.GetValue<string>();
+            description = string.IsNullOrWhiteSpace(description) ? "Shared image" : description;
+            if (string.IsNullOrWhiteSpace(assetId))
+            {
+                unavailable.Add(description);
+                continue;
+            }
+
+            var file = await assetStore.ReadAsync(assetId, ct);
+            if (file is null
+                || file.Bytes.LongLength > config.MaxAttachmentBytes
+                || !TryImageExtension(file.ContentType, out var extension))
+            {
+                unavailable.Add(description);
+                continue;
+            }
+
+            files.Add(new DiscordOutboundFile(
+                $"shared-image-{index + 1}{extension}",
+                file.ContentType,
+                description.Length <= 1024 ? description : description[..1024],
+                file.Bytes));
+        }
+
+        foreach (var description in unavailable)
+            content = AppendUnavailableImage(content, description);
+        return new ResolvedOutboundPayload(content, files);
+    }
+
+    private static string AppendUnavailableImage(string content, string description)
+    {
+        var note = $"[Image unavailable: {description}]";
+        if (string.IsNullOrEmpty(content)) return note[..Math.Min(note.Length, 2_000)];
+        var available = 2_000 - note.Length - 2;
+        return available <= 0
+            ? note[..Math.Min(note.Length, 2_000)]
+            : $"{content[..Math.Min(content.Length, available)]}\n\n{note}";
+    }
+
+    private static bool TryImageExtension(string contentType, out string extension)
+    {
+        extension = contentType.ToLowerInvariant() switch
+        {
+            "image/png" => ".png",
+            "image/jpeg" => ".jpg",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            _ => "",
+        };
+        return extension.Length > 0;
+    }
+
+    internal sealed record ResolvedOutboundPayload(
+        string Content, IReadOnlyList<DiscordOutboundFile> Files);
+
+    private async Task DisposeClientAsync(DiscordSocketClient target)
+    {
+        var connectedHandler = ReferenceEquals(client, target)
+            ? clientConnectedHandler
+            : null;
+        var readyHandler = ReferenceEquals(client, target)
+            ? clientReadyHandler
+            : null;
+        var disconnectedHandler = ReferenceEquals(client, target)
+            ? clientDisconnectedHandler
+            : null;
+        target.Log -= OnLogAsync;
+        if (connectedHandler is not null) target.Connected -= connectedHandler;
+        if (readyHandler is not null) target.Ready -= readyHandler;
+        if (disconnectedHandler is not null) target.Disconnected -= disconnectedHandler;
+        target.MessageReceived -= OnMessageAsync;
+        target.ReactionAdded -= OnReactionAddedAsync;
+        target.SlashCommandExecuted -= OnSlashCommandAsync;
+        if (clientPresenceHandler is not null)
+            target.PresenceUpdated -= clientPresenceHandler;
+        if (clientVoiceHandler is not null)
+            target.UserVoiceStateUpdated -= clientVoiceHandler;
+        if (ReferenceEquals(client, target))
+        {
+            clientConnectedHandler = null;
+            clientReadyHandler = null;
+            clientDisconnectedHandler = null;
+            clientPresenceHandler = null;
+            clientVoiceHandler = null;
+        }
+        try { await target.StopAsync(); } catch { }
+        try { await target.LogoutAsync(); } catch { }
+        try { await target.DisposeAsync(); } catch { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync();
+        lifecycle.Dispose();
+        maintenance.Dispose();
+        foreach (var gate in outboxGates.Values) gate.Dispose();
+    }
+
+    private async Task<LeafDiscordConfig> GetConfigAsync(CancellationToken ct = default)
+        => await configStore.GetAsync(configId, ct)
+           ?? throw new InvalidOperationException(
+               $"Discord bot configuration '{configId}' no longer exists.");
+
+    private sealed record CachedUserProfile(
+        DiscordUserProfile Profile,
+        DateTimeOffset ExpiresAt);
+}
+
+internal readonly record struct DiscordStartupBackfillPolicy(
+    int MessageLimit,
+    TimeSpan MaxAge,
+    bool RequiresDirectAddress);
+
+internal sealed record DiscordTransportStatus(
+    string State,
+    string? LastError);

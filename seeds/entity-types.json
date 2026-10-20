@@ -1,0 +1,110 @@
+[
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-config",
+    "name": "Discord Configuration",
+    "data": {
+      "icon": "ph-bold ph-discord-logo",
+      "color": "indigo",
+      "folder": "config",
+      "versioning": true,
+      "description": "Private Discord application settings and default external-audience policy"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-installation",
+    "name": "Discord Installation",
+    "data": {
+      "icon": "ph-bold ph-buildings",
+      "color": "indigo",
+      "folder": "integration",
+      "versioning": true,
+      "description": "One Discord guild observed by the configured application"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-bot",
+    "name": "Discord Bot",
+    "data": {
+      "icon": "ph-bold ph-robot",
+      "color": "indigo",
+      "folder": "integration",
+      "versioning": true,
+      "description": "One Discord application and credential set dedicated to one Leaf Agent"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-commons-config",
+    "name": "Discord Commons Configuration",
+    "data": {
+      "icon": "ph-bold ph-globe-hemisphere-west",
+      "color": "indigo",
+      "folder": "integration",
+      "versioning": true,
+      "description": "Owner-scoped Nova Commons relay configuration and encrypted credentials"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-commons-ingest",
+    "name": "Discord Commons Ingest Delivery",
+    "data": {
+      "icon": "ph-bold ph-arrow-square-out",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "Durable retry state for one host-to-Commons ingest event"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-prompt",
+    "name": "Discord Prompt",
+    "data": {
+      "icon": "ph-bold ph-chat-text",
+      "color": "indigo",
+      "folder": "configuration",
+      "versioning": true,
+      "description": "Reusable owner-authored instructions for an Agent in a Discord context"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-behavior",
+    "name": "Discord Behavior",
+    "data": {
+      "icon": "ph-bold ph-sliders-horizontal",
+      "color": "indigo",
+      "folder": "configuration",
+      "versioning": true,
+      "description": "One Agent bot participation policy and prompt assignment for a Discord scope"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-binding",
+    "name": "Discord Binding",
+    "data": {
+      "icon": "ph-bold ph-link",
+      "color": "indigo",
+      "folder": "integration",
+      "versioning": true,
+      "description": "Allowlisted DM, guild channel, or thread bound to one isolated Agent conversation generation"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
+    "slug": "leaf-discord-delivery",
+    "name": "Discord Delivery",
+    "data": {
+      "icon": "ph-bold ph-paper-plane-tilt",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "Durable idempotent Discord inbox or outbox delivery state"
+    }
+  }
+]

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Leaf.Plugins.LeafDiscord</RootNamespace>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- RedLeaf loads workspace plugins through a private AssemblyLoadContext.
+         Library projects do not otherwise copy NuGet runtime dependencies beside
+         their assembly, so Discord.Net and its transitive DLLs would be absent. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <!-- Local workspace convention used by RedLeaf's dev-plugin reload endpoint:
+         prefer an adjacent SDK checkout, while release builds can still pass an
+         explicit LeafSdkProject or restore the published package. -->
+    <LeafSdkProject Condition="'$(LeafSdkProject)' == '' And Exists('..\..\..\leaf-sdk\src\Leaf.Sdk\Leaf.Sdk.csproj')">..\..\..\leaf-sdk\src\Leaf.Sdk\Leaf.Sdk.csproj</LeafSdkProject>
+    <LeafSdkProject Condition="'$(LeafSdkProject)' == '' And Exists('..\..\..\redleaf\src\Leaf.Sdk\Leaf.Sdk.csproj')">..\..\..\redleaf\src\Leaf.Sdk\Leaf.Sdk.csproj</LeafSdkProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- The SDK is the interface, the kernel is the runtime: a plugin references the
+       Leaf.Sdk PACKAGE and never kernel source. At load time the kernel supplies
+       Leaf.Sdk from its own context — the packaging script strips the dll from the
+       publish output (shipping a copy breaks ILeafPlugin type identity).
+       Working against a kernel checkout instead? Build with
+       -p:LeafSdkProject=<path>\src\Leaf.Sdk\Leaf.Sdk.csproj -->
+  <ItemGroup Condition="'$(LeafSdkProject)' == ''">
+    <PackageReference Include="Leaf.Sdk" Version="0.1.*" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(LeafSdkProject)' != ''">
+    <ProjectReference Include="$(LeafSdkProject)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Use only the gateway transport. The Discord.Net umbrella also brings its
+         Commands/Interactions stacks and a private DI abstractions runtime whose
+         type identity conflicts with RedLeaf's shared ILeafPlugin contract. -->
+    <PackageReference Include="Discord.Net.WebSocket" Version="3.20.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The manifest the loader reads from disk is also the Manifest property this
+         assembly exposes — embedding the same file keeps them from drifting. -->
+    <EmbeddedResource Include="..\..\plugin.json" LogicalName="plugin.json" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,9 @@
+/* Canonical RedLeaf plugin stylesheet.
+   The shell owns base styles; this plugin contributes only the same RedLeaf
+   tokens and utilities used by Nova, Code, and @redbamboo/chat. */
+@layer theme, base, components, utilities;
+@import "@redbamboo/ui/tokens.css";
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@source "./";
+@source "../node_modules/@redbamboo/chat/src";

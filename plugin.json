@@ -1,0 +1,37 @@
+{
+  "id": "leaf-discord",
+  "name": "Discord",
+  "version": "0.1.0",
+  "kernelApi": "^0.1.0",
+  "description": "Multi-Agent Discord bridge with one dedicated bot identity per Leaf Agent.",
+  "icon": "ph-discord-logo",
+  "color": "indigo",
+  "requires": ["entities", "records", "discussions", "assets", "nova"],
+  "backend": { "assembly": "Leaf.Plugins.LeafDiscord" },
+  "frontend": {
+    "package": "leaf-discord-web",
+    "settings": {},
+    "extensions": [
+      {
+        "id": "discord",
+        "target": "nova",
+        "slot": "app-section",
+        "order": 2,
+        "description": "Persistent external Discord conversations for Leaf Agents",
+        "section": {
+          "name": "Discord",
+          "icon": "ph-bold ph-discord-logo",
+          "path": "discord",
+          "description": "Persistent external Discord conversations, filtered by Agent",
+          "legacyRoute": "/apps/leaf-discord"
+        }
+      }
+    ]
+  },
+  "permissions": [
+    { "kind": "net", "target": "discord.com", "reason": "Discord Gateway and REST API" },
+    { "kind": "net", "target": "cdn.discordapp.com", "reason": "Explicitly submitted Discord attachments" },
+    { "kind": "net", "target": "media.discordapp.net", "reason": "Discord attachment proxy content" },
+    { "kind": "process", "target": "npx.cmd", "reason": "One-shot owner-authorized Wrangler lab secret installation" }
+  ]
+}
