@@ -26,10 +26,35 @@ changing application IDs, binding IDs, generations, sessions, transcript cursors
 or durable delivery identities. Discord avatars are explicit bot configuration and
 never follow the Agent Entity's base `avatar` or the optional Outfits extension.
 
-## Set up your own bot
+## Install the plugin
 
 Prerequisites: a running Leaf source installation with Nova installed, plus access
-to its private Settings surface. Each Leaf Agent needs its own Discord application.
+to its private Settings surface.
+
+1. Clone this repository next to your other Leaf checkouts, in the same parent
+   folder as `redleaf` and `redbamboo-packages`. The frontend links the shared
+   packages through `../../redbamboo-packages`, so the sibling layout matters:
+
+   ```powershell
+   git clone https://github.com/RedBamboo-Interactive/leaf-discord.git
+   ```
+
+2. Add `"../leaf-discord"` to the `plugins` array of `redleaf/leaf.workspace.local.json`
+   (copy `leaf.workspace.example.json` if you do not have one yet), or register the
+   folder through **Extensions > Add dev plugin**.
+3. Build and load it from the `redleaf` checkout:
+
+   ```powershell
+   ./rebuild.ps1 -Only leaf-discord
+   ```
+
+4. Confirm that **Extensions** lists Discord as enabled and that Nova shows a
+   **Discord** section. The bridge stays `not-configured` until you complete the
+   bot setup below.
+
+## Set up your own bot
+
+Each Leaf Agent needs its own Discord application.
 
 1. In the Discord Developer Portal, create an application and add a bot. Copy the
    application ID and interaction public key from the application's general page,
