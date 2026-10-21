@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Leaf.Plugins.LeafDiscord;
 
@@ -17,7 +18,8 @@ public sealed record DiscordBindingMessageRequest(
     string Content,
     string IdempotencyKey,
     string? DeliveryContent = null,
-    IReadOnlyList<DiscordBindingOutputAssetRequest>? OutputAssets = null);
+    IReadOnlyList<DiscordBindingOutputAssetRequest>? OutputAssets = null,
+    bool NotifyReplies = true);
 
 public sealed record DiscordBindingOutputAssetRequest(
     string AssetId,
@@ -1123,6 +1125,8 @@ public static class DiscordEndpoints
             DiscordBindingStore bindings,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordReplySubscriptionStore replySubscriptions,
+            ILoggerFactory loggers,
             CancellationToken ct) =>
         {
             var caller = ReadBindingMessageCaller(http);
@@ -1152,6 +1156,10 @@ public static class DiscordEndpoints
                             asset.AssetId, asset.Description))
                         .ToArray(),
                     ct);
+                var replyCallback = await SubscribeRepliesAsync(
+                    request.NotifyReplies, caller, result.Binding, result.MessageUid,
+                    replySubscriptions,
+                    loggers.CreateLogger("Leaf.Plugins.LeafDiscord.ReplyCallbacks"), ct);
                 return Results.Ok(new
                 {
                     ok = true,
@@ -1159,6 +1167,11 @@ public static class DiscordEndpoints
                     conversationName = result.Binding.ConversationName,
                     sessionId = result.Binding.SessionId,
                     messageUid = result.MessageUid,
+                    replyCallback = replyCallback is null ? null : new
+                    {
+                        discussionId = replyCallback.DiscussionId,
+                        expiresAt = replyCallback.ExpiresAt,
+                    },
                 });
             }
             catch (UnauthorizedAccessException ex)
@@ -1430,11 +1443,25 @@ public static class DiscordEndpoints
             DiscordBotConfigurationStore configurations,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordBindingStore bindings,
+            DiscordReplySubscriptionStore replySubscriptions,
+            ILoggerFactory loggers,
             CancellationToken ct) =>
             await OpenOwnerDirectMessageAsync(
                 id, http, configurations, agents,
-                (config, ownerUserId, token) => bot.OpenOwnerDirectMessageAsync(
-                    config.EntityId, ownerUserId, request, token),
+                async (config, ownerUserId, token) =>
+                {
+                    var result = await bot.OpenOwnerDirectMessageAsync(
+                        config.EntityId, ownerUserId, request, token);
+                    // OpenOwnerDirectMessageAsync already required a private discussion caller.
+                    if (request.NotifyReplies
+                        && ReadPrivateLeafAgentCaller(http) is { } caller
+                        && await bindings.GetAsync(result.BindingEntityId, token) is { } binding)
+                        await SubscribeRepliesAsync(
+                            true, caller, binding, result.MessageUid, replySubscriptions,
+                            loggers.CreateLogger("Leaf.Plugins.LeafDiscord.ReplyCallbacks"), token);
+                    return result;
+                },
                 ct));
 
         group.MapPost("/reactions", async (
@@ -2116,6 +2143,37 @@ public static class DiscordEndpoints
         => Results.Json(new { error = "forbidden", message },
             statusCode: StatusCodes.Status403Forbidden);
 
+    /// <summary>
+    /// A message sent from a private discussion subscribes that discussion to the binding's
+    /// replies. Automations have no discussion to report back to. The message is already
+    /// delivered, so a subscription failure is logged and reported as absent, never as a
+    /// send failure the caller might retry into a duplicate.
+    /// </summary>
+    internal static async Task<DiscordReplySubscription?> SubscribeRepliesAsync(
+        bool notifyReplies,
+        LeafAgentCaller caller,
+        DiscordBinding binding,
+        string messageUid,
+        DiscordReplySubscriptionStore replySubscriptions,
+        ILogger logger,
+        CancellationToken ct)
+    {
+        if (!notifyReplies || caller.DiscussionId is null) return null;
+        try
+        {
+            return await replySubscriptions.SubscribeAsync(
+                binding, caller.DiscussionId, caller.BeneficiaryId,
+                caller.ActorEntityId, messageUid, DateTimeOffset.UtcNow, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Discord reply callback could not be recorded for binding {BindingId}",
+                binding.BindingId);
+            return null;
+        }
+    }
+
     internal static LeafAgentCaller? ReadBindingMessageCaller(HttpContext http)
         => ReadLeafAgentCaller(http, allowAuthorizedAutomation: true);
 
@@ -2144,12 +2202,20 @@ public static class DiscordEndpoints
             var actorEntityId = actor.GetProperty("entityId").GetString();
             var beneficiaryId = beneficiary.GetProperty("id").GetString();
             var hasPrivateDiscussion = false;
+            string? discussionId = null;
             var hasExternalConversation = false;
             var automationIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in root.GetProperty("context").EnumerateArray())
             {
                 var kind = item.GetProperty("kind").GetString();
-                if (kind == "discussion") hasPrivateDiscussion = true;
+                if (kind == "discussion")
+                {
+                    hasPrivateDiscussion = true;
+                    if (item.TryGetProperty("id", out var discussion)
+                        && discussion.ValueKind == JsonValueKind.String
+                        && discussion.GetString() is { Length: > 0 and <= 100 } value)
+                        discussionId ??= value;
+                }
                 if (kind == "external-conversation") hasExternalConversation = true;
                 if (kind == "automation"
                     && item.TryGetProperty("id", out var automationId)
@@ -2160,7 +2226,10 @@ public static class DiscordEndpoints
             if (actorEntityId is null || beneficiaryId is null || hasExternalConversation)
                 return null;
             if (hasPrivateDiscussion)
-                return new LeafAgentCaller(actorEntityId, beneficiaryId);
+                return new LeafAgentCaller(actorEntityId, beneficiaryId)
+                {
+                    DiscussionId = discussionId,
+                };
             return allowAuthorizedAutomation && automationIds.Count == 1
                 ? new LeafAgentCaller(actorEntityId, beneficiaryId,
                     automationIds.Single())
@@ -2187,4 +2256,8 @@ internal sealed record DiscordGuildAgentScope(
 internal sealed record LeafAgentCaller(
     string ActorEntityId,
     string BeneficiaryId,
-    string? AutomationId = null);
+    string? AutomationId = null)
+{
+    /// <summary>The signed private discussion the call came from, when there is one.</summary>
+    public string? DiscussionId { get; init; }
+}

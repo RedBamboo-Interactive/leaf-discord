@@ -423,6 +423,26 @@ attachments instead of sending private Asset Markdown as text:
 }
 ```
 
+### Reply callbacks to the sending discussion
+
+When a private Leaf discussion sends through `POST /bindings/{entityId}/messages` or
+`POST /bots/{botEntityId}/dms`, the bridge records that signed discussion as a reply
+subscriber on the binding (`leaf-discord-reply-subscription`). Each later human message the
+binding admits publishes `leaf-discord.reply-received` for every subscriber: every message in
+a DM, and in guild channels or threads only messages that mention or reply to the bot. The
+binding's own Agent session still answers on Discord as usual; the callback only tells the
+sending discussion that someone replied. Nova injects it into that discussion as a
+`discord-reply` event after checking that the kernel-stamped source is Leaf Discord and that the
+discussion is open and belongs to the same owner and Agent.
+
+Plugin events are mirrored into `os:events` and broadcast to frontend sockets, so the event
+carries identifiers (binding, Discord message, admitted transcript UID, requestor display name,
+attachment count, an injection-suspected flag), never the message text. The receiver reads the
+reply from `GET /bindings/{entityId}/transcript`. Each send renews the subscription for 48
+hours, and a binding keeps at most 8 subscribers. Automation callers have no discussion and
+never subscribe. Send `"notifyReplies": false` to opt out for one message. The send response
+includes `replyCallback` (`discussionId`, `expiresAt`) when a subscription was recorded.
+
 ### Owner-directed DM opening
 
 From the owner's private Nova discussion, the bot's Agent can open (or continue) a DM with

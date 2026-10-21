@@ -10,7 +10,8 @@ public sealed record DiscordOwnerDirectMessageRequest(
     string Content,
     string IdempotencyKey,
     string? DeliveryContent = null,
-    IReadOnlyList<DiscordBindingOutputAssetRequest>? OutputAssets = null);
+    IReadOnlyList<DiscordBindingOutputAssetRequest>? OutputAssets = null,
+    bool NotifyReplies = true);
 
 public sealed record DiscordOwnerDirectMessageResult(
     Guid BindingEntityId,

@@ -61,6 +61,18 @@
   },
   {
     "typeSlug": "entity-type",
+    "slug": "leaf-discord-reply-subscription",
+    "name": "Discord Reply Callback",
+    "data": {
+      "icon": "ph-bold ph-arrow-bend-up-left",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "A private discussion that messaged a Discord binding and is told when someone replies"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
     "slug": "leaf-discord-prompt",
     "name": "Discord Prompt",
     "data": {

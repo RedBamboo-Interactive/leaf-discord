@@ -85,6 +85,7 @@ public sealed class DiscordBotService(
     DiscordOwnerPresencePublisher ownerPresence,
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
+    DiscordReplyNotifier replyNotifier,
     IAssets assets,
     ILoggerFactory loggerFactory,
     IEnumerable<IDiscordExplicitAction> explicitActions) : IAsyncDisposable
@@ -526,6 +527,7 @@ public sealed class DiscordBotService(
             ownerPresence,
             commons,
             commonsConfigurations,
+            replyNotifier,
             assets,
             loggerFactory.CreateLogger<DiscordBotRuntime>(),
             explicitActions));
@@ -591,6 +593,7 @@ internal sealed class DiscordBotRuntime(
     DiscordOwnerPresencePublisher ownerPresence,
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
+    DiscordReplyNotifier replyNotifier,
     IAssets assets,
     ILogger logger,
     IEnumerable<IDiscordExplicitAction> explicitActions) : IAsyncDisposable
@@ -2163,6 +2166,15 @@ internal sealed class DiscordBotRuntime(
             {
                 typing.MarkAdmitted(typingAdmission, admission.MessageUid);
                 maintenance.RequestFull(binding.BindingId);
+                // The Discord session answers on its own; this only tells any private
+                // discussion that messaged this binding that someone replied.
+                await replyNotifier.NotifyAsync(
+                    binding, message.Id.ToString(),
+                    new ExternalRequestor(message.Author.Id.ToString(),
+                        message.Author.GlobalName ?? message.Author.Username,
+                        message.Author.Username),
+                    message.Content ?? "", submittedAttachments.Count, admission.MessageUid,
+                    mentioned, repliesToBot, DateTimeOffset.UtcNow);
             }
         }
         catch (Exception ex)

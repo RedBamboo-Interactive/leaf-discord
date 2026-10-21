@@ -46,6 +46,15 @@
   { "parentType": "leaf-discord-commons-ingest", "slug": "next_attempt_at", "name": "Next Attempt", "fieldType": "string", "sortOrder": 5 },
   { "parentType": "leaf-discord-commons-ingest", "slug": "last_error", "name": "Last Error", "fieldType": "string", "sortOrder": 6 },
 
+  { "parentType": "leaf-discord-reply-subscription", "slug": "binding_id", "name": "Binding Key", "fieldType": "string", "sortOrder": 0 },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "binding_entity_id", "name": "Discord Binding", "fieldType": "entity_ref", "sortOrder": 1, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-binding\u0022}" },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "discussion_id", "name": "Discussion ID", "fieldType": "string", "sortOrder": 2 },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "owner_user_id", "name": "Owner User ID", "fieldType": "string", "sortOrder": 3 },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "agent_entity_id", "name": "Agent", "fieldType": "string", "sortOrder": 4 },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "sent_message_uid", "name": "Last Sent Message", "fieldType": "string", "sortOrder": 5 },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "subscribed_at", "name": "Subscribed At", "fieldType": "string", "sortOrder": 6 },
+  { "parentType": "leaf-discord-reply-subscription", "slug": "expires_at", "name": "Expires At", "fieldType": "string", "sortOrder": 7 },
+
   { "parentType": "leaf-discord-prompt", "slug": "instructions", "name": "Instructions", "fieldType": "markdown", "sortOrder": 0, "description": "Additive Discord behavior instructions. Agent identity, capabilities, privacy and authority rules remain governing." },
 
   { "parentType": "leaf-discord-behavior", "slug": "bot", "name": "Discord Bot", "fieldType": "entity_ref", "sortOrder": 0, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-bot\u0022}" },
