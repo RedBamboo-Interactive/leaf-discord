@@ -446,6 +446,15 @@ hours, and a binding keeps at most 8 subscribers. Automation callers have no dis
 never subscribe. Send `"notifyReplies": false` to opt out for one message. The send response
 includes `replyCallback` (`discussionId`, `expiresAt`) when a subscription was recorded.
 
+### Recovering queued turns after a restart
+
+When a rebuild stops a binding's Agent session while a Discord turn is queued, RedCompute asks
+RedLeaf to authorize recovering that accepted input. The turn has no Nova discussion, so the
+plugin registers `IExternalConversationRecoveryAuthority` (`DiscordRecoveryAuthority`) and vouches
+for it only when the binding still exists, is enabled, belongs to the same owner and Agent, is on
+the same session and generation (a `/clear` refuses older input), its bot is enabled and a DM
+counterpart is still allowlisted.
+
 ### Owner-directed DM opening
 
 From the owner's private Nova discussion, the bot's Agent can open (or continue) a DM with

@@ -63,6 +63,10 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
             sp.GetRequiredKeyedService<IPluginEvents>(PluginId),
             sp.GetRequiredService<PromptInjectionDetector>(),
             sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DiscordReplyNotifier>>()));
+        services.AddSingleton<IExternalConversationRecoveryAuthority>(sp => new DiscordRecoveryAuthority(
+            sp.GetRequiredService<DiscordBindingStore>(),
+            sp.GetRequiredService<DiscordBotConfigurationStore>(),
+            sp.GetRequiredService<DiscordAgentResolver>()));
         services.AddSingleton<DiscordConversationCoordinator>();
         services.AddSingleton<DiscordAttachmentIngestor>();
         services.AddSingleton<DiscordRestTransport>();
