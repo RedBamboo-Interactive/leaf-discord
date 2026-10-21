@@ -1,0 +1,5 @@
+*, *::before, *::after { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body { font-family: ui-sans-serif, system-ui, sans-serif; }
+[data-slot="tabs"][data-orientation="horizontal"] { flex-direction: column; }
+[data-slot="tabs-content"] { flex: 1 1 0%; width: 100%; }

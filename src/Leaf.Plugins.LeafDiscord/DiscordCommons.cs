@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Leaf.Sdk;
 using Leaf.Sdk.Services;
@@ -15,7 +16,8 @@ public sealed record DiscordCommonsConfiguration(
     string RelayUrl,
     string? HostCredential,
     IReadOnlySet<string> GuildAllowlist,
-    IReadOnlyDictionary<string, string> WebhookUrls)
+    IReadOnlyDictionary<string, string> WebhookUrls,
+    DiscordCommonsRoleReconciliation RoleReconciliation)
 {
     public bool Ready => Uri.TryCreate(RelayUrl, UriKind.Absolute, out var relay)
                          && relay.Scheme == Uri.UriSchemeHttps
@@ -33,7 +35,57 @@ public sealed record DiscordCommonsConfigurationView(
     string RelayUrl,
     bool HostCredentialConfigured,
     IReadOnlyList<string> GuildAllowlist,
-    IReadOnlyList<string> WebhookChannelIds);
+    IReadOnlyList<string> WebhookChannelIds,
+    DiscordCommonsRoleReconciliation RoleReconciliation);
+
+public sealed record DiscordCommonsRoleReconciliation(
+    string State,
+    string? Error,
+    DateTimeOffset? At,
+    int EnvoyCount);
+
+public sealed record DiscordCommonsRelayEnvoy(
+    string Id,
+    string OwnerDiscordUserId,
+    string OwnerDisplayName,
+    string PublicName,
+    string PersonaName,
+    string Status,
+    string? DiscordRoleId);
+
+public sealed record DiscordCommonsGuildMember(
+    string UserId,
+    string DisplayName,
+    bool IsBot);
+
+public static class DiscordCommonsRolePolicy
+{
+    public const int MaximumRolesPerGuild = 50;
+
+    public static string RoleName(DiscordCommonsRelayEnvoy envoy)
+    {
+        var publicName = string.IsNullOrWhiteSpace(envoy.PublicName)
+            ? envoy.PersonaName.Replace("Nova ·", "", StringComparison.OrdinalIgnoreCase).Trim()
+            : envoy.PublicName.Trim();
+        return $"Nova {publicName}";
+    }
+
+    public static void EnsureCanReconcile(
+        bool manageRoles, IReadOnlyCollection<DiscordCommonsRelayEnvoy> envoys)
+    {
+        if (!manageRoles)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs Manage Roles to reconcile Public Nova roles.");
+        if (envoys.Count(envoy => envoy.Status == "active") > MaximumRolesPerGuild)
+            throw new InvalidOperationException(
+                $"Public Nova role cap of {MaximumRolesPerGuild} was exceeded.");
+    }
+
+    public static bool NeedsUpdate(DiscordManagedRole role, string desiredName)
+        => !string.Equals(role.Name, desiredName, StringComparison.Ordinal)
+           || role.Permissions != "0"
+           || !role.Mentionable;
+}
 
 public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
 {
@@ -62,6 +114,7 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                 ["relay_url"] = "",
                 ["guild_allowlist"] = new JsonArray(),
                 ["webhook_urls"] = "{}",
+                ["role_reconciliation_state"] = "not-run",
             },
             ct);
         return Map(entity);
@@ -96,6 +149,10 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                 .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
             ["webhook_urls"] = SerializeWebhookUrls(
                 existing?.WebhookUrls ?? new Dictionary<string, string>()),
+            ["role_reconciliation_state"] = existing?.RoleReconciliation.State ?? "not-run",
+            ["role_reconciliation_error"] = existing?.RoleReconciliation.Error,
+            ["role_reconciliation_at"] = existing?.RoleReconciliation.At?.ToString("O"),
+            ["role_reconciliation_envoy_count"] = existing?.RoleReconciliation.EnvoyCount ?? 0,
         };
         var entity = existing is null
             ? await store.UpsertBySlugAsync(
@@ -135,7 +192,24 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
             config.RelayUrl,
             !string.IsNullOrWhiteSpace(config.HostCredential),
             config.GuildAllowlist.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
-            config.WebhookUrls.Keys.OrderBy(value => value, StringComparer.Ordinal).ToArray());
+            config.WebhookUrls.Keys.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
+            config.RoleReconciliation);
+
+    public async Task SetRoleReconciliationAsync(
+        Guid botId,
+        DiscordCommonsRoleReconciliation status,
+        CancellationToken ct = default)
+    {
+        var existing = await GetAsync(botId, ct)
+            ?? throw new InvalidOperationException("Discord Commons is not configured.");
+        _ = await store.PatchAsync(existing.EntityId, new JsonObject
+        {
+            ["role_reconciliation_state"] = status.State,
+            ["role_reconciliation_error"] = status.Error,
+            ["role_reconciliation_at"] = status.At?.ToString("O"),
+            ["role_reconciliation_envoy_count"] = status.EnvoyCount,
+        }, ct: ct);
+    }
 
     internal static string NormalizeRelayUrl(string value)
     {
@@ -156,13 +230,20 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
         var botId = Guid.TryParse(JsonRead.String(data, "bot_id"), out var parsed)
             ? parsed
             : Guid.Empty;
+        _ = DateTimeOffset.TryParse(
+            JsonRead.String(data, "role_reconciliation_at"), out var roleAt);
         return new DiscordCommonsConfiguration(
             entity.Id,
             botId,
             JsonRead.String(data, "relay_url") ?? "",
             JsonRead.String(data, "host_credential"),
             JsonRead.StringSet(data, "guild_allowlist"),
-            ParseWebhookUrls(JsonRead.String(data, "webhook_urls")));
+            ParseWebhookUrls(JsonRead.String(data, "webhook_urls")),
+            new DiscordCommonsRoleReconciliation(
+                JsonRead.String(data, "role_reconciliation_state") ?? "not-run",
+                JsonRead.String(data, "role_reconciliation_error"),
+                roleAt == default ? null : roleAt,
+                (int)JsonRead.Long(data, "role_reconciliation_envoy_count", 0)));
     }
 
     private static IReadOnlyDictionary<string, string> ParseWebhookUrls(string? value)
@@ -319,6 +400,90 @@ public sealed class DiscordCommonsRelayService(
         try { signal.Release(); } catch (SemaphoreFullException) { }
     }
 
+    public async Task<IReadOnlyList<DiscordCommonsRelayEnvoy>> GetEnvoysAsync(
+        Guid botId, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, HttpMethod.Get,
+            "/v1/admin/envoys", null, ct);
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        return document.RootElement.GetProperty("envoys").EnumerateArray()
+            .Select(item => new DiscordCommonsRelayEnvoy(
+                item.GetProperty("id").GetString() ?? "",
+                item.GetProperty("ownerDiscordUserId").GetString() ?? "",
+                item.GetProperty("ownerDisplayName").GetString() ?? "",
+                item.TryGetProperty("publicName", out var publicName)
+                    ? publicName.GetString() ?? "" : "",
+                item.GetProperty("personaName").GetString() ?? "",
+                item.GetProperty("status").GetString() ?? "",
+                item.TryGetProperty("discordRoleId", out var role)
+                    && role.ValueKind == JsonValueKind.String ? role.GetString() : null))
+            .Where(item => !string.IsNullOrWhiteSpace(item.Id))
+            .ToArray();
+    }
+
+    public async Task PushReservedNamesAsync(
+        Guid botId,
+        IReadOnlyList<DiscordCommonsGuildMember> members,
+        CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, HttpMethod.Put,
+            "/v1/admin/reserved-names", new JsonObject
+            {
+                ["members"] = new JsonArray(members.Where(member => !member.IsBot)
+                    .Select(member => (JsonNode?)new JsonObject
+                    {
+                        ["userId"] = member.UserId,
+                        ["displayName"] = member.DisplayName,
+                    }).ToArray()),
+            }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task SetDiscordRoleAsync(
+        Guid botId, string envoyId, string? roleId, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, HttpMethod.Put,
+            $"/v1/admin/envoys/{Uri.EscapeDataString(envoyId)}/discord-role",
+            new JsonObject { ["discordRoleId"] = roleId }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task SyncOwnerDisplayNameAsync(
+        Guid botId, string envoyId, string displayName, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, HttpMethod.Put,
+            $"/v1/admin/envoys/{Uri.EscapeDataString(envoyId)}/owner-profile",
+            new JsonObject { ["ownerDisplayName"] = displayName }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    private async Task<HttpResponseMessage> SendHostAsync(
+        Guid botId,
+        HttpMethod method,
+        string path,
+        JsonObject? body,
+        CancellationToken ct)
+    {
+        var config = await configurations.GetAsync(botId, ct);
+        if (config is not { Ready: true })
+            throw new InvalidOperationException("Discord Commons is not configured.");
+        var request = new HttpRequestMessage(method, new Uri(config.RelayUrl + path));
+        request.Headers.Authorization = new AuthenticationHeaderValue(
+            "Bearer", config.HostCredential);
+        if (body is not null)
+            request.Content = new StringContent(
+                body.ToJsonString(), Encoding.UTF8, "application/json");
+        try
+        {
+            return await http.SendAsync(request, ct);
+        }
+        finally
+        {
+            request.Dispose();
+        }
+    }
+
     public void Start(CancellationToken stoppingToken)
     {
         if (loop is not null) return;
@@ -351,6 +516,38 @@ public sealed class DiscordCommonsRelayService(
         var normalized = value.Trim().ToLowerInvariant();
         return normalized is "général" or "general" ? "general" : normalized;
     }
+
+    internal static JsonObject BuildHumanMessagePayload(
+        string eventId,
+        string authorId,
+        string displayName,
+        string content,
+        IReadOnlyList<string> mentions,
+        IReadOnlyList<string> mentionRoles,
+        string channel,
+        string? threadRef,
+        string? referencedMessageId,
+        long timestamp)
+        => new()
+        {
+            ["type"] = "human_message",
+            ["eventId"] = eventId,
+            ["authorId"] = authorId,
+            ["displayName"] = displayName,
+            ["content"] = content,
+            ["mentions"] = new JsonArray(mentions
+                .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
+            ["mentionRoles"] = new JsonArray(mentionRoles
+                .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
+            ["referencedMessageId"] = referencedMessageId,
+            ["channel"] = channel,
+            ["threadRef"] = threadRef,
+            ["opensFloor"] = threadRef is not null
+                && mentions.Count == 0
+                && mentionRoles.Count == 0
+                && referencedMessageId is null,
+            ["timestamp"] = timestamp,
+        };
 
     private async Task RunAsync(CancellationToken ct)
     {

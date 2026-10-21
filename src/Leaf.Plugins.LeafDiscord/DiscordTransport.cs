@@ -100,6 +100,8 @@ public sealed class DiscordAttachmentIngestor : IDisposable
 public sealed record DiscordRestMessage(string Id, string? Nonce, int AttachmentCount);
 public sealed record DiscordWebhookCredentials(string Id, string Token);
 public sealed record DiscordDirectMessageChannel(string ChannelId, string RecipientName);
+public sealed record DiscordManagedRole(
+    string Id, string Name, string Permissions, bool Mentionable, bool Managed);
 
 public sealed class DiscordRestTransport : IDisposable
 {
@@ -196,6 +198,112 @@ public sealed class DiscordRestTransport : IDisposable
             root.GetProperty("token").GetString()
                 ?? throw new InvalidOperationException("Discord webhook response has no token"));
     }
+
+    public async Task<IReadOnlyList<DiscordManagedRole>> ListGuildRolesAsync(
+        string botToken, string guildId, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Get, $"guilds/{guildId}/roles", botToken);
+        using var response = await http.SendAsync(request, ct);
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode) throw DiscordRestException.From(response, raw);
+        using var document = JsonDocument.Parse(raw);
+        return document.RootElement.EnumerateArray().Select(ReadRole).ToArray();
+    }
+
+    public async Task<DiscordManagedRole> CreateGuildRoleAsync(
+        string botToken, string guildId, string name, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Post, $"guilds/{guildId}/roles", botToken);
+        request.Content = JsonContent.Create(new
+        {
+            name,
+            permissions = "0",
+            mentionable = true,
+            hoist = false,
+        });
+        using var response = await http.SendAsync(request, ct);
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode) throw DiscordRestException.From(response, raw);
+        using var document = JsonDocument.Parse(raw);
+        return ReadRole(document.RootElement);
+    }
+
+    public async Task<DiscordManagedRole> ModifyGuildRoleAsync(
+        string botToken, string guildId, string roleId, string name,
+        CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Patch,
+            $"guilds/{guildId}/roles/{roleId}", botToken);
+        request.Content = JsonContent.Create(new
+        {
+            name,
+            permissions = "0",
+            mentionable = true,
+            hoist = false,
+        });
+        using var response = await http.SendAsync(request, ct);
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode) throw DiscordRestException.From(response, raw);
+        using var document = JsonDocument.Parse(raw);
+        return ReadRole(document.RootElement);
+    }
+
+    public async Task DeleteGuildRoleAsync(
+        string botToken, string guildId, string roleId, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Delete,
+            $"guilds/{guildId}/roles/{roleId}", botToken);
+        using var response = await http.SendAsync(request, ct);
+        if (response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.NotFound) return;
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        throw DiscordRestException.From(response, raw);
+    }
+
+    public async Task<IReadOnlyList<DiscordCommonsGuildMember>> ListGuildMembersAsync(
+        string botToken, string guildId, CancellationToken ct = default)
+    {
+        var result = new List<DiscordCommonsGuildMember>();
+        string? after = null;
+        while (true)
+        {
+            var path = $"guilds/{guildId}/members?limit=1000"
+                       + (after is null ? "" : $"&after={Uri.EscapeDataString(after)}");
+            using var request = Authorized(HttpMethod.Get, path, botToken);
+            using var response = await http.SendAsync(request, ct);
+            var raw = await response.Content.ReadAsStringAsync(ct);
+            if (!response.IsSuccessStatusCode) throw DiscordRestException.From(response, raw);
+            using var document = JsonDocument.Parse(raw);
+            var page = document.RootElement.EnumerateArray().ToArray();
+            foreach (var member in page)
+            {
+                var user = member.GetProperty("user");
+                var id = user.GetProperty("id").GetString() ?? "";
+                var username = user.GetProperty("username").GetString() ?? id;
+                var globalName = user.TryGetProperty("global_name", out var global)
+                    && global.ValueKind == JsonValueKind.String ? global.GetString() : null;
+                var nickname = member.TryGetProperty("nick", out var nick)
+                    && nick.ValueKind == JsonValueKind.String ? nick.GetString() : null;
+                var isBot = user.TryGetProperty("bot", out var bot)
+                    && bot.ValueKind == JsonValueKind.True;
+                result.Add(new DiscordCommonsGuildMember(
+                    id, nickname ?? globalName ?? username, isBot));
+            }
+            if (page.Length < 1000) break;
+            after = result[^1].UserId;
+        }
+        return result;
+    }
+
+    private static DiscordManagedRole ReadRole(JsonElement item)
+        => new(
+            item.GetProperty("id").GetString() ?? "",
+            item.GetProperty("name").GetString() ?? "",
+            item.TryGetProperty("permissions", out var permissions)
+                ? permissions.GetString() ?? "0" : "0",
+            item.TryGetProperty("mentionable", out var mentionable)
+                && mentionable.ValueKind == JsonValueKind.True,
+            item.TryGetProperty("managed", out var managed)
+                && managed.ValueKind == JsonValueKind.True);
 
     public async Task ModifyWebhookAsync(
         string botToken, string webhookId, string name, string imageData,

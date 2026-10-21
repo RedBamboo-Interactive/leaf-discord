@@ -20,6 +20,11 @@ import {
   type DiscordAuthor,
   type DiscordTranscriptMessage,
 } from "./discord-transcript"
+import {
+  projectPublicNovaMessages,
+  type PublicNovaConversation,
+  type PublicNovaThread,
+} from "./public-nova"
 
 type BotStatus = {
   state: string
@@ -72,10 +77,12 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T
 }
 
-function Page() {
+export function Page() {
   const [bots, setBots] = useState<Bot[]>([])
   const [bindings, setBindings] = useState<Binding[]>([])
   const [selectedBindingId, setSelectedBindingId] = useState<string | null>(null)
+  const [publicThreads, setPublicThreads] = useState<PublicNovaThread[] | null>(null)
+  const [selectedPublicRef, setSelectedPublicRef] = useState<string | null>(null)
   const [agentFilter, setAgentFilterState] = useState<string | null>(() =>
     window.localStorage.getItem("leaf-discord-agent-filter"))
   const [mobileTab, setMobileTab] = useState(0)
@@ -88,12 +95,18 @@ function Page() {
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
-    const [botResult, bindingResult] = await Promise.all([
+    const [botResult, bindingResult, publicResult] = await Promise.all([
       api<{ items: Bot[] }>("/bots"),
       api<{ items: Binding[] }>("/bindings"),
+      fetch("/api/apps/leaf-commons/threads").then(async (response) => {
+        if (response.status === 404 || response.status === 403) return null
+        if (!response.ok) throw new Error(`Public Nova HTTP ${response.status}`)
+        return await response.json() as { items: PublicNovaThread[] }
+      }).catch(() => null),
     ])
     setBots(botResult.items)
     setBindings(bindingResult.items)
+    setPublicThreads(publicResult?.items ?? null)
   }, [])
 
   useEffect(() => {
@@ -116,8 +129,24 @@ function Page() {
     }
   }, [])
 
+  const loadPublicTranscript = useCallback(async (threadRef: string, showSpinner = false) => {
+    if (showSpinner) setTranscriptLoading(true)
+    try {
+      const response = await fetch(`/api/apps/leaf-commons/threads/${encodeURIComponent(threadRef)}`)
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload.message ?? payload.error ?? `HTTP ${response.status}`)
+      const projection = projectPublicNovaMessages((payload as PublicNovaConversation).messages)
+      setMessages(projection.messages)
+      setAuthors(projection.authors)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      if (showSpinner) setTranscriptLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
-    if (!selectedBindingId) {
+    if (!selectedBindingId || selectedPublicRef) {
       setMessages([])
       setAuthors({})
       return
@@ -125,7 +154,14 @@ function Page() {
     void loadTranscript(selectedBindingId, true)
     const timer = window.setInterval(() => void loadTranscript(selectedBindingId), 2500)
     return () => window.clearInterval(timer)
-  }, [loadTranscript, selectedBindingId])
+  }, [loadTranscript, selectedBindingId, selectedPublicRef])
+
+  useEffect(() => {
+    if (!selectedPublicRef) return
+    void loadPublicTranscript(selectedPublicRef, true)
+    const timer = window.setInterval(() => void loadPublicTranscript(selectedPublicRef), 2500)
+    return () => window.clearInterval(timer)
+  }, [loadPublicTranscript, selectedPublicRef])
 
   const resolveDiscordAuthor = useCallback(
     (id: string) => authors[id],
@@ -134,6 +170,14 @@ function Page() {
 
   const selectBinding = useCallback((id: string) => {
     setSelectedBindingId(id)
+    setSelectedPublicRef(null)
+    setMobileTab(1)
+  }, [])
+
+  const selectPublicThread = useCallback((threadRef: string) => {
+    setSelectedPublicRef(threadRef)
+    setSelectedBindingId(null)
+    setConfiguring(false)
     setMobileTab(1)
   }, [])
 
@@ -148,11 +192,11 @@ function Page() {
     : bindings
 
   useEffect(() => {
-    setSelectedBindingId((current) =>
-      current && visibleBindings.some((binding) => binding.entityId === current)
-        ? current
-        : visibleBindings[0]?.entityId ?? null)
-  }, [agentFilter, bindings])
+    if (selectedPublicRef) return
+    setSelectedBindingId((current) => current
+      && visibleBindings.some((binding) => binding.entityId === current)
+        ? current : visibleBindings[0]?.entityId ?? null)
+  }, [agentFilter, bindings, selectedPublicRef])
 
   useEffect(() => {
     if (agentFilter && !bots.some((bot) => bot.config.agentId === agentFilter))
@@ -180,6 +224,7 @@ function Page() {
   }
 
   const selectedBinding = visibleBindings.find((binding) => binding.entityId === selectedBindingId) ?? null
+  const selectedPublicThread = publicThreads?.find((thread) => thread.threadRef === selectedPublicRef) ?? null
   const selectedBot = selectedBinding
     ? bots.find((bot) => bot.config.applicationId === selectedBinding.applicationId)
     : agentFilter
@@ -193,7 +238,16 @@ function Page() {
     avatarUrl: bot.config.agentAvatarUrl,
   }))
 
-  const chatHeader = selectedBinding ? (
+  const chatHeader = selectedPublicThread ? (
+    <PanelHeader>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-[14px] font-medium text-contrast">{selectedPublicThread.title}</span>
+        <span className="truncate text-xs text-text-muted">
+          Public Nova / #{selectedPublicThread.channelName} / {selectedPublicThread.scenario}
+        </span>
+      </div>
+    </PanelHeader>
+  ) : selectedBinding ? (
     <PanelHeader>
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-[14px] font-medium text-contrast">{selectedBinding.conversationName}</span>
@@ -210,7 +264,7 @@ function Page() {
     </PanelHeader>
   ) : null
 
-  const chatArea = !selectedBinding ? (
+  const chatArea = !selectedBinding && !selectedPublicThread ? (
     <div className="flex flex-1 items-center justify-center text-text-muted">
       <div className="text-center">
         <i className="ph-bold ph-discord-logo mb-3 text-3xl opacity-30" />
@@ -231,7 +285,7 @@ function Page() {
       isReconnecting={false}
       interrupting={false}
       resumePending={false}
-      sessionId={selectedBinding.sessionId ?? selectedBinding.entityId}
+      sessionId={selectedBinding?.sessionId ?? selectedBinding?.entityId ?? selectedPublicThread!.threadRef}
       persistQueue={false}
       disabled
       hideComposer
@@ -282,25 +336,48 @@ function Page() {
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-hidden">
-        <ItemList
-          items={visibleBindings}
-          keyFn={(binding) => binding.entityId}
-          emptyMessage="A discussion appears after its first eligible Discord message."
-          renderItem={(binding) => (
-            <ItemListRow
-              selected={binding.entityId === selectedBindingId}
-              onClick={() => selectBinding(binding.entityId)}
-              icon={binding.iconUrl
-                ? <img src={binding.iconUrl} alt="" className="size-full rounded-full object-cover" />
-                : <i className={binding.kind === "dm" ? "ph-bold ph-user" : binding.kind === "thread" ? "ph-bold ph-chats-teardrop" : "ph-bold ph-hash"} />}
-              title={binding.conversationName}
-              subtitle={binding.guildName
-                ? `${binding.guildName} / ${binding.kind.replace("_", " ")}`
-                : binding.kind.replace("_", " ")}
-              trailing={<span className={`size-2 rounded-full ${binding.sessionId ? "bg-accent-teal" : "bg-overlay-15"}`} title={binding.sessionId ? "Persistent session attached; resumes on demand" : "Waiting for first message"} />}
+        <div className="h-full overflow-y-auto">
+          {publicThreads && <section aria-label="Public Nova discussions">
+            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Public Nova</div>
+            <ItemList
+              items={publicThreads}
+              keyFn={(thread) => thread.threadRef}
+              emptyMessage="Public Nova threads appear here after your Nova posts or is pinged."
+              renderItem={(thread) => <ItemListRow
+                selected={thread.threadRef === selectedPublicRef}
+                onClick={() => selectPublicThread(thread.threadRef)}
+                icon={<i className="ph-bold ph-globe-hemisphere-west" />}
+                title={thread.title}
+                subtitle={`#${thread.channelName} · ${thread.lastSnippet}`}
+                trailing={Boolean(thread.unread)
+                  ? <span className="min-w-5 rounded-full bg-primary px-1.5 text-center text-[10px] text-primary-foreground">{typeof thread.unread === "number" ? thread.unread : "•"}</span>
+                  : null}
+              />}
             />
-          )}
-        />
+          </section>}
+          <section aria-label="Agent Discord discussions">
+            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Agent conversations</div>
+            <ItemList
+              items={visibleBindings}
+              keyFn={(binding) => binding.entityId}
+              emptyMessage="A discussion appears after its first eligible Discord message."
+              renderItem={(binding) => (
+                <ItemListRow
+                  selected={binding.entityId === selectedBindingId}
+                  onClick={() => selectBinding(binding.entityId)}
+                  icon={binding.iconUrl
+                    ? <img src={binding.iconUrl} alt="" className="size-full rounded-full object-cover" />
+                    : <i className={binding.kind === "dm" ? "ph-bold ph-user" : binding.kind === "thread" ? "ph-bold ph-chats-teardrop" : "ph-bold ph-hash"} />}
+                  title={binding.conversationName}
+                  subtitle={binding.guildName
+                    ? `${binding.guildName} / ${binding.kind.replace("_", " ")}`
+                    : binding.kind.replace("_", " ")}
+                  trailing={<span className={`size-2 rounded-full ${binding.sessionId ? "bg-accent-teal" : "bg-overlay-15"}`} title={binding.sessionId ? "Persistent session attached; resumes on demand" : "Waiting for first message"} />}
+                />
+              )}
+            />
+          </section>
+        </div>
       </div>
     </>
   )

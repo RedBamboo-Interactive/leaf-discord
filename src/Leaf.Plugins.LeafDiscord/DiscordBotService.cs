@@ -623,6 +623,7 @@ internal sealed class DiscordBotRuntime(
     private CancellationTokenSource? runCts;
     private Task? outboxLoop;
     private Task? presenceLoop;
+    private Task? commonsRoleLoop;
     private string state = "stopped";
     private DateTimeOffset? connectedAt;
     private string? lastError;
@@ -1623,6 +1624,7 @@ internal sealed class DiscordBotRuntime(
             runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
             outboxLoop = RunOutboxLoopAsync(runCts.Token);
             presenceLoop = RunPresenceLoopAsync(next, runCts.Token);
+            commonsRoleLoop = RunCommonsRoleLoopAsync(next, runCts.Token);
             await OnReadyAsync(next);
         }
         catch (Exception ex)
@@ -1786,6 +1788,7 @@ internal sealed class DiscordBotRuntime(
             // fault would block every restart that could recover it.
             await ObserveBackgroundLoopAsync(outboxLoop, "outbox");
             await ObserveBackgroundLoopAsync(presenceLoop, "presence");
+            await ObserveBackgroundLoopAsync(commonsRoleLoop, "Public Nova role reconciliation");
             if (client is not null)
             {
                 await DisposeClientAsync(client);
@@ -1795,6 +1798,7 @@ internal sealed class DiscordBotRuntime(
             runCts = null;
             outboxLoop = null;
             presenceLoop = null;
+            commonsRoleLoop = null;
             connectedAt = null;
             state = "stopped";
         }
@@ -2202,22 +2206,24 @@ internal sealed class DiscordBotRuntime(
             .Select(value => value.ToString())
             .Distinct(StringComparer.Ordinal)
             .ToArray();
-        await commons.EnqueueAsync(configId, message.Id.ToString(), new JsonObject
-        {
-            ["type"] = "human_message",
-            ["eventId"] = message.Id.ToString(),
-            ["authorId"] = message.Author.Id.ToString(),
-            ["displayName"] = message.Author is SocketGuildUser member
-                ? member.DisplayName
-                : message.Author.GlobalName ?? message.Author.Username,
-            ["content"] = message.Content,
-            ["mentions"] = new JsonArray(mentions
-                .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
-            ["channel"] = location.Value.Channel,
-            ["threadRef"] = location.Value.ThreadRef,
-            ["opensFloor"] = location.Value.ThreadRef is not null && mentions.Length == 0,
-            ["timestamp"] = message.Timestamp.ToUnixTimeMilliseconds(),
-        });
+        var mentionRoles = message.MentionedRoleIds
+            .Select(value => value.ToString())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        await commons.EnqueueAsync(configId, message.Id.ToString(),
+            DiscordCommonsRelayService.BuildHumanMessagePayload(
+                message.Id.ToString(),
+                message.Author.Id.ToString(),
+                message.Author is SocketGuildUser member
+                    ? member.DisplayName
+                    : message.Author.GlobalName ?? message.Author.Username,
+                message.Content,
+                mentions,
+                mentionRoles,
+                location.Value.Channel,
+                location.Value.ThreadRef,
+                message.Reference?.MessageId.ToString(),
+                message.Timestamp.ToUnixTimeMilliseconds()));
     }
 
     private async Task OnReactionAddedAsync(
@@ -3057,6 +3063,115 @@ internal sealed class DiscordBotRuntime(
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
         while (await timer.WaitForNextTickAsync(ct))
             await PublishOwnerPresenceAsync(source, forceRefresh: true, ct);
+    }
+
+    private async Task RunCommonsRoleLoopAsync(
+        DiscordSocketClient source,
+        CancellationToken ct)
+    {
+        await ReconcileCommonsRolesAsync(source, ct);
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
+        while (await timer.WaitForNextTickAsync(ct))
+            await ReconcileCommonsRolesAsync(source, ct);
+    }
+
+    private async Task ReconcileCommonsRolesAsync(
+        DiscordSocketClient source,
+        CancellationToken ct)
+    {
+        if (!ReferenceEquals(client, source)) return;
+        var config = await commonsConfigurations.GetAsync(configId, ct);
+        if (config is not { Ready: true }) return;
+        var envoyCount = 0;
+        try
+        {
+            var botConfig = await GetConfigAsync(ct);
+            var botToken = botConfig.BotToken
+                ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+            foreach (var guildId in config.GuildAllowlist)
+            {
+                if (!ulong.TryParse(guildId, out var parsedGuildId)) continue;
+                var guild = source.GetGuild(parsedGuildId)
+                    ?? throw new InvalidOperationException(
+                        "A configured Public Nova guild is not visible to the Discord bot.");
+                var envoys = await commons.GetEnvoysAsync(configId, ct);
+                envoyCount = envoys.Count;
+                DiscordCommonsRolePolicy.EnsureCanReconcile(
+                    guild.CurrentUser.GuildPermissions.ManageRoles, envoys);
+
+                var members = await rest.ListGuildMembersAsync(botToken, guildId, ct);
+                foreach (var envoy in envoys)
+                {
+                    var owner = members.FirstOrDefault(member =>
+                        !member.IsBot && string.Equals(
+                            member.UserId, envoy.OwnerDiscordUserId, StringComparison.Ordinal));
+                    if (owner is not null && !string.Equals(
+                            owner.DisplayName, envoy.OwnerDisplayName, StringComparison.Ordinal))
+                        await commons.SyncOwnerDisplayNameAsync(
+                            configId, envoy.Id, owner.DisplayName, ct);
+                }
+                await commons.PushReservedNamesAsync(configId, members, ct);
+                envoys = await commons.GetEnvoysAsync(configId, ct);
+                DiscordCommonsRolePolicy.EnsureCanReconcile(true, envoys);
+
+                var roles = (await rest.ListGuildRolesAsync(botToken, guildId, ct)).ToList();
+                foreach (var envoy in envoys)
+                {
+                    var recorded = string.IsNullOrWhiteSpace(envoy.DiscordRoleId)
+                        ? null
+                        : roles.FirstOrDefault(role => role.Id == envoy.DiscordRoleId);
+                    if (envoy.Status != "active")
+                    {
+                        if (recorded is not null && !recorded.Managed)
+                            await rest.DeleteGuildRoleAsync(botToken, guildId, recorded.Id, ct);
+                        if (envoy.DiscordRoleId is not null)
+                            await commons.SetDiscordRoleAsync(configId, envoy.Id, null, ct);
+                        continue;
+                    }
+
+                    var desiredName = DiscordCommonsRolePolicy.RoleName(envoy);
+                    var role = recorded ?? roles.FirstOrDefault(candidate =>
+                        !candidate.Managed && string.Equals(
+                            candidate.Name, desiredName, StringComparison.Ordinal));
+                    if (role is null)
+                    {
+                        role = await rest.CreateGuildRoleAsync(
+                            botToken, guildId, desiredName, ct);
+                        roles.Add(role);
+                    }
+                    else if (DiscordCommonsRolePolicy.NeedsUpdate(role, desiredName))
+                    {
+                        role = await rest.ModifyGuildRoleAsync(
+                            botToken, guildId, role.Id, desiredName, ct);
+                    }
+                    if (!string.Equals(envoy.DiscordRoleId, role.Id, StringComparison.Ordinal))
+                        await commons.SetDiscordRoleAsync(
+                            configId, envoy.Id, role.Id, ct);
+                }
+            }
+            await commonsConfigurations.SetRoleReconciliationAsync(
+                configId,
+                new DiscordCommonsRoleReconciliation(
+                    "ready", null, DateTimeOffset.UtcNow, envoyCount),
+                ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var state = ex is UnauthorizedAccessException
+                ? "missing-permission" : "error";
+            await commonsConfigurations.SetRoleReconciliationAsync(
+                configId,
+                new DiscordCommonsRoleReconciliation(
+                    state, ex.Message, DateTimeOffset.UtcNow, envoyCount),
+                ct);
+            logger.LogWarning(
+                "Public Nova role reconciliation failed for {ConfigId}: {ErrorType}",
+                configId, ex.GetType().Name);
+        }
     }
 
     private async Task PublishOwnerPresenceAsync(

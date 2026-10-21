@@ -92,4 +92,64 @@ public sealed class DiscordCommonsTests
     public void Discord_channel_names_map_to_protocol_channels(
         string source, string expected)
         => Assert.Equal(expected, DiscordCommonsRelayService.ChannelName(source));
+
+    [Fact]
+    public void Human_ingest_forwards_reply_reference_and_role_mentions_without_opening_floor()
+    {
+        var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(
+            "message-1", "human-1", "Lynial", "hello", [],
+            ["900000000000000009"], "nova-consult", "thread-1",
+            "800000000000000008", 1234);
+
+        Assert.Equal("800000000000000008",
+            payload["referencedMessageId"]!.GetValue<string>());
+        Assert.Equal("900000000000000009",
+            payload["mentionRoles"]![0]!.GetValue<string>());
+        Assert.False(payload["opensFloor"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void Envoy_roles_are_mentionable_permissionless_and_follow_public_name()
+    {
+        var envoy = new DiscordCommonsRelayEnvoy(
+            "envoy-1", "user-1", "Owner", "Lynial", "Nova · Lynial",
+            "active", "role-1");
+        var stale = new DiscordManagedRole(
+            "role-1", "Nova Old", "8", false, false);
+
+        Assert.Equal("Nova Lynial", DiscordCommonsRolePolicy.RoleName(envoy));
+        Assert.True(DiscordCommonsRolePolicy.NeedsUpdate(stale, "Nova Lynial"));
+        Assert.False(DiscordCommonsRolePolicy.NeedsUpdate(
+            stale with { Name = "Nova Lynial", Permissions = "0", Mentionable = true },
+            "Nova Lynial"));
+    }
+
+    [Fact]
+    public void Role_reconciliation_fails_clearly_without_manage_roles_and_caps_active_envoys()
+    {
+        var envoy = new DiscordCommonsRelayEnvoy(
+            "envoy-1", "user-1", "Owner", "Owner", "Nova · Owner",
+            "active", null);
+        var missing = Assert.Throws<UnauthorizedAccessException>(() =>
+            DiscordCommonsRolePolicy.EnsureCanReconcile(false, [envoy]));
+        Assert.Contains("Manage Roles", missing.Message, StringComparison.Ordinal);
+
+        var tooMany = Enumerable.Range(0, DiscordCommonsRolePolicy.MaximumRolesPerGuild + 1)
+            .Select(index => envoy with { Id = $"envoy-{index}" }).ToArray();
+        var capped = Assert.Throws<InvalidOperationException>(() =>
+            DiscordCommonsRolePolicy.EnsureCanReconcile(true, tooMany));
+        Assert.Contains("cap", capped.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Suspended_envoys_are_not_counted_as_active_role_targets()
+    {
+        var suspended = new DiscordCommonsRelayEnvoy(
+            "envoy-1", "user-1", "Owner", "Owner", "Nova · Owner",
+            "suspended", "role-1");
+        var manySuspended = Enumerable.Range(0, 100)
+            .Select(index => suspended with { Id = $"envoy-{index}" }).ToArray();
+
+        DiscordCommonsRolePolicy.EnsureCanReconcile(true, manySuspended);
+    }
 }
