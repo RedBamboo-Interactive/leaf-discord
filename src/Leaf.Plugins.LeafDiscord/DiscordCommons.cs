@@ -323,7 +323,10 @@ public sealed class DiscordCommonsRelayService(
     {
         if (loop is not null) return;
         runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        loop = RunAsync(runCts.Token);
+        // Task.Run so the loop never captures the caller's context (the kernel's WPF
+        // dispatcher); otherwise StopAsync waits on continuations a busy UI thread can't run.
+        var token = runCts.Token;
+        loop = Task.Run(() => RunAsync(token), CancellationToken.None);
     }
 
     public async Task StopAsync()
