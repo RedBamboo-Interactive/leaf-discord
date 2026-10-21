@@ -22,7 +22,9 @@ public sealed class DiscordTypingLeases : IDisposable
     private readonly Dictionary<string, Lease> leases = new(StringComparer.Ordinal);
     private readonly TimeSpan maxLifetime;
 
-    public DiscordTypingLeases() : this(TimeSpan.FromMinutes(10)) { }
+    // A safety net for a lease that never reaches quiescence, not a turn budget:
+    // long tool-heavy turns legitimately run past ten minutes.
+    public DiscordTypingLeases() : this(TimeSpan.FromMinutes(30)) { }
 
     internal DiscordTypingLeases(TimeSpan maxLifetime)
     {
@@ -83,6 +85,24 @@ public sealed class DiscordTypingLeases : IDisposable
                 return;
             Activate(lease);
         }
+    }
+
+    /// <summary>
+    /// Restart a visible indicator so Discord shows it immediately again. Posting a
+    /// message clears the author's typing state client-side, and the indicator only
+    /// re-triggers periodically. Does nothing when no indicator is showing.
+    /// </summary>
+    internal void Refresh(string bindingId)
+    {
+        IDisposable? previous;
+        lock (gate)
+        {
+            if (!leases.TryGetValue(bindingId, out var lease) || lease.Indicator is null)
+                return;
+            previous = lease.Indicator;
+            lease.Indicator = lease.CreateIndicator();
+        }
+        previous.Dispose();
     }
 
     internal void Cancel(DiscordTypingAdmission admission)

@@ -272,6 +272,7 @@ public sealed class DiscordBotConfigurationStore(
         ["max_attachment_bytes"] = config.MaxAttachmentBytes,
         ["presence_context_mode"] = config.PresenceContextMode,
         ["presence_extension_feed_enabled"] = config.PresenceExtensionFeedEnabled,
+        ["show_tool_activity"] = config.ShowToolActivity,
         ["owner_user_id"] = config.OwnerUserId,
     };
 
@@ -309,6 +310,7 @@ public sealed class DiscordBotConfigurationStore(
                 JsonRead.String(data, "presence_context_mode")),
             PresenceExtensionFeedEnabled = JsonRead.Bool(
                 data, "presence_extension_feed_enabled"),
+            ShowToolActivity = JsonRead.Bool(data, "show_tool_activity", true),
         };
     }
 

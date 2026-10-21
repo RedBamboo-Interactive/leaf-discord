@@ -20,6 +20,7 @@ public sealed class DiscordSettingsProvider(
                 ["default_agent", "session_quality_mode", "sentinel_quality_mode",
                  "dm_allowlist", "clear_allowlist"],
             ["attachments"] = ["max_attachment_bytes"],
+            ["replies"] = ["show_tool_activity"],
             ["presence"] = ["presence_context_mode", "presence_extension_feed_enabled"],
         };
 
@@ -95,6 +96,11 @@ public sealed class DiscordSettingsProvider(
                     Field("max_attachment_bytes", "number", config.MaxAttachmentBytes,
                         "Maximum accepted attachment size in bytes (1 to 25 MiB)."),
                 }),
+                Section("replies", "Replies", new JsonArray
+                {
+                    Field("show_tool_activity", "boolean", config.ShowToolActivity,
+                        "Show tool-call squares in the progress message while the Agent works."),
+                }),
                 Section("presence", "Guild context", new JsonArray
                 {
                     Field("presence_context_mode", "select", config.PresenceContextMode,
@@ -160,7 +166,8 @@ public sealed class DiscordSettingsProvider(
             ReadString(values, "sentinel_quality_mode") ?? current.SentinelQualityMode,
             ReadString(values, "presence_context_mode") ?? current.PresenceContextMode,
             ReadBool(values, "presence_extension_feed_enabled")
-                ?? current.PresenceExtensionFeedEnabled);
+                ?? current.PresenceExtensionFeedEnabled,
+            ReadBool(values, "show_tool_activity") ?? current.ShowToolActivity);
         var normalized = LeafDiscordConfigStore.NormalizeUpdate(current, update);
         if (await agents.ResolveAsync(normalized.AgentId, ct) is null)
             throw new ArgumentException(

@@ -519,6 +519,8 @@ public sealed class DiscordConversationCoordinator(
         var provider = ResolveProvider(binding.AgentId);
         var handle = ToHandle(binding, provider.ProviderId);
         var cursor = binding.Epoch is null ? null : new ExternalConversationCursor(binding.Epoch, binding.Sequence);
+        var showToolActivity = (await botConfigurations.FindByApplicationIdAsync(
+            binding.ApplicationId, ct))?.ShowToolActivity ?? true;
         while (true)
         {
             var page = await provider.ReadSettledAsync(handle, cursor, 100, ct);
@@ -530,6 +532,7 @@ public sealed class DiscordConversationCoordinator(
                 if (message.Kind is "tool_use" or "tool_result")
                 {
                     typing.Activate(binding.BindingId, message.MessageUid);
+                    if (!showToolActivity) continue;
                     await deliveries.EnqueueProgressAsync(
                         binding,
                         message,

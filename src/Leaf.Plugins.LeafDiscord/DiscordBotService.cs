@@ -3325,6 +3325,7 @@ internal sealed class DiscordBotRuntime(
                     {
                         var receipt = await deliveries.FindProgressReceiptAsync(latest, ct);
                         if (receipt is null)
+                        {
                             receipt = useWebhook
                                 ? await rest.SendWebhookAsync(
                                     binding.WebhookId!, binding.WebhookToken!,
@@ -3335,6 +3336,11 @@ internal sealed class DiscordBotRuntime(
                                     progressContent,
                                     DiscordRestTransport.Nonce(latest),
                                     ct);
+                            // Discord hides "is typing" as soon as the bot posts a message.
+                            // The progress message is not the answer, so show it again now
+                            // rather than after the indicator's next periodic trigger.
+                            typing.Refresh(binding.BindingId);
+                        }
                         else
                         {
                             if (useWebhook)

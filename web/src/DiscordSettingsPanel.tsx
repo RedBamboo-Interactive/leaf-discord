@@ -57,6 +57,7 @@ type BotConfig = {
   maxAttachmentBytes: number
   presenceContextMode: "off" | "active" | "roster"
   presenceExtensionFeedEnabled: boolean
+  showToolActivity?: boolean
   agentName?: string
   agentAvatarUrl?: string
 }
@@ -150,6 +151,8 @@ export function DiscordSettingsPanel() {
     presenceContextMode: key === "presence_context_mode" ? value : config.presenceContextMode,
     presenceExtensionFeedEnabled: key === "presence_extension_feed_enabled"
       ? value : config.presenceExtensionFeedEnabled,
+    showToolActivity: key === "show_tool_activity"
+      ? value : config.showToolActivity ?? true,
   })
 
   const save = async (_section: string, key: string, value: unknown) => {
@@ -308,6 +311,11 @@ export function DiscordSettingsPanel() {
           key: "max_attachment_bytes", type: "number", value: selected.config.maxAttachmentBytes,
           description: "Maximum accepted attachment size in bytes (1 to 25 MiB).",
         }} onSave={save} />
+        <FieldControl section="replies" field={{
+          key: "show_tool_activity", type: "boolean",
+          value: selected.config.showToolActivity ?? true,
+          description: "Show tool-call squares in the progress message while the Agent works.",
+        }} onSave={save} />
       </section>
       <section>
         <SectionHeader>Guild context</SectionHeader>
@@ -408,6 +416,7 @@ function AddBotDialog({
           maxAttachmentBytes: 10 * 1024 * 1024,
           presenceContextMode: "off",
           presenceExtensionFeedEnabled: false,
+          showToolActivity: true,
         }),
       })
       onOpenChange(false)

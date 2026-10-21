@@ -34,6 +34,8 @@ public sealed record LeafDiscordConfig(
     public string? OwnerUserId { get; init; }
     public string PresenceContextMode { get; init; } = DiscordPresenceContextModes.Off;
     public bool PresenceExtensionFeedEnabled { get; init; }
+    /// <summary>Show tool-call squares in the progress message while the Agent works.</summary>
+    public bool ShowToolActivity { get; init; } = true;
 
     public bool Ready => Enabled && !string.IsNullOrWhiteSpace(BotToken)
         && !string.IsNullOrWhiteSpace(ApplicationId) && !string.IsNullOrWhiteSpace(AgentId);
@@ -66,6 +68,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             ["max_attachment_bytes"] = 10 * 1024 * 1024,
             ["presence_context_mode"] = DiscordPresenceContextModes.Off,
             ["presence_extension_feed_enabled"] = false,
+            ["show_tool_activity"] = true,
             ["avatar_managed"] = false,
             ["guild_avatar_asset_ids"] = new JsonObject(),
             ["guild_avatar_fingerprints"] = new JsonObject(),
@@ -112,6 +115,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
                 JsonRead.String(data, "presence_context_mode")),
             PresenceExtensionFeedEnabled = JsonRead.Bool(
                 data, "presence_extension_feed_enabled"),
+            ShowToolActivity = JsonRead.Bool(data, "show_tool_activity", true),
         };
     }
 
@@ -141,6 +145,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             ["max_attachment_bytes"] = normalized.MaxAttachmentBytes,
             ["presence_context_mode"] = normalized.PresenceContextMode,
             ["presence_extension_feed_enabled"] = normalized.PresenceExtensionFeedEnabled,
+            ["show_tool_activity"] = normalized.ShowToolActivity,
             ["avatar_asset_id"] = existing.AvatarAssetId,
             ["avatar_managed"] = existing.AvatarManaged,
             ["avatar_fingerprint"] = existing.AvatarFingerprint,
@@ -168,6 +173,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
                 JsonRead.String(saved.Data, "presence_context_mode")),
             PresenceExtensionFeedEnabled = JsonRead.Bool(
                 saved.Data, "presence_extension_feed_enabled"),
+            ShowToolActivity = JsonRead.Bool(saved.Data, "show_tool_activity", true),
             AvatarManaged = JsonRead.Bool(saved.Data, "avatar_managed"),
             AvatarFingerprint = JsonRead.String(saved.Data, "avatar_fingerprint"),
             GuildAvatarAssetIds = JsonRead.StringDictionary(
@@ -215,6 +221,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
                 update.PresenceContextMode, existing.PresenceContextMode),
             PresenceExtensionFeedEnabled = update.PresenceExtensionFeedEnabled
                 ?? existing.PresenceExtensionFeedEnabled,
+            ShowToolActivity = update.ShowToolActivity ?? existing.ShowToolActivity,
         };
     }
 
@@ -237,6 +244,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
         BotId = config.EntityId,
         PresenceContextMode = config.PresenceContextMode,
         PresenceExtensionFeedEnabled = config.PresenceExtensionFeedEnabled,
+        ShowToolActivity = config.ShowToolActivity,
     };
 
     private static string RequiredSnowflake(string? value, string label)
@@ -273,6 +281,7 @@ public sealed record LeafDiscordConfigView(
     public string? AgentAvatarUrl { get; init; }
     public string PresenceContextMode { get; init; } = DiscordPresenceContextModes.Off;
     public bool PresenceExtensionFeedEnabled { get; init; }
+    public bool ShowToolActivity { get; init; } = true;
 }
 
 public sealed record LeafDiscordConfigUpdate(
@@ -289,7 +298,8 @@ public sealed record LeafDiscordConfigUpdate(
     string? SessionQualityMode = null,
     string? SentinelQualityMode = null,
     string? PresenceContextMode = null,
-    bool? PresenceExtensionFeedEnabled = null);
+    bool? PresenceExtensionFeedEnabled = null,
+    bool? ShowToolActivity = null);
 
 internal static class DiscordPresenceContextModes
 {

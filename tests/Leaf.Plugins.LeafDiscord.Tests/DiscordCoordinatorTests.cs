@@ -546,6 +546,58 @@ public sealed class DiscordCoordinatorTests
     }
 
     [Fact]
+    public async Task Reconcile_omits_tool_squares_when_the_bot_hides_tool_activity()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var configurations = await SeedBotConfigurationAsync(entities);
+        var config = (await configurations.ListAsync()).Single();
+        await configurations.SaveAsync(config.EntityId, new LeafDiscordConfigUpdate(
+            config.ApplicationId, config.InteractionPublicKey, null, false, false,
+            config.SentinelAgentId, [], [], config.MaxAttachmentBytes, config.AgentId,
+            config.SessionQualityMode, config.SentinelQualityMode, ShowToolActivity: false));
+        var bindings = new DiscordBindingStore(entities);
+        var deliveries = new DiscordDeliveryStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", "owner-1",
+            "nova-discord-external", "participate"));
+        var provider = new FlakyProvider(false);
+        binding = await bindings.AttachConversationAsync(binding, new ExternalConversationHandle(
+            provider.ProviderId, binding.BindingId, binding.Generation, "conversation", "session"));
+        provider.Messages.AddRange([
+            new ExternalConversationMessage(
+                new ExternalConversationCursor("epoch-1", 1), "turn-1",
+                "assistant", "commentary", "I am checking that now.", DateTimeOffset.UtcNow),
+            new ExternalConversationMessage(
+                new ExternalConversationCursor("epoch-1", 2), "turn-1",
+                "assistant", "tool_use", null, DateTimeOffset.UtcNow, ToolName: "inspect"),
+            new ExternalConversationMessage(
+                new ExternalConversationCursor("epoch-1", 3), "turn-1",
+                "assistant", "tool_result", null, DateTimeOffset.UtcNow, ToolName: "inspect"),
+            new ExternalConversationMessage(
+                new ExternalConversationCursor("epoch-1", 4), "turn-1",
+                "assistant", "text", "Found it.", DateTimeOffset.UtcNow),
+        ]);
+        using var coordinator = new DiscordConversationCoordinator(
+            bindings, deliveries, configurations,
+            new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), new FakeComputeGateway(),
+            [provider], new PromptInjectionDetector(), new DiscordEgressGuard(), new DiscordTypingLeases(),
+            NullLogger<DiscordConversationCoordinator>.Instance);
+
+        await coordinator.ReconcileAsync(binding);
+        var pending = await deliveries.PendingOutboundAsync(binding.BindingId);
+
+        Assert.Equal(2, pending.Count);
+        Assert.Equal(DiscordDeliveryStore.ProgressKind, pending[0].Kind);
+        Assert.Equal("I am checking that now.", pending[0].Payload?["content"]?.GetValue<string>());
+        Assert.Equal(DiscordDeliveryStore.MessageKind, pending[1].Kind);
+        Assert.Equal("Found it.", pending[1].Payload?["content"]?.GetValue<string>());
+        binding = await bindings.GetAsync(binding.EntityId) ?? throw new InvalidOperationException();
+        Assert.Equal(4, binding.Sequence);
+    }
+
+    [Fact]
     public async Task Reconcile_queues_delivery_text_and_asset_without_leaking_local_markdown()
     {
         var entities = new MemoryEntityStore();

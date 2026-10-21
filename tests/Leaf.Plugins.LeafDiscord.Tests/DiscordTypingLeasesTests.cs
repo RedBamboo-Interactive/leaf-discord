@@ -126,6 +126,46 @@ public sealed class DiscordTypingLeasesTests
         Assert.Null(leases.Capture("binding"));
     }
 
+    [Fact]
+    public void Refresh_restarts_a_visible_indicator_without_ending_the_lease()
+    {
+        using var leases = new DiscordTypingLeases(TimeSpan.FromMinutes(1));
+        var created = new List<FakeIndicator>();
+        var admission = leases.Begin("binding", () =>
+        {
+            var indicator = new FakeIndicator();
+            created.Add(indicator);
+            return indicator;
+        });
+        leases.MarkAdmitted(admission, "turn-1");
+
+        leases.Refresh("binding");
+
+        Assert.Equal(2, created.Count);
+        Assert.Equal(1, created[0].DisposeCount);
+        Assert.Equal(0, created[1].DisposeCount);
+
+        leases.CompleteQuiescent(Assert.IsType<DiscordTypingSnapshot>(leases.Capture("binding")));
+        Assert.Equal(1, created[1].DisposeCount);
+    }
+
+    [Fact]
+    public void Refresh_does_not_start_typing_that_is_not_showing()
+    {
+        using var leases = new DiscordTypingLeases(TimeSpan.FromMinutes(1));
+        var createCount = 0;
+        leases.Begin("binding", () =>
+        {
+            createCount++;
+            return new FakeIndicator();
+        }, startImmediately: false);
+
+        leases.Refresh("binding");
+        leases.Refresh("unknown");
+
+        Assert.Equal(0, createCount);
+    }
+
     private sealed class FakeIndicator : IDisposable
     {
         public int DisposeCount { get; private set; }
