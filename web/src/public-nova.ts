@@ -3,12 +3,34 @@ import type { DiscordAuthor } from "./discord-transcript"
 
 export type PublicNovaThread = {
   threadRef: string
+  agentId: string
+  agentName: string
   channelName: string
   title: string
   lastActivityAt: string
   lastSnippet: string
   unread: boolean | number
   scenario: string
+}
+
+export function effectivePublicAgentId(
+  selectedAgentId: string | null,
+  agents: Array<{ id: string }>,
+): string | null {
+  const ids = [...new Set(agents.map((agent) => agent.id))]
+  if (selectedAgentId && ids.includes(selectedAgentId)) return selectedAgentId
+  return ids.length === 1 ? ids[0] : null
+}
+
+export function publicThreadsRequestUrl(agentId: string): string {
+  return `/api/apps/leaf-commons/threads?agentId=${encodeURIComponent(agentId)}`
+}
+
+export function publicThreadsForAgent(
+  items: PublicNovaThread[],
+  agentId: string,
+): PublicNovaThread[] {
+  return items.filter((item) => item.agentId === agentId)
 }
 
 export type PublicNovaMessage = {

@@ -1788,7 +1788,7 @@ internal sealed class DiscordBotRuntime(
             // fault would block every restart that could recover it.
             await ObserveBackgroundLoopAsync(outboxLoop, "outbox");
             await ObserveBackgroundLoopAsync(presenceLoop, "presence");
-            await ObserveBackgroundLoopAsync(commonsRoleLoop, "Public Nova role reconciliation");
+            await ObserveBackgroundLoopAsync(commonsRoleLoop, "Public Agent role reconciliation");
             if (client is not null)
             {
                 await DisposeClientAsync(client);
@@ -3093,7 +3093,7 @@ internal sealed class DiscordBotRuntime(
                 if (!ulong.TryParse(guildId, out var parsedGuildId)) continue;
                 var guild = source.GetGuild(parsedGuildId)
                     ?? throw new InvalidOperationException(
-                        "A configured Public Nova guild is not visible to the Discord bot.");
+                        "A configured public Agent guild is not visible to the Discord bot.");
                 var envoys = await commons.GetEnvoysAsync(configId, ct);
                 envoyCount = envoys.Count;
                 DiscordCommonsRolePolicy.EnsureCanReconcile(
@@ -3169,7 +3169,7 @@ internal sealed class DiscordBotRuntime(
                     state, ex.Message, DateTimeOffset.UtcNow, envoyCount),
                 ct);
             logger.LogWarning(
-                "Public Nova role reconciliation failed for {ConfigId}: {ErrorType}",
+                "Public Agent role reconciliation failed for {ConfigId}: {ErrorType}",
                 configId, ex.GetType().Name);
         }
     }

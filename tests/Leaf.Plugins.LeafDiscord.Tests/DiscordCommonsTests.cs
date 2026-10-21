@@ -112,23 +112,23 @@ public sealed class DiscordCommonsTests
     public void Envoy_roles_are_mentionable_permissionless_and_follow_public_name()
     {
         var envoy = new DiscordCommonsRelayEnvoy(
-            "envoy-1", "user-1", "Owner", "Lynial", "Nova · Lynial",
+            "envoy-1", "user-1", "Owner", "agent-1", "Atlas", "Lynial", "Atlas · Lynial",
             "active", "role-1");
         var stale = new DiscordManagedRole(
             "role-1", "Nova Old", "8", false, false);
 
-        Assert.Equal("Nova Lynial", DiscordCommonsRolePolicy.RoleName(envoy));
-        Assert.True(DiscordCommonsRolePolicy.NeedsUpdate(stale, "Nova Lynial"));
+        Assert.Equal("Atlas Lynial", DiscordCommonsRolePolicy.RoleName(envoy));
+        Assert.True(DiscordCommonsRolePolicy.NeedsUpdate(stale, "Atlas Lynial"));
         Assert.False(DiscordCommonsRolePolicy.NeedsUpdate(
-            stale with { Name = "Nova Lynial", Permissions = "0", Mentionable = true },
-            "Nova Lynial"));
+            stale with { Name = "Atlas Lynial", Permissions = "0", Mentionable = true },
+            "Atlas Lynial"));
     }
 
     [Fact]
     public void Role_reconciliation_fails_clearly_without_manage_roles_and_caps_active_envoys()
     {
         var envoy = new DiscordCommonsRelayEnvoy(
-            "envoy-1", "user-1", "Owner", "Owner", "Nova · Owner",
+            "envoy-1", "user-1", "Owner", "agent-1", "Atlas", "Owner", "Atlas · Owner",
             "active", null);
         var missing = Assert.Throws<UnauthorizedAccessException>(() =>
             DiscordCommonsRolePolicy.EnsureCanReconcile(false, [envoy]));
@@ -145,7 +145,7 @@ public sealed class DiscordCommonsTests
     public void Suspended_envoys_are_not_counted_as_active_role_targets()
     {
         var suspended = new DiscordCommonsRelayEnvoy(
-            "envoy-1", "user-1", "Owner", "Owner", "Nova · Owner",
+            "envoy-1", "user-1", "Owner", "agent-1", "Atlas", "Owner", "Atlas · Owner",
             "suspended", "role-1");
         var manySuspended = Enumerable.Range(0, 100)
             .Select(index => suspended with { Id = $"envoy-{index}" }).ToArray();

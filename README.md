@@ -306,8 +306,8 @@ permission as channel editing. It creates only ordinary text channels and inheri
 selected category's permissions; it cannot create or alter permission overwrites. Use the
 existing binding route afterward when Nova should participate in the new channel.
 
-Public Nova is an optional host-only transport path (internally the Commons
-protocol). Fresh installations have no
+An Agent's public side is an optional host-only transport path (internally the
+Commons protocol). Fresh installations have no
 relay URL and an empty guild allowlist. Once an owner explicitly configures both,
 messages in an allowlisted guild are diverted before binding lookup: they can never
 create or enter a native Nova Agent session, and any old/manual binding for that
@@ -318,16 +318,18 @@ commands to the configured HTTPS relay.
 Human replies to a relay webhook message forward its Discord message reference;
 the relay resolves the authoring Envoy and treats the reply as a ping. Discord role
 mentions are forwarded separately. For every active Envoy the host reconciles one
-mentionable, permissionless `Nova <publicName>` role, records its ID at the relay,
-renames it with the public profile, and removes it on suspension. Reconciliation is
+mentionable, permissionless `<agentName> <publicName>` role, records its ID at the
+relay, renames it with either public-profile or Agent-name changes, and removes it
+on suspension. Reconciliation is
 capped at 50 active Envoys per guild. A missing Manage Roles grant is reported in
 the safe Commons configuration view and retried without interrupting ingest.
 
-When `leaf-commons` is installed and enabled, Nova's existing Discord page adds a
-**Public Nova** group beside native Agent conversations. It reads the owner-guarded
-`/api/apps/leaf-commons/threads` contract and renders thread messages and terminal
-blocked/failed outcomes in the same master-detail conversation surface. No separate
-Commons page is added.
+When `leaf-commons` is installed and enabled, the existing Discord page adds that
+Agent's public-thread group beside its native conversations. It requests the
+owner-guarded `/api/apps/leaf-commons/threads?agentId=<id>` contract only for the
+selected Agent, hides the group when that Agent is not public, and renders thread
+messages and terminal blocked/failed outcomes in the same master-detail conversation
+surface. No separate Commons page is added.
 
 The bot owner or local administrator configures the relay without receiving secrets
 back in a response:

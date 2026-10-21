@@ -48,6 +48,8 @@ public sealed record DiscordCommonsRelayEnvoy(
     string Id,
     string OwnerDiscordUserId,
     string OwnerDisplayName,
+    string AgentEntityId,
+    string AgentName,
     string PublicName,
     string PersonaName,
     string Status,
@@ -64,10 +66,13 @@ public static class DiscordCommonsRolePolicy
 
     public static string RoleName(DiscordCommonsRelayEnvoy envoy)
     {
+        var agentName = string.IsNullOrWhiteSpace(envoy.AgentName)
+            ? envoy.PersonaName.Split('·', 2)[0].Trim()
+            : envoy.AgentName.Trim();
         var publicName = string.IsNullOrWhiteSpace(envoy.PublicName)
-            ? envoy.PersonaName.Replace("Nova ·", "", StringComparison.OrdinalIgnoreCase).Trim()
+            ? envoy.PersonaName.Split('·', 2).Last().Trim()
             : envoy.PublicName.Trim();
-        return $"Nova {publicName}";
+        return $"{agentName} {publicName}";
     }
 
     public static void EnsureCanReconcile(
@@ -75,10 +80,10 @@ public static class DiscordCommonsRolePolicy
     {
         if (!manageRoles)
             throw new UnauthorizedAccessException(
-                "The Discord bot needs Manage Roles to reconcile Public Nova roles.");
+                "The Discord bot needs Manage Roles to reconcile public Agent roles.");
         if (envoys.Count(envoy => envoy.Status == "active") > MaximumRolesPerGuild)
             throw new InvalidOperationException(
-                $"Public Nova role cap of {MaximumRolesPerGuild} was exceeded.");
+                $"Public Agent role cap of {MaximumRolesPerGuild} was exceeded.");
     }
 
     public static bool NeedsUpdate(DiscordManagedRole role, string desiredName)
@@ -412,6 +417,10 @@ public sealed class DiscordCommonsRelayService(
                 item.GetProperty("id").GetString() ?? "",
                 item.GetProperty("ownerDiscordUserId").GetString() ?? "",
                 item.GetProperty("ownerDisplayName").GetString() ?? "",
+                item.TryGetProperty("agentEntityId", out var agentEntityId)
+                    ? agentEntityId.GetString() ?? "" : "",
+                item.TryGetProperty("agentName", out var agentName)
+                    ? agentName.GetString() ?? "" : "",
                 item.TryGetProperty("publicName", out var publicName)
                     ? publicName.GetString() ?? "" : "",
                 item.GetProperty("personaName").GetString() ?? "",

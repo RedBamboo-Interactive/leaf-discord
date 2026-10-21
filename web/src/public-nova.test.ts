@@ -2,12 +2,28 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   humanizePublicNovaReason,
+  effectivePublicAgentId,
   projectPublicNovaMessages,
+  publicThreadsForAgent,
+  publicThreadsRequestUrl,
   publicNovaOutcomeLine,
   type PublicNovaMessage,
 } from "./public-nova.ts"
 
-test("Public Nova reason codes use human-facing copy", () => {
+test("Public threads are requested and retained only for the selected Agent", () => {
+  assert.equal(effectivePublicAgentId(null, [{ id: "agent-one" }]), "agent-one")
+  assert.equal(effectivePublicAgentId(null, [{ id: "agent-one" }, { id: "agent-two" }]), null)
+  assert.equal(effectivePublicAgentId("agent-two", [{ id: "agent-one" }, { id: "agent-two" }]), "agent-two")
+  assert.equal(publicThreadsRequestUrl("agent / two"), "/api/apps/leaf-commons/threads?agentId=agent%20%2F%20two")
+
+  const items = [
+    { threadRef: "one", agentId: "agent-one", agentName: "Atlas", channelName: "bugs", title: "One", lastActivityAt: "now", lastSnippet: "", unread: false, scenario: "bug" },
+    { threadRef: "two", agentId: "agent-two", agentName: "Scout", channelName: "showcase", title: "Two", lastActivityAt: "now", lastSnippet: "", unread: false, scenario: "showcase" },
+  ]
+  assert.deepEqual(publicThreadsForAgent(items, "agent-two"), [items[1]])
+})
+
+test("public Agent reason codes use human-facing copy", () => {
   assert.equal(humanizePublicNovaReason("wait_for_human"), "Paused until a human replies")
   assert.equal(humanizePublicNovaReason("absolute-path"), "Withheld: it contained a file path")
   assert.equal(humanizePublicNovaReason("relay_link_not_allowed"), "Withheld: it contained a link that isn't allowed")
@@ -16,7 +32,7 @@ test("Public Nova reason codes use human-facing copy", () => {
   assert.equal(humanizePublicNovaReason("future_reason"), "Withheld (reason: future_reason)")
 })
 
-test("Public Nova attribution matches the Discord transcript model", () => {
+test("public Agent attribution matches the Discord transcript model", () => {
   const source: PublicNovaMessage[] = [
     { id: "envoy", at: "2026-10-21T12:00:00Z", author: { kind: "envoy", name: "Nova · Lab", avatarUrl: "https://relay.example/avatar/lab" }, text: "From another Nova" },
     { id: "human", at: "2026-10-21T12:01:00Z", author: { kind: "human", name: "Lynial", avatarUrl: "https://cdn.discordapp.com/avatar" }, text: "From Discord" },

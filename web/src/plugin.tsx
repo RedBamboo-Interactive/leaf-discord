@@ -21,7 +21,10 @@ import {
   type DiscordTranscriptMessage,
 } from "./discord-transcript"
 import {
+  effectivePublicAgentId,
   projectPublicNovaMessages,
+  publicThreadsForAgent,
+  publicThreadsRequestUrl,
   publicNovaOutcomeLine,
   type PublicNovaConversation,
   type PublicNovaThread,
@@ -36,7 +39,7 @@ function PublicNovaOutcomeStatus({ block }: { block: MessageBlock }) {
       ? { color: "var(--color-accent-gold)", icon: "ph-bold ph-shield-warning" }
       : { color: "var(--color-text-muted)", icon: "ph-bold ph-info" }
   return (
-    <div role="status" aria-label={`Public Nova ${line.outcome}`} className="mt-1">
+    <div role="status" aria-label={`Public Agent ${line.outcome}`} className="mt-1">
       <ChatStatusLine color={appearance.color} icon={appearance.icon} label={line.label} />
     </div>
   )
@@ -111,19 +114,27 @@ export function Page() {
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
-    const [botResult, bindingResult, publicResult] = await Promise.all([
+    const [botResult, bindingResult] = await Promise.all([
       api<{ items: Bot[] }>("/bots"),
       api<{ items: Binding[] }>("/bindings"),
-      fetch("/api/apps/leaf-commons/threads").then(async (response) => {
-        if (response.status === 404 || response.status === 403) return null
-        if (!response.ok) throw new Error(`Public Nova HTTP ${response.status}`)
-        return await response.json() as { items: PublicNovaThread[] }
-      }).catch(() => null),
     ])
+    const publicAgentId = effectivePublicAgentId(
+      agentFilter,
+      botResult.items.map((bot) => ({ id: bot.config.agentId })),
+    )
+    const publicResult = publicAgentId
+      ? await fetch(publicThreadsRequestUrl(publicAgentId)).then(async (response) => {
+        if (response.status === 404 || response.status === 403) return null
+        if (!response.ok) throw new Error(`Public Agent HTTP ${response.status}`)
+        return await response.json() as { items: PublicNovaThread[] }
+      }).catch(() => null)
+      : null
     setBots(botResult.items)
     setBindings(bindingResult.items)
-    setPublicThreads(publicResult?.items ?? null)
-  }, [])
+    setPublicThreads(publicResult && publicAgentId
+      ? publicThreadsForAgent(publicResult.items, publicAgentId)
+      : null)
+  }, [agentFilter])
 
   useEffect(() => {
     void refresh().catch((reason) => setError(String(reason.message ?? reason)))
@@ -199,6 +210,10 @@ export function Page() {
 
   const setAgentFilter = useCallback((id: string | null) => {
     setAgentFilterState(id)
+    setPublicThreads(null)
+    setSelectedPublicRef(null)
+    setMessages([])
+    setAuthors({})
     if (id) window.localStorage.setItem("leaf-discord-agent-filter", id)
     else window.localStorage.removeItem("leaf-discord-agent-filter")
   }, [])
@@ -241,7 +256,10 @@ export function Page() {
 
   const selectedBinding = visibleBindings.find((binding) => binding.entityId === selectedBindingId) ?? null
   const selectedPublicThread = publicThreads?.find((thread) => thread.threadRef === selectedPublicRef) ?? null
-  const selectedBot = selectedBinding
+  const publicAgentId = effectivePublicAgentId(agentFilter, bots.map((bot) => ({ id: bot.config.agentId })))
+  const selectedBot = selectedPublicThread
+    ? bots.find((bot) => bot.config.agentId === selectedPublicThread.agentId)
+    : selectedBinding
     ? bots.find((bot) => bot.config.applicationId === selectedBinding.applicationId)
     : agentFilter
       ? bots.find((bot) => bot.config.agentId === agentFilter)
@@ -259,7 +277,7 @@ export function Page() {
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-[14px] font-medium text-contrast">{selectedPublicThread.title}</span>
         <span className="truncate text-xs text-text-muted">
-          Public Nova / #{selectedPublicThread.channelName} / {selectedPublicThread.scenario}
+          {selectedPublicThread.agentName} public / #{selectedPublicThread.channelName} / {selectedPublicThread.scenario}
         </span>
       </div>
     </PanelHeader>
@@ -356,12 +374,14 @@ export function Page() {
       )}
       <div className="min-h-0 flex-1 overflow-hidden">
         <div className="h-full overflow-y-auto">
-          {publicThreads && <section aria-label="Public Nova discussions">
-            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Public Nova</div>
+          {publicThreads && publicAgentId && <section aria-label={`${selectedBot?.config.agentName ?? "Agent"} public discussions`}>
+            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+              Public {publicThreads[0]?.agentName ?? selectedBot?.config.agentName ?? "Agent"}
+            </div>
             <ItemList
               items={publicThreads}
               keyFn={(thread) => thread.threadRef}
-              emptyMessage="Public Nova threads appear here after your Nova posts or is pinged."
+              emptyMessage="Public threads appear here after this Agent posts or is pinged."
               renderItem={(thread) => <ItemListRow
                 selected={thread.threadRef === selectedPublicRef}
                 onClick={() => selectPublicThread(thread.threadRef)}
