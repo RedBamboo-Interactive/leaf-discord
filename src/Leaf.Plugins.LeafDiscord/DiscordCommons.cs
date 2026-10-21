@@ -537,26 +537,34 @@ public sealed class DiscordCommonsRelayService(
         string? threadRef,
         string? referencedMessageId,
         long timestamp)
-        => new()
+    {
+        var listeningOnly = string.Equals(
+            ChannelName(channel), "announcements", StringComparison.Ordinal);
+        IReadOnlyList<string> forwardedMentions = listeningOnly ? [] : mentions;
+        IReadOnlyList<string> forwardedRoles = listeningOnly ? [] : mentionRoles;
+        var forwardedThread = listeningOnly ? null : threadRef;
+        var forwardedReference = listeningOnly ? null : referencedMessageId;
+        return new JsonObject
         {
             ["type"] = "human_message",
             ["eventId"] = eventId,
             ["authorId"] = authorId,
             ["displayName"] = displayName,
             ["content"] = content,
-            ["mentions"] = new JsonArray(mentions
+            ["mentions"] = new JsonArray(forwardedMentions
                 .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
-            ["mentionRoles"] = new JsonArray(mentionRoles
+            ["mentionRoles"] = new JsonArray(forwardedRoles
                 .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
-            ["referencedMessageId"] = referencedMessageId,
+            ["referencedMessageId"] = forwardedReference,
             ["channel"] = channel,
-            ["threadRef"] = threadRef,
-            ["opensFloor"] = threadRef is not null
-                && mentions.Count == 0
-                && mentionRoles.Count == 0
-                && referencedMessageId is null,
+            ["threadRef"] = forwardedThread,
+            ["opensFloor"] = !listeningOnly && forwardedThread is not null
+                && forwardedMentions.Count == 0
+                && forwardedRoles.Count == 0
+                && forwardedReference is null,
             ["timestamp"] = timestamp,
         };
+    }
 
     private async Task RunAsync(CancellationToken ct)
     {

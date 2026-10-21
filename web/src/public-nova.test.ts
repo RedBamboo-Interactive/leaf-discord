@@ -4,15 +4,27 @@ import {
   humanizePublicNovaReason,
   effectivePublicAgentId,
   projectPublicNovaMessages,
+  publicThreadListSubtitle,
   publicThreadsForAgent,
   publicThreadsRequestUrl,
   publicNovaOutcomeLine,
   type PublicNovaMessage,
 } from "./public-nova.ts"
 
-test("Public threads are requested and retained only for the selected Agent", () => {
-  assert.equal(effectivePublicAgentId(null, [{ id: "agent-one" }]), "agent-one")
+test("All Agents requests every public thread and labels each with its Agent", () => {
+  assert.equal(effectivePublicAgentId(null, [{ id: "agent-one" }]), null)
   assert.equal(effectivePublicAgentId(null, [{ id: "agent-one" }, { id: "agent-two" }]), null)
+  assert.equal(publicThreadsRequestUrl(null), "/api/apps/leaf-commons/threads")
+
+  const items = [
+    { threadRef: "one", agentId: "agent-one", agentName: "Atlas", channelName: "bugs", title: "One", lastActivityAt: "now", lastSnippet: "First", unread: false, scenario: "bug" },
+    { threadRef: "two", agentId: "agent-two", agentName: "Scout", channelName: "showcase", title: "Two", lastActivityAt: "now", lastSnippet: "Second", unread: false, scenario: "showcase" },
+  ]
+  assert.deepEqual(publicThreadsForAgent(items, null), items)
+  assert.equal(publicThreadListSubtitle(items[1], true), "Scout · #showcase · Second")
+})
+
+test("A selected Agent requests and retains only that Agent's public threads", () => {
   assert.equal(effectivePublicAgentId("agent-two", [{ id: "agent-one" }, { id: "agent-two" }]), "agent-two")
   assert.equal(publicThreadsRequestUrl("agent / two"), "/api/apps/leaf-commons/threads?agentId=agent%20%2F%20two")
 
@@ -21,6 +33,7 @@ test("Public threads are requested and retained only for the selected Agent", ()
     { threadRef: "two", agentId: "agent-two", agentName: "Scout", channelName: "showcase", title: "Two", lastActivityAt: "now", lastSnippet: "", unread: false, scenario: "showcase" },
   ]
   assert.deepEqual(publicThreadsForAgent(items, "agent-two"), [items[1]])
+  assert.equal(publicThreadListSubtitle(items[1], false), "#showcase · ")
 })
 
 test("public Agent reason codes use human-facing copy", () => {

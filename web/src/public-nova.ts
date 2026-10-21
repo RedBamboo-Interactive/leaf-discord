@@ -19,18 +19,28 @@ export function effectivePublicAgentId(
 ): string | null {
   const ids = [...new Set(agents.map((agent) => agent.id))]
   if (selectedAgentId && ids.includes(selectedAgentId)) return selectedAgentId
-  return ids.length === 1 ? ids[0] : null
+  return null
 }
 
-export function publicThreadsRequestUrl(agentId: string): string {
-  return `/api/apps/leaf-commons/threads?agentId=${encodeURIComponent(agentId)}`
+export function publicThreadsRequestUrl(agentId: string | null): string {
+  return agentId
+    ? `/api/apps/leaf-commons/threads?agentId=${encodeURIComponent(agentId)}`
+    : "/api/apps/leaf-commons/threads"
 }
 
 export function publicThreadsForAgent(
   items: PublicNovaThread[],
-  agentId: string,
+  agentId: string | null,
 ): PublicNovaThread[] {
-  return items.filter((item) => item.agentId === agentId)
+  return agentId ? items.filter((item) => item.agentId === agentId) : items
+}
+
+export function publicThreadListSubtitle(
+  thread: PublicNovaThread,
+  aggregate: boolean,
+): string {
+  const agent = aggregate ? `${thread.agentName} · ` : ""
+  return `${agent}#${thread.channelName} · ${thread.lastSnippet}`
 }
 
 export type PublicNovaMessage = {

@@ -23,6 +23,7 @@ import {
 import {
   effectivePublicAgentId,
   projectPublicNovaMessages,
+  publicThreadListSubtitle,
   publicThreadsForAgent,
   publicThreadsRequestUrl,
   publicNovaOutcomeLine,
@@ -122,16 +123,14 @@ export function Page() {
       agentFilter,
       botResult.items.map((bot) => ({ id: bot.config.agentId })),
     )
-    const publicResult = publicAgentId
-      ? await fetch(publicThreadsRequestUrl(publicAgentId)).then(async (response) => {
+    const publicResult = await fetch(publicThreadsRequestUrl(publicAgentId)).then(async (response) => {
         if (response.status === 404 || response.status === 403) return null
         if (!response.ok) throw new Error(`Public Agent HTTP ${response.status}`)
         return await response.json() as { items: PublicNovaThread[] }
       }).catch(() => null)
-      : null
     setBots(botResult.items)
     setBindings(bindingResult.items)
-    setPublicThreads(publicResult && publicAgentId
+    setPublicThreads(publicResult
       ? publicThreadsForAgent(publicResult.items, publicAgentId)
       : null)
   }, [agentFilter])
@@ -374,9 +373,13 @@ export function Page() {
       )}
       <div className="min-h-0 flex-1 overflow-hidden">
         <div className="h-full overflow-y-auto">
-          {publicThreads && publicAgentId && <section aria-label={`${selectedBot?.config.agentName ?? "Agent"} public discussions`}>
+          {publicThreads && <section aria-label={publicAgentId
+            ? `${selectedBot?.config.agentName ?? "Agent"} public discussions`
+            : "All Agents public discussions"}>
             <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
-              Public {publicThreads[0]?.agentName ?? selectedBot?.config.agentName ?? "Agent"}
+              {publicAgentId
+                ? `Public ${publicThreads[0]?.agentName ?? selectedBot?.config.agentName ?? "Agent"}`
+                : "Public"}
             </div>
             <ItemList
               items={publicThreads}
@@ -387,7 +390,7 @@ export function Page() {
                 onClick={() => selectPublicThread(thread.threadRef)}
                 icon={<i className="ph-bold ph-globe-hemisphere-west" />}
                 title={thread.title}
-                subtitle={`#${thread.channelName} · ${thread.lastSnippet}`}
+                subtitle={publicThreadListSubtitle(thread, publicAgentId === null)}
                 trailing={Boolean(thread.unread)
                   ? <span className="min-w-5 rounded-full bg-primary px-1.5 text-center text-[10px] text-primary-foreground">{typeof thread.unread === "number" ? thread.unread : "•"}</span>
                   : null}

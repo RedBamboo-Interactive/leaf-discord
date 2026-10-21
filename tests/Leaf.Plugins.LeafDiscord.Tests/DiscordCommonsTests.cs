@@ -109,6 +109,22 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
+    public void Announcements_ingest_is_listening_only_and_strips_every_addressing_signal()
+    {
+        var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(
+            "announcement-1", "human-1", "Lynial", "Nova Lynial ships this",
+            ["user-mention"], ["role-mention"], "announcements", "announcements",
+            "envoy-message", 1234);
+
+        Assert.Empty(payload["mentions"]!.AsArray());
+        Assert.Empty(payload["mentionRoles"]!.AsArray());
+        Assert.Null(payload["referencedMessageId"]);
+        Assert.Null(payload["threadRef"]);
+        Assert.False(payload["opensFloor"]!.GetValue<bool>());
+        Assert.Equal("Nova Lynial ships this", payload["content"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void Envoy_roles_are_mentionable_permissionless_and_follow_public_name()
     {
         var envoy = new DiscordCommonsRelayEnvoy(
