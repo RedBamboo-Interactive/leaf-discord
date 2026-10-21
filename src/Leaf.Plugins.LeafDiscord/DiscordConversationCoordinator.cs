@@ -7,6 +7,11 @@ using Microsoft.Extensions.Logging;
 
 namespace Leaf.Plugins.LeafDiscord;
 
+internal sealed record DiscordPreparedOutreach(
+    string Content,
+    string DeliveryContent,
+    IReadOnlyList<ExternalConversationOutputAsset> OutputAssets);
+
 internal sealed record DiscordPreparedCorrection(
     string? DeliveryContent,
     IReadOnlyList<ExternalConversationOutputAsset>? OutputAssets);
@@ -222,6 +227,18 @@ public sealed class DiscordConversationCoordinator(
         => SendProactiveCoreAsync(
             binding, requestId, content, null, null, discordMessageId, null, [], ct);
 
+    public Task<(DiscordBinding Binding, string MessageUid)> RecordDeliveredProactiveAsync(
+        DiscordBinding binding,
+        string requestId,
+        string content,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        string discordMessageId,
+        CancellationToken ct = default)
+        => SendProactiveCoreAsync(
+            binding, requestId, content, null, null, discordMessageId,
+            deliveryContent, outputAssets, ct);
+
 
     public async Task<DiscordBinding> EnsureReadyAsync(
         DiscordBinding binding, CancellationToken ct = default)
@@ -336,29 +353,7 @@ public sealed class DiscordConversationCoordinator(
                 throw new DiscordBindingSessionChangedException(
                     "The Discord binding session changed before the message was admitted");
 
-            var inspected = egress.Inspect(content);
-            if (!inspected.Allowed)
-                throw new ArgumentException("Discord outreach content was rejected by the egress guard");
-            var inspectedDelivery = egress.Inspect(deliveryContent ?? inspected.Content);
-            if (!inspectedDelivery.Allowed)
-                throw new ArgumentException(
-                    "Discord outreach delivery content was rejected by the egress guard");
-            var inspectedAssets = (outputAssets ?? []).Select(asset =>
-            {
-                var description = egress.Inspect(asset.Description);
-                return asset with
-                {
-                    Description = description.Allowed
-                        && !string.IsNullOrWhiteSpace(description.Content)
-                            ? description.Content
-                            : "Shared image",
-                };
-            }).ToArray();
-            if (inspectedAssets.Length == 0
-                && deliveryContent is null
-                && LooksLikePrivateAssetImageMarkdown(inspected.Content))
-                throw new ArgumentException(
-                    "Private RedLeaf Asset Markdown requires typed Discord output Assets");
+            var prepared = PrepareOutreach(content, deliveryContent, outputAssets);
 
             var (_, handle, attached) = await EnsureConversationAsync(binding, ct);
             binding = attached;
@@ -370,7 +365,7 @@ public sealed class DiscordConversationCoordinator(
                 Content = JsonContent.Create(new
                 {
                     role = "assistant",
-                    content = inspected.Content,
+                    content = prepared.Content,
                     messageUid,
                     metadata = new
                     {
@@ -386,14 +381,14 @@ public sealed class DiscordConversationCoordinator(
 
             var message = new ExternalConversationMessage(
                 new ExternalConversationCursor("leaf-discord-outreach", 0),
-                messageUid, "assistant", "text", inspected.Content, DateTimeOffset.UtcNow,
+                messageUid, "assistant", "text", prepared.Content, DateTimeOffset.UtcNow,
                 new JsonObject { ["origin"] = "agent-outreach" })
             {
-                DeliveryContent = inspectedDelivery.Content,
-                OutputAssets = inspectedAssets,
+                DeliveryContent = prepared.DeliveryContent,
+                OutputAssets = prepared.OutputAssets,
             };
-            var chunks = DiscordMessageChunker.Split(inspectedDelivery.Content);
-            var assetGroups = inspectedAssets.Chunk(10).ToArray();
+            var chunks = DiscordMessageChunker.Split(prepared.DeliveryContent);
+            var assetGroups = prepared.OutputAssets.Chunk(10).ToArray();
             var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
             for (var i = 0; i < deliveryCount; i++)
             {
@@ -418,6 +413,42 @@ public sealed class DiscordConversationCoordinator(
         {
             gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Applies the outreach egress contract without side effects, so a caller that must
+    /// deliver to Discord before a transcript exists sends exactly what the outbox would.
+    /// </summary>
+    internal DiscordPreparedOutreach PrepareOutreach(
+        string content,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset>? outputAssets)
+    {
+        var inspected = egress.Inspect(content);
+        if (!inspected.Allowed)
+            throw new ArgumentException("Discord outreach content was rejected by the egress guard");
+        var inspectedDelivery = egress.Inspect(deliveryContent ?? inspected.Content);
+        if (!inspectedDelivery.Allowed)
+            throw new ArgumentException(
+                "Discord outreach delivery content was rejected by the egress guard");
+        var inspectedAssets = (outputAssets ?? []).Select(asset =>
+        {
+            var description = egress.Inspect(asset.Description);
+            return asset with
+            {
+                Description = description.Allowed
+                    && !string.IsNullOrWhiteSpace(description.Content)
+                        ? description.Content
+                        : "Shared image",
+            };
+        }).ToArray();
+        if (inspectedAssets.Length == 0
+            && deliveryContent is null
+            && LooksLikePrivateAssetImageMarkdown(inspected.Content))
+            throw new ArgumentException(
+                "Private RedLeaf Asset Markdown requires typed Discord output Assets");
+        return new DiscordPreparedOutreach(
+            inspected.Content, inspectedDelivery.Content, inspectedAssets);
     }
 
     private static bool LooksLikePrivateAssetImageMarkdown(string content)

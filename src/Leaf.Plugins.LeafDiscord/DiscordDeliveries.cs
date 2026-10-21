@@ -25,12 +25,21 @@ public sealed record DiscordDelivery(
     string? LastError,
     DateTimeOffset CreatedAt);
 
+public sealed record DiscordOwnerDirectMessageOperation(
+    DiscordDelivery Delivery,
+    string? ChannelId,
+    bool? BindingExisted,
+    DiscordOwnerDirectMessageResult? Result);
+
+public sealed class DiscordIdempotencyConflictException(string message) : Exception(message);
+
 public sealed class DiscordDeliveryStore(IEntityStore store)
 {
     public const string TypeSlug = "leaf-discord-delivery";
     internal const string ProgressKind = "progress";
     internal const string MessageKind = "message";
     internal const string ForumPostKind = "forum_post";
+    internal const string OwnerDirectMessageKind = "owner_dm";
     internal const string ToolUseMarker = "\U0001F7EA";
     internal const string MutatingToolMarker = "\U0001F7E7";
     internal const string ToolResultMarker = "\U0001F7E9";
@@ -201,6 +210,91 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
                 ["attempts"] = 0,
                 ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
             }, ct));
+    }
+
+    /// <summary>
+    /// Reserves one owner-directed DM opening. The identity is the bot application and
+    /// idempotency key; the hash covers recipient and content, so reusing a key for a
+    /// different message is refused before any Discord or transcript side effect.
+    /// </summary>
+    public async Task<DiscordOwnerDirectMessageOperation> ReserveOwnerDirectMessageAsync(
+        string applicationId,
+        string idempotencyKey,
+        JsonObject identity,
+        JsonObject payload,
+        CancellationToken ct = default)
+    {
+        var slug = $"discord-owner-dm-{DiscordBindingStore.Hash(
+            $"{applicationId}:{idempotencyKey}")}";
+        var payloadHash = Hash(identity.ToJsonString());
+        var existing = await store.GetBySlugAsync(TypeSlug, slug, ct);
+        if (existing is not null)
+        {
+            var operation = MapOwnerDirectMessage(existing);
+            if (!string.Equals(operation.Delivery.Kind, OwnerDirectMessageKind, StringComparison.Ordinal)
+                || !string.Equals(operation.Delivery.PayloadHash, payloadHash, StringComparison.Ordinal))
+                throw new DiscordIdempotencyConflictException(
+                    "This idempotency key was already used for a different Discord DM recipient or content.");
+            return operation;
+        }
+
+        return MapOwnerDirectMessage(await store.UpsertBySlugAsync(TypeSlug, slug,
+            $"Discord owner DM {idempotencyKey}", new JsonObject
+            {
+                ["direction"] = "outbound",
+                ["kind"] = OwnerDirectMessageKind,
+                ["binding_id"] = $"discord-owner-dm:{applicationId}",
+                ["generation"] = 1,
+                ["state"] = "queued",
+                ["message_uid"] = idempotencyKey,
+                ["chunk_index"] = 0,
+                ["payload_hash"] = payloadHash,
+                ["payload"] = payload,
+                ["attempts"] = 0,
+                ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
+            }, ct));
+    }
+
+    /// <summary>Records Discord's acceptance before any binding or session is created.</summary>
+    public async Task<DiscordOwnerDirectMessageOperation> MarkOwnerDirectMessageDeliveredAsync(
+        DiscordOwnerDirectMessageOperation operation,
+        string channelId,
+        string discordMessageId,
+        bool bindingExisted,
+        CancellationToken ct = default)
+        => MapOwnerDirectMessage(await store.PatchAsync(operation.Delivery.EntityId, new JsonObject
+        {
+            ["state"] = "delivered",
+            ["discord_id"] = discordMessageId,
+            ["channel_id"] = channelId,
+            ["binding_existed"] = bindingExisted,
+            ["last_error"] = null,
+        }, ct: ct));
+
+    public async Task<DiscordOwnerDirectMessageOperation> CompleteOwnerDirectMessageAsync(
+        DiscordOwnerDirectMessageOperation operation,
+        DiscordOwnerDirectMessageResult result,
+        CancellationToken ct = default)
+        => MapOwnerDirectMessage(await store.PatchAsync(operation.Delivery.EntityId, new JsonObject
+        {
+            ["state"] = "sent",
+            ["result"] = JsonSerializer.SerializeToNode(result),
+            ["last_error"] = null,
+        }, ct: ct));
+
+    private static DiscordOwnerDirectMessageOperation MapOwnerDirectMessage(LeafEntity entity)
+    {
+        var data = entity.Data;
+        var delivery = Map(entity);
+        return new DiscordOwnerDirectMessageOperation(
+            delivery,
+            JsonRead.String(data, "channel_id"),
+            data["binding_existed"] is JsonValue existed && existed.TryGetValue<bool>(out var value)
+                ? value
+                : null,
+            delivery.State == "sent" && data["result"] is JsonObject result
+                ? result.Deserialize<DiscordOwnerDirectMessageResult>()
+                : null);
     }
 
     public async Task<DiscordDelivery?> EnqueueProgressAsync(

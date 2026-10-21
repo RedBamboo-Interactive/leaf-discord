@@ -101,5 +101,8 @@
   { "parentType": "leaf-discord-delivery", "slug": "markers", "name": "Progress Markers", "fieldType": "string", "sortOrder": 16 },
   { "parentType": "leaf-discord-delivery", "slug": "marker_count", "name": "Progress Marker Count", "fieldType": "number", "sortOrder": 17 },
   { "parentType": "leaf-discord-delivery", "slug": "edited_at", "name": "Edited At", "fieldType": "string", "sortOrder": 18 },
-  { "parentType": "leaf-discord-delivery", "slug": "deleted_at", "name": "Deleted At", "fieldType": "string", "sortOrder": 19 }
+  { "parentType": "leaf-discord-delivery", "slug": "deleted_at", "name": "Deleted At", "fieldType": "string", "sortOrder": 19 },
+  { "parentType": "leaf-discord-delivery", "slug": "channel_id", "name": "Owner DM Channel ID", "fieldType": "string", "sortOrder": 20 },
+  { "parentType": "leaf-discord-delivery", "slug": "binding_existed", "name": "Owner DM Binding Existed", "fieldType": "boolean", "sortOrder": 21 },
+  { "parentType": "leaf-discord-delivery", "slug": "result", "name": "Owner DM Result", "fieldType": "json", "sortOrder": 22 }
 ]

@@ -339,6 +339,20 @@ public sealed class DiscordBotService(
             guildId, forumId, title, content, idempotencyKey, ownerUserId, ct);
     }
 
+    public async Task<DiscordOwnerDirectMessageResult> OpenOwnerDirectMessageAsync(
+        Guid botId,
+        string ownerUserId,
+        DiscordOwnerDirectMessageRequest request,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.OpenOwnerDirectMessageAsync(ownerUserId, request, ct);
+    }
+
     public async Task<DiscordChannelEditResult> EditGuildChannelAsync(
         Guid botId,
         string guildId,
@@ -595,6 +609,8 @@ internal sealed class DiscordBotRuntime(
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelEditGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelCreateGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<ulong, CachedUserProfile> userProfiles = new();
+    private readonly DiscordOwnerDirectMessenger ownerDirectMessages =
+        new(bindings, behaviors, deliveries, conversations, rest, assets);
     private DiscordSocketClient? client;
     private Func<Task>? clientConnectedHandler;
     private Func<Task>? clientReadyHandler;
@@ -1681,6 +1697,20 @@ internal sealed class DiscordBotRuntime(
             binding, idempotencyKey.Trim(), content.Trim(), ct);
         await DrainBindingAsync(sent.Binding, ct);
         return new DiscordDirectMessageResult(sent.Binding, sent.MessageUid);
+    }
+
+    public async Task<DiscordOwnerDirectMessageResult> OpenOwnerDirectMessageAsync(
+        string ownerUserId,
+        DiscordOwnerDirectMessageRequest request,
+        CancellationToken ct = default)
+    {
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var config = await GetConfigAsync(ct);
+        if (!config.Enabled)
+            throw new InvalidOperationException("Discord bot is disabled.");
+        return await ownerDirectMessages.OpenAsync(config, ownerUserId, request, ct);
     }
 
     public async Task<DiscordDirectMessageResult> SendExistingBindingMessageAsync(

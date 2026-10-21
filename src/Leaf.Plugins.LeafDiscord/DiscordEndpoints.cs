@@ -1423,6 +1423,20 @@ public static class DiscordEndpoints
             }
         });
 
+        group.MapPost("/bots/{id:guid}/dms", async (
+            Guid id,
+            DiscordOwnerDirectMessageRequest request,
+            HttpContext http,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+            await OpenOwnerDirectMessageAsync(
+                id, http, configurations, agents,
+                (config, ownerUserId, token) => bot.OpenOwnerDirectMessageAsync(
+                    config.EntityId, ownerUserId, request, token),
+                ct));
+
         group.MapPost("/reactions", async (
             DiscordReactionRequest request,
             HttpContext http,
@@ -1865,6 +1879,98 @@ public static class DiscordEndpoints
         }
     }
 
+    /// <summary>
+    /// Owner-directed DM opening from a signed private Nova Agent discussion. Authority is
+    /// the exact bot Agent and owner; the recipient must already be on the bot's DM allowlist.
+    /// </summary>
+    internal static async Task<IResult> OpenOwnerDirectMessageAsync(
+        Guid id,
+        HttpContext http,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        Func<LeafDiscordConfig, string, CancellationToken, Task<DiscordOwnerDirectMessageResult>> open,
+        CancellationToken ct)
+    {
+        var caller = ReadPrivateLeafAgentCaller(http);
+        if (caller is null)
+            return Forbidden("A signed private Nova Agent discussion is required.");
+        var config = await configurations.GetAsync(id, ct);
+        if (config is null) return Results.NotFound();
+        var agent = await agents.ResolveAsync(config.AgentId, ct);
+        if (!MatchesBotOwnerAndAgent(caller, config, agent?.Id.ToString()))
+            return Forbidden("This Agent cannot address that Discord bot.");
+        if (!config.Enabled)
+            return Results.Conflict(new
+            {
+                error = "discord_bot_disabled",
+                message = "The Discord bot is disabled.",
+            });
+        try
+        {
+            var result = await open(config, config.OwnerUserId!, ct);
+            return Results.Ok(new
+            {
+                ok = true,
+                bindingEntityId = result.BindingEntityId,
+                bindingId = result.BindingId,
+                generation = result.Generation,
+                sessionId = result.SessionId,
+                deliveryId = result.DeliveryId,
+                messageUid = result.MessageUid,
+                channelId = result.ChannelId,
+                discordMessageId = result.DiscordMessageId,
+                binding = result.BindingCreated ? "created" : "reused",
+                bindingCreated = result.BindingCreated,
+                replayed = result.Replayed,
+            });
+        }
+        catch (DiscordRecipientNotAllowlistedException ex)
+        {
+            return Results.Json(new { error = "recipient_not_allowlisted", message = ex.Message },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Results.Json(new { error = "dm_not_allowed", message = ex.Message },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = "invalid_dm", message = ex.Message });
+        }
+        catch (DiscordIdempotencyConflictException ex)
+        {
+            return Results.Conflict(new { error = "idempotency_key_conflict", message = ex.Message });
+        }
+        catch (DiscordBindingUnavailableException ex)
+        {
+            return Results.Conflict(new { error = "discord_binding_disabled", message = ex.Message });
+        }
+        catch (DiscordDirectMessageRefusedException ex)
+        {
+            return Results.Json(new
+            {
+                error = "discord_dm_refused",
+                message = ex.Message,
+                discordStatus = (int)ex.DiscordStatusCode,
+            }, statusCode: StatusCodes.Status502BadGateway);
+        }
+        catch (DiscordDirectMessageUnavailableException ex)
+        {
+            return Results.Json(new
+            {
+                error = "discord_dm_unavailable",
+                message = ex.Message,
+                retryAfterSeconds = ex.RetryAfter?.TotalSeconds,
+            }, statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Json(new { error = "discord_bot_unavailable", message = ex.Message },
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
     private static bool IsAdmin(IAuthContext auth)
         => auth.IsInRole("admin") || auth.IsInRole("owner");
 
@@ -1994,7 +2100,13 @@ public static class DiscordEndpoints
         LeafAgentCaller caller,
         LeafDiscordConfig config,
         string? resolvedAgentEntityId)
-        => config.Enabled
+        => config.Enabled && MatchesBotOwnerAndAgent(caller, config, resolvedAgentEntityId);
+
+    internal static bool MatchesBotOwnerAndAgent(
+        LeafAgentCaller caller,
+        LeafDiscordConfig config,
+        string? resolvedAgentEntityId)
+        => !string.IsNullOrWhiteSpace(config.OwnerUserId)
            && string.Equals(config.OwnerUserId, caller.BeneficiaryId,
                StringComparison.OrdinalIgnoreCase)
            && string.Equals(resolvedAgentEntityId, caller.ActorEntityId,

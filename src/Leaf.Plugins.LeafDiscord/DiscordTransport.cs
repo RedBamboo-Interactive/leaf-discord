@@ -99,6 +99,7 @@ public sealed class DiscordAttachmentIngestor : IDisposable
 
 public sealed record DiscordRestMessage(string Id, string? Nonce, int AttachmentCount);
 public sealed record DiscordWebhookCredentials(string Id, string Token);
+public sealed record DiscordDirectMessageChannel(string ChannelId, string RecipientName);
 
 public sealed class DiscordRestTransport : IDisposable
 {
@@ -521,6 +522,55 @@ public sealed class DiscordRestTransport : IDisposable
             multipart.Add(part, $"files[{index}]", files[index].Filename);
         }
         return multipart;
+    }
+
+    /// <summary>
+    /// Opens, or returns the existing, DM channel between the bot and one user. Discord
+    /// treats this as idempotent and it creates no message, so it is safe before any
+    /// Leaf state exists.
+    /// </summary>
+    public async Task<DiscordDirectMessageChannel> CreateDirectMessageChannelAsync(
+        string botToken, string recipientUserId, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Post, "users/@me/channels", botToken);
+        request.Content = JsonContent.Create(new { recipient_id = recipientUserId });
+        using var response = await http.SendAsync(request, ct);
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode)
+            throw DiscordRestException.From(response, raw);
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            var root = document.RootElement;
+            var channelId = root.TryGetProperty("id", out var id) ? id.GetString() : null;
+            if (string.IsNullOrWhiteSpace(channelId))
+                throw new DiscordRestException(HttpStatusCode.BadGateway,
+                    "Discord Create DM response has no channel id");
+            string? name = null;
+            if (root.TryGetProperty("recipients", out var recipients)
+                && recipients.ValueKind == JsonValueKind.Array)
+                foreach (var recipient in recipients.EnumerateArray())
+                {
+                    if (recipient.TryGetProperty("id", out var userId)
+                        && userId.GetString() != recipientUserId)
+                        continue;
+                    name = recipient.TryGetProperty("global_name", out var global)
+                           && global.ValueKind == JsonValueKind.String
+                        ? global.GetString()
+                        : null;
+                    if (string.IsNullOrWhiteSpace(name)
+                        && recipient.TryGetProperty("username", out var username)
+                        && username.ValueKind == JsonValueKind.String)
+                        name = username.GetString();
+                }
+            return new DiscordDirectMessageChannel(
+                channelId, string.IsNullOrWhiteSpace(name) ? recipientUserId : name);
+        }
+        catch (JsonException ex)
+        {
+            throw new DiscordRestException(HttpStatusCode.BadGateway,
+                $"Discord returned an invalid Create DM response: {ex.Message}");
+        }
     }
 
     public async Task<JsonObject> ModifyGuildChannelAsync(

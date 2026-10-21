@@ -381,8 +381,9 @@ have the native path's crash-recovery deduplication guarantee.
 
 ## Agent delivery
 
-The bridge has two authenticated proactive paths. A bound Discord Agent session may open or
-reuse an allowlisted DM through `POST /outreach/dm`. A private Leaf Agent discussion may
+The bridge has three authenticated proactive paths. A bound Discord Agent session may open or
+reuse an allowlisted DM through `POST /outreach/dm`. A private Leaf Agent discussion may open
+or reuse an allowlisted DM through `POST /bots/{botEntityId}/dms` (below). A private Leaf Agent discussion may
 address an existing owned DM, guild channel, or thread through
 `POST /bindings/{entityId}/messages`. One exact Nova Automation may use that same route only
 when its Entity ID appears in the binding's `authorized_automation_ids`; the signed actor,
@@ -404,6 +405,59 @@ attachments instead of sending private Asset Markdown as text:
   "idempotencyKey": "stable-exact-retry-key"
 }
 ```
+
+### Owner-directed DM opening
+
+From the owner's private Nova discussion, the bot's Agent can open (or continue) a DM with
+someone already on that bot's **DM allowlist**, without that person writing first:
+
+```text
+POST /api/apps/leaf-discord/bots/{botEntityId}/dms
+Content-Type: application/json
+
+{
+  "recipientUserId": "<Discord user snowflake>",
+  "content": "Opening message",
+  "idempotencyKey": "stable-exact-retry-key"
+}
+```
+
+`deliveryContent` and `outputAssets` are optional and follow the binding-messages contract
+above. The caller must be a signed private Nova Agent execution (not an automation and not
+an external Discord conversation) whose Agent and beneficiary exactly match the bot's
+configured Agent and owner. A recipient outside the bot's `dmAllowlist` gets
+`403 recipient_not_allowlisted`; the route grants no other access.
+
+The route opens or reuses the DM channel through the bot's REST client, then delivers the
+opening first, under a durable reservation with a Discord-enforced nonce. Only after Discord
+accepts the message does it create or reuse the DM binding and Agent session. It uses the same
+audience profile, behavior resolution, and session-opening path as a first inbound DM. It then
+records the opening as an assistant turn in the canonical transcript, with a sent outbox
+receipt. An existing DM binding keeps its generation and session. The opening must fit in one
+Discord message (2,000 characters plus up to 10 images); send follow-ups through
+`POST /bindings/{bindingEntityId}/messages`.
+
+The response carries `bindingEntityId`, `bindingId`, `generation`, `sessionId`, `deliveryId`
+(outbox delivery Entity), `messageUid`, `channelId`, `discordMessageId`, `binding`
+(`created` or `reused`), and `replayed`. Repeating the same key with the same recipient and
+content returns the stored result with `replayed: true` and no second delivery. The same key
+with a different recipient or content is `409 idempotency_key_conflict`.
+
+Failures:
+
+- `409 discord_bot_disabled`: the bot is disabled.
+- `503 discord_bot_unavailable`: the Gateway is disconnected or the bot is not running.
+- `502 discord_dm_refused`: Discord refused the DM, for example code 50007 when the user
+  disallows DMs from server members or blocks the bot. No binding or session is created,
+  and the same key may be retried later.
+- `503 discord_dm_unavailable`: Discord rate-limited the request or failed transiently.
+  Retry with the same key.
+- `409 discord_binding_disabled`: the recipient's existing DM binding is disabled.
+
+If the session or transcript step fails after Discord accepted the message, retrying the same
+key resumes from the recorded delivery and never sends twice.
+
+### Correcting deliveries
 
 The same signed private-Nova or explicitly binding-authorized Automation identity can
 correct its own existing delivery through these narrowly scoped routes:
