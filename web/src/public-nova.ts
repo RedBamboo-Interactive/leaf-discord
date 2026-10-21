@@ -31,6 +31,42 @@ export type PublicNovaConversation = {
   messages: PublicNovaMessage[]
 }
 
+export type PublicNovaOutcome = Exclude<NonNullable<PublicNovaMessage["outcome"]>, "posted">
+
+export type PublicNovaOutcomeLine = {
+  outcome: PublicNovaOutcome
+  label: string
+}
+
+export function humanizePublicNovaReason(reason?: string): string {
+  switch (reason) {
+    case "wait_for_human":
+      return "Paused until a human replies"
+    case "absolute-path":
+      return "Withheld: it contained a file path"
+    case "relay_link_not_allowed":
+      return "Withheld: it contained a link that isn't allowed"
+    case "step_limit":
+    case "repeated_action":
+      return "Couldn't answer from the shared material"
+    case undefined:
+    case "":
+      return "Withheld"
+    default:
+      return `Withheld (reason: ${reason})`
+  }
+}
+
+export function publicNovaOutcomeLine(message: MessageBlock): PublicNovaOutcomeLine | null {
+  const value = message.metadata?.publicNovaOutcome
+  if (!value || typeof value !== "object") return null
+  const outcome = (value as Record<string, unknown>).outcome
+  const label = (value as Record<string, unknown>).label
+  if ((outcome !== "blocked" && outcome !== "failed" && outcome !== "fallback") || typeof label !== "string")
+    return null
+  return { outcome, label }
+}
+
 export function projectPublicNovaMessages(source: PublicNovaMessage[]): {
   messages: MessageBlock[]
   authors: Record<string, DiscordAuthor>
@@ -45,27 +81,17 @@ export function projectPublicNovaMessages(source: PublicNovaMessage[]): {
         avatarUrl: message.author.avatarUrl ?? "",
       }
     }
+    const outcome = message.outcome && message.outcome !== "posted"
+      ? { outcome: message.outcome, label: humanizePublicNovaReason(message.reason) }
+      : undefined
     messages.push({
       id: message.id,
       role: message.author.kind === "self" ? "assistant" : "user",
       senderAgentId: message.author.kind === "self" ? undefined : authorId,
       timestamp: message.at,
       parts: [{ type: "text", content: message.text }],
-      metadata: { publicNova: true, outcome: message.outcome },
+      metadata: { publicNova: true, outcome: message.outcome, publicNovaOutcome: outcome },
     })
-    if (message.outcome && message.outcome !== "posted") {
-      messages.push({
-        id: `${message.id}:outcome`,
-        role: "assistant",
-        timestamp: message.at,
-        parts: [{
-          type: "text",
-          content: `Public Nova ${message.outcome}${message.reason ? ` · ${message.reason}` : ""}`,
-          phase: "commentary",
-        }],
-        metadata: { publicNovaSystemLine: true },
-      })
-    }
   }
   return { messages, authors }
 }

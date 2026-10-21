@@ -1,6 +1,6 @@
 // Canonical RedLeaf chat application surface.
 import { useCallback, useEffect, useState } from "react"
-import { ChatPanel, type MessageBlock } from "@redbamboo/chat"
+import { ChatPanel, ChatStatusLine, type MessageBlock } from "@redbamboo/chat"
 import {
   Button,
   DropdownMenu,
@@ -22,9 +22,25 @@ import {
 } from "./discord-transcript"
 import {
   projectPublicNovaMessages,
+  publicNovaOutcomeLine,
   type PublicNovaConversation,
   type PublicNovaThread,
 } from "./public-nova"
+
+function PublicNovaOutcomeStatus({ block }: { block: MessageBlock }) {
+  const line = publicNovaOutcomeLine(block)
+  if (!line) return null
+  const appearance = line.outcome === "failed"
+    ? { color: "var(--color-accent-red)", icon: "ph-bold ph-warning-circle" }
+    : line.outcome === "blocked"
+      ? { color: "var(--color-accent-gold)", icon: "ph-bold ph-shield-warning" }
+      : { color: "var(--color-text-muted)", icon: "ph-bold ph-info" }
+  return (
+    <div role="status" aria-label={`Public Nova ${line.outcome}`} className="mt-1">
+      <ChatStatusLine color={appearance.color} icon={appearance.icon} label={line.label} />
+    </div>
+  )
+}
 
 type BotStatus = {
   state: string
@@ -292,6 +308,9 @@ export function Page() {
       header={chatHeader}
       assistantAvatar={avatarUrl}
       resolveAgentInfo={resolveDiscordAuthor}
+      renderMessageExtra={selectedPublicThread
+        ? (block) => <PublicNovaOutcomeStatus block={block} />
+        : undefined}
     />
   )
 
