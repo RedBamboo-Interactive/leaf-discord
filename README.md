@@ -433,9 +433,10 @@ a DM, and in guild channels or threads only messages that mention or reply to th
 binding's own Agent session still answers on Discord as usual; the callback only tells the
 sending discussion that someone replied. Nova injects it into that discussion as a
 `discord-reply` event after checking that the kernel-stamped source is Leaf Discord and that the
-discussion belongs to the same owner and Agent. A callback never wakes a sleeping discussion:
-stopped, archiving and archived discussions are neither written to nor resumed, and Nova
-rechecks the status under the discussion's write gate before it injects.
+discussion belongs to the same owner and Agent. A callback never revives a closed discussion:
+archiving and archived discussions are neither written to nor resumed, and Nova rechecks the
+status under the discussion's write gate before it injects. A stopped discussion is only
+interrupted, so it still receives the callback.
 
 Plugin events are mirrored into `os:events` and broadcast to frontend sockets, so the event
 carries identifiers (binding, Discord message, admitted transcript UID, requestor display name,
