@@ -598,6 +598,7 @@ internal sealed class DiscordBotRuntime(
     private static readonly TimeSpan InitialReadyTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan UserProfileCacheTtl = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MaintenanceRecoveryInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan MaintenanceFailureBackoff = TimeSpan.FromSeconds(5);
     private const int GuildStartupBackfillLimit = 25;
     private const int DmStartupBackfillLimit = 50;
     private static readonly TimeSpan GuildStartupBackfillMaxAge = TimeSpan.FromMinutes(15);
@@ -1781,14 +1782,10 @@ internal sealed class DiscordBotRuntime(
         {
             DetachConversationReconciledHandler();
             runCts?.Cancel();
-            if (outboxLoop is not null)
-            {
-                try { await outboxLoop; } catch (OperationCanceledException) { }
-            }
-            if (presenceLoop is not null)
-            {
-                try { await presenceLoop; } catch (OperationCanceledException) { }
-            }
+            // A loop that already faulted must not keep the runtime from stopping, or the
+            // fault would block every restart that could recover it.
+            await ObserveBackgroundLoopAsync(outboxLoop, "outbox");
+            await ObserveBackgroundLoopAsync(presenceLoop, "presence");
             if (client is not null)
             {
                 await DisposeClientAsync(client);
@@ -1804,6 +1801,22 @@ internal sealed class DiscordBotRuntime(
         finally
         {
             lifecycle.Release();
+        }
+    }
+
+    private async Task ObserveBackgroundLoopAsync(Task? loop, string name)
+    {
+        if (loop is null) return;
+        try
+        {
+            await loop;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Discord {Loop} loop had faulted before stop for bot configuration {ConfigId}",
+                name, configId);
         }
     }
 
@@ -2905,86 +2918,81 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
-    private async Task RunOutboxLoopAsync(CancellationToken ct)
-    {
-        foreach (var binding in await bindings.ListAsync(ct))
-            maintenance.RetryFull(binding.BindingId);
+    private Task RunOutboxLoopAsync(CancellationToken ct)
+        => RunSupervisedMaintenanceAsync(
+            recoverySweep => RunMaintenanceSweepAsync(recoverySweep, ct),
+            () => maintenance.WaitAsync(MaintenanceRecoveryInterval, ct),
+            () => Task.Delay(MaintenanceFailureBackoff, ct),
+            ex => logger.LogError(ex,
+                "Discord maintenance sweep failed for bot configuration {ConfigId}; retrying",
+                configId),
+            ct);
 
-        var first = true;
+    // The outbox loop is the only sender for queued deliveries. An exception escaping it
+    // ends the task silently and stops all background delivery for the bot until restart,
+    // so every sweep is isolated and a failed sweep is followed by a full recovery sweep,
+    // which re-requests the bindings whose pending requests the failure consumed.
+    internal static async Task RunSupervisedMaintenanceAsync(
+        Func<bool, Task> sweep,
+        Func<Task<bool>> waitForRequest,
+        Func<Task> backoff,
+        Action<Exception> reportFailure,
+        CancellationToken ct)
+    {
+        var recoverySweep = true;
         while (true)
         {
-            var recoverySweep = false;
-            if (!first)
-                recoverySweep = !await maintenance.WaitAsync(
-                    MaintenanceRecoveryInterval, ct);
-            first = false;
-
-            var config = await GetConfigAsync(ct);
-            if (recoverySweep)
+            try
             {
-                foreach (var binding in await bindings.ListAsync(ct))
-                {
-                    if (binding.Enabled && string.Equals(
-                            binding.ApplicationId, config.ApplicationId,
-                            StringComparison.Ordinal))
-                        maintenance.RetryFull(binding.BindingId);
-                }
+                await sweep(recoverySweep);
+                recoverySweep = !await waitForRequest();
             }
-            foreach (var request in maintenance.TakePending())
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                var binding = await bindings.FindByBindingIdAsync(request.BindingId, ct);
-                if (binding is null) continue;
-                if (!binding.Enabled || !string.Equals(
-                        binding.ApplicationId, config.ApplicationId, StringComparison.Ordinal))
-                    continue;
-                if (ShouldDeferLegacyOwnerMaintenance(config, binding))
-                    continue;
-                var activeBinding = string.IsNullOrWhiteSpace(config.OwnerUserId)
-                    ? binding
-                    : await bindings.RepairLegacyOwnerAsync(
-                        binding, config.OwnerUserId, ct);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                reportFailure(ex);
+                await backoff();
+                recoverySweep = true;
+            }
+        }
+    }
 
-                var retryFull = false;
-                if (request.FullReconciliation)
-                {
-                    try
-                    {
-                        await conversations.RetryPendingAsync(activeBinding, ct);
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        retryFull = true;
-                        logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
-                            "inbound retry", activeBinding.BindingId);
-                    }
+    private async Task RunMaintenanceSweepAsync(bool recoverySweep, CancellationToken ct)
+    {
+        var config = await GetConfigAsync(ct);
+        if (recoverySweep)
+        {
+            foreach (var binding in await bindings.ListAsync(ct))
+            {
+                if (binding.Enabled && string.Equals(
+                        binding.ApplicationId, config.ApplicationId,
+                        StringComparison.Ordinal))
+                    maintenance.RetryFull(binding.BindingId);
+            }
+        }
+        foreach (var request in maintenance.TakePending())
+        {
+            var binding = await bindings.FindByBindingIdAsync(request.BindingId, ct);
+            if (binding is null) continue;
+            if (!binding.Enabled || !string.Equals(
+                    binding.ApplicationId, config.ApplicationId, StringComparison.Ordinal))
+                continue;
+            if (ShouldDeferLegacyOwnerMaintenance(config, binding))
+                continue;
+            var activeBinding = string.IsNullOrWhiteSpace(config.OwnerUserId)
+                ? binding
+                : await bindings.RepairLegacyOwnerAsync(
+                    binding, config.OwnerUserId, ct);
 
-                    try
-                    {
-                        if (!await conversations.ReconcileAsync(activeBinding, ct))
-                            retryFull = true;
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        retryFull = true;
-                        logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
-                            "transcript reconciliation", activeBinding.BindingId);
-                    }
-
-                    if (retryFull)
-                        maintenance.RetryFull(activeBinding.BindingId);
-                }
-
+            var retryFull = false;
+            if (request.FullReconciliation)
+            {
                 try
                 {
-                    await DrainBindingAsync(activeBinding, ct);
+                    await conversations.RetryPendingAsync(activeBinding, ct);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -2992,10 +3000,44 @@ internal sealed class DiscordBotRuntime(
                 }
                 catch (Exception ex)
                 {
-                    maintenance.RetryDrain(activeBinding.BindingId);
+                    retryFull = true;
                     logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
-                        "outbound drain", activeBinding.BindingId);
+                        "inbound retry", activeBinding.BindingId);
                 }
+
+                try
+                {
+                    if (!await conversations.ReconcileAsync(activeBinding, ct))
+                        retryFull = true;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    retryFull = true;
+                    logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
+                        "transcript reconciliation", activeBinding.BindingId);
+                }
+
+                if (retryFull)
+                    maintenance.RetryFull(activeBinding.BindingId);
+            }
+
+            try
+            {
+                await DrainBindingAsync(activeBinding, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                maintenance.RetryDrain(activeBinding.BindingId);
+                logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
+                    "outbound drain", activeBinding.BindingId);
             }
         }
     }

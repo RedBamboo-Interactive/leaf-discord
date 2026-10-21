@@ -204,6 +204,43 @@ public sealed class DiscordBotStartupTests
     }
 
     [Fact]
+    public async Task Failed_maintenance_sweep_keeps_the_loop_alive_and_forces_recovery()
+    {
+        using var cts = new CancellationTokenSource();
+        var sweeps = new List<bool>();
+        var failures = new List<Exception>();
+        var backoffs = 0;
+
+        var loop = DiscordBotRuntime.RunSupervisedMaintenanceAsync(
+            recoverySweep =>
+            {
+                sweeps.Add(recoverySweep);
+                if (sweeps.Count == 2)
+                    throw new InvalidOperationException("transient database timeout");
+                if (sweeps.Count == 3)
+                    cts.Cancel();
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                return Task.FromResult(true);
+            },
+            () =>
+            {
+                backoffs++;
+                return Task.CompletedTask;
+            },
+            failures.Add,
+            cts.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => loop);
+        Assert.Equal([true, false, true], sweeps);
+        Assert.Single(failures);
+        Assert.Equal(1, backoffs);
+    }
+
+    [Fact]
     public void Ownerless_bot_defers_legacy_binding_maintenance_until_authenticated_claim()
     {
         var owner = Guid.NewGuid().ToString();
