@@ -2351,7 +2351,7 @@ internal sealed class DiscordBotRuntime(
             await bindings.MarkReceivedAsync(binding, message.Id.ToString());
             return;
         }
-        var mentioned = message.MentionedUserIds.Contains(current.Id);
+        var mentioned = MentionsBot(message, current.Id);
         var repliesToBot = message.ReferencedMessage?.Author.Id == current.Id;
         if (!ShouldAdmitMessage(
                 binding.Kind, behavior.ResponseMode, mentioned, repliesToBot))
@@ -3077,6 +3077,28 @@ internal sealed class DiscordBotRuntime(
             config.SentinelQualityMode));
     }
 
+    /// <summary>
+    /// Discord gives every bot a managed integration role with the bot's own name, and
+    /// mention autocomplete offers it beside the bot user. Pinging that role addresses
+    /// the bot exactly like a user mention; other roles the bot merely holds do not.
+    /// </summary>
+    internal static bool MentionsBot(
+        IEnumerable<ulong> mentionedUserIds,
+        IEnumerable<ulong> mentionedRoleIds,
+        ulong botUserId,
+        Func<ulong, ulong?> roleBotId)
+        => mentionedUserIds.Contains(botUserId)
+            || mentionedRoleIds.Any(roleId => roleBotId(roleId) == botUserId);
+
+    private bool MentionsBot(IMessage message, ulong botUserId)
+    {
+        var guild = message.Channel is IGuildChannel channel
+            ? client?.GetGuild(channel.GuildId)
+            : null;
+        return MentionsBot(message.MentionedUserIds, message.MentionedRoleIds, botUserId,
+            roleId => guild?.GetRole(roleId)?.Tags?.BotId);
+    }
+
     internal static bool ShouldAdmitMessage(
         string bindingKind,
         string responseMode,
@@ -3190,7 +3212,7 @@ internal sealed class DiscordBotRuntime(
                 var admitted = 0;
                 foreach (var message in batch.OfType<IUserMessage>())
                 {
-                    var mentioned = message.MentionedUserIds.Contains(client.CurrentUser.Id);
+                    var mentioned = MentionsBot(message, client.CurrentUser.Id);
                     var repliesToBot = message.ReferencedMessage?.Author.Id == client.CurrentUser.Id;
                     if (!ShouldAdmitStartupBackfillMessage(
                             binding.Kind, message.Timestamp, observedAt, mentioned, repliesToBot))

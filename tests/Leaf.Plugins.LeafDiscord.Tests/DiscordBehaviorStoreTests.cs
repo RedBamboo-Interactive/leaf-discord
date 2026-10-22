@@ -111,6 +111,21 @@ public sealed class DiscordBehaviorStoreTests
             kind, mode, mentioned, repliesToBot));
 
     [Theory]
+    [InlineData(new ulong[] { 7 }, new ulong[0], true)]
+    [InlineData(new ulong[0], new ulong[] { 70 }, true)]
+    [InlineData(new ulong[0], new ulong[] { 80 }, false)]
+    [InlineData(new ulong[0], new ulong[] { 90 }, false)]
+    [InlineData(new ulong[] { 8 }, new ulong[0], false)]
+    public void Mentioning_the_bot_managed_role_addresses_the_bot(
+        ulong[] userIds, ulong[] roleIds, bool expected)
+    {
+        // 70: this bot's managed role, 80: another bot's managed role, 90: ordinary role.
+        var roleBots = new Dictionary<ulong, ulong?> { [70] = 7, [80] = 8, [90] = null };
+        Assert.Equal(expected, DiscordBotRuntime.MentionsBot(
+            userIds, roleIds, 7, roleId => roleBots.GetValueOrDefault(roleId)));
+    }
+
+    [Theory]
     [InlineData("dm", "direct", false, false, true)]
     [InlineData("guild_channel", "direct", true, false, true)]
     [InlineData("thread", "direct", false, true, true)]
