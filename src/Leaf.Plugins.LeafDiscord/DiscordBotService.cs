@@ -2391,7 +2391,8 @@ internal sealed class DiscordBotRuntime(
                 new ExternalRequestor(message.Author.Id.ToString(),
                     message.Author.GlobalName ?? message.Author.Username, message.Author.Username),
                 content, submittedAttachments, guildContext: guildContext,
-                behaviorContext: behavior.ToTrustedMetadata());
+                behaviorContext: behavior.ToTrustedMetadata(),
+                channelGap: ChannelGapSource(message, config));
             LogSlowMessageStep(message.Id, "Agent session admission", submitStarted);
             if (admission is null)
                 typing.Cancel(typingAdmission);
@@ -2498,7 +2499,8 @@ internal sealed class DiscordBotRuntime(
             [],
             guildContext: BuildGuildContext(message, config),
             behaviorContext: behavior.ToTrustedMetadata(),
-            relayContext: relayContext);
+            relayContext: relayContext,
+            channelGap: ChannelGapSource(message, config));
         if (admission is null)
         {
             await commonsHostTurns.CompleteAsync(hostTurn, "not-admitted");
@@ -2508,6 +2510,67 @@ internal sealed class DiscordBotRuntime(
             typing.Begin(binding.BindingId, () => message.Channel.EnterTypingState(), true),
             admission.MessageUid);
         maintenance.RequestFull(binding.BindingId);
+    }
+
+    /// <summary>
+    /// Reads the channel messages before <paramref name="message"/> that the binding's session
+    /// has not seen, bounded by <see cref="DiscordChannelGaps"/>. Gap attachments go through
+    /// the same quarantine ingestor and size limit as the current message's attachments.
+    /// </summary>
+    private DiscordChannelGapSource? ChannelGapSource(IUserMessage message, LeafDiscordConfig config)
+    {
+        if (message.Channel is not IGuildChannel) return null;
+        var channel = message.Channel;
+        return async (binding, ct) =>
+        {
+            var started = Stopwatch.GetTimestamp();
+            var gap = await DiscordChannelGaps.ReadAsync(
+                binding,
+                async (limit, cursor, token) =>
+                {
+                    var read = new List<(ulong, DiscordGapMessage?)>();
+                    await foreach (var page in channel.GetMessagesAsync(
+                                       message.Id, Direction.Before, limit,
+                                       CacheMode.AllowDownload,
+                                       new RequestOptions { CancelToken = token }))
+                    {
+                        read.AddRange(page.Select(item => (item.Id, ToGapMessage(item))));
+                        if (cursor is { } delivered && page.Any(item => item.Id <= delivered))
+                            break;
+                    }
+                    return read;
+                },
+                deliveries,
+                async (gapMessage, attachment, token) => (await attachmentIngestor.IngestAsync(
+                    config, gapMessage.Id, [attachment], token)).Single(),
+                config.MaxAttachmentBytes,
+                ct);
+            LogSlowMessageStep(message.Id, "channel gap", started);
+            return gap;
+        };
+    }
+
+    internal static DiscordGapMessage? ToGapMessage(IMessage message)
+    {
+        // A thread started from a channel message shows it as a reference to that message.
+        if (message.Type == MessageType.ThreadStarterMessage)
+            return message is IUserMessage { ReferencedMessage: { } starter }
+                ? ToGapMessage(starter)
+                : null;
+        if (message.Type is not (MessageType.Default or MessageType.Reply)) return null;
+        if (string.IsNullOrWhiteSpace(message.Content) && message.Attachments.Count == 0)
+            return null;
+        return new DiscordGapMessage(
+            message.Id.ToString(),
+            message.Author.Id.ToString(),
+            message.Author.GlobalName ?? message.Author.Username,
+            message.Author.IsBot,
+            message.Source == MessageSource.Webhook,
+            message.Timestamp,
+            message.Content ?? "",
+            message.Attachments.Select(attachment => new DiscordAttachmentSource(
+                attachment.Id.ToString(), attachment.Filename, attachment.ContentType,
+                attachment.Size, attachment.Url)).ToArray());
     }
 
     private void LogSlowMessageStep(ulong messageId, string step, long started)

@@ -175,6 +175,39 @@ public sealed class DiscordTranscriptProjectionTests
     }
 
     [Fact]
+    public async Task Batched_turn_carrying_a_channel_gap_splits_and_shows_only_the_author_text()
+    {
+        var gap = DiscordChannelGaps.ToRecord(new DiscordChannelGap(
+            [new DiscordGapEntry(new DiscordGapMessage(
+                "1000", "7", "Author", false, false, DateTimeOffset.UnixEpoch,
+                "Untagged report", []), [])],
+            0, false));
+        var tagged = DiscordChannelGaps.Compose(gap, "@Nova Test");
+        var source = DisplayRecord($"{tagged}\nthanks",
+            "discord-uid-1", ("1001", "none"), ("1002", "none"));
+        var authors = new Dictionary<string, DiscordInboundAttribution>
+        {
+            ["1001"] = DiscordInboundAttributions.Parse(DiscordInboundAttributions.FromPayload(
+                new JsonObject
+                {
+                    ["requestor"] = new JsonObject { ["id"] = "42", ["display_name"] = "Alice" },
+                    ["content"] = "@Nova Test",
+                    ["channel_gap"] = gap,
+                }))!,
+            ["1002"] = new("77", "Ana", "ana", ContentLength: 6),
+        };
+
+        var result = await DiscordTranscriptProjection.ProjectAsync(
+            [source],
+            (_, _) => Task.FromResult<DiscordUserProfile?>(null),
+            (id, _) => Task.FromResult<DiscordInboundAttribution?>(authors[id]));
+
+        Assert.Equal(["@Nova Test", "thanks"], result.Select(item => item.Content));
+        Assert.Equal("Alice", result[0].Metadata?["discord"]?["requestor"]?["displayName"]
+            ?.GetValue<string>());
+    }
+
+    [Fact]
     public async Task Unsplittable_batch_keeps_one_turn_and_never_misattributes()
     {
         var source = DisplayRecord("one\ntwo", "discord-uid-1", ("1001", "none"), ("1002", "none"));

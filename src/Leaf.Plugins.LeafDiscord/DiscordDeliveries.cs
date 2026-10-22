@@ -94,6 +94,7 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             ["payload"] = null,
             // The transcript keeps only display text; retain who wrote it for attribution.
             ["attribution"] = DiscordInboundAttributions.FromPayload(delivery.Payload),
+            ["channel_gap"] = DiscordChannelGaps.Summary(delivery.Payload?["channel_gap"]),
             ["last_error"] = null,
         }, ct: ct));
 
@@ -114,6 +115,42 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
         return DiscordInboundAttributions.Parse(entity.Data["attribution"])
             ?? DiscordInboundAttributions.Parse(
                 DiscordInboundAttributions.FromPayload(entity.Data["payload"]));
+    }
+
+    /// <summary>Finds the inbound delivery recorded for one Discord message, if any.</summary>
+    public async Task<DiscordDelivery?> FindInboundAsync(
+        DiscordBinding binding, string discordMessageId, CancellationToken ct = default)
+    {
+        var entity = await store.GetBySlugAsync(TypeSlug,
+            InboundSlug(binding.ApplicationId, discordMessageId), ct);
+        return entity is null ? null : Map(entity);
+    }
+
+    /// <summary>
+    /// Whether the binding's current session already holds one Discord message: an inbound
+    /// turn admitted in this generation, or (for bot and webhook authors) one of this
+    /// generation's own outbound deliveries. A binding without a session holds nothing.
+    /// </summary>
+    public async Task<bool> SessionHasDiscordMessageAsync(
+        DiscordBinding binding, string discordMessageId, bool botAuthored,
+        CancellationToken ct = default)
+    {
+        if (binding.SessionId is null) return false;
+        if (await ContainsAdmittedInboundAsync(
+                binding.BindingId, binding.Generation, discordMessageId, ct))
+            return true;
+        if (!botAuthored) return false;
+        return (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["binding_id"] = binding.BindingId,
+                ["discord_id"] = discordMessageId,
+            },
+            Limit = 10,
+        }, ct)).Select(Map).Any(item => item.Generation == binding.Generation);
     }
 
     private static string InboundSlug(string applicationId, string discordMessageId)

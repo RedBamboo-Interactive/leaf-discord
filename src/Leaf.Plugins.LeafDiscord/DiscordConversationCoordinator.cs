@@ -70,7 +70,8 @@ public sealed class DiscordConversationCoordinator(
         CancellationToken ct = default,
         JsonObject? guildContext = null,
         JsonObject? behaviorContext = null,
-        JsonObject? relayContext = null)
+        JsonObject? relayContext = null,
+        DiscordChannelGapSource? channelGap = null)
     {
         var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -79,6 +80,15 @@ public sealed class DiscordConversationCoordinator(
             binding = await bindings.GetAsync(binding.EntityId, ct)
                 ?? throw new InvalidOperationException("Discord binding disappeared during delivery");
             if (!binding.Enabled) return null;
+
+            // A retried delivery reuses the gap captured when it was first received, so it
+            // can neither duplicate nor reshuffle the messages its session sees.
+            var existing = await deliveries.FindInboundAsync(binding, discordMessageId, ct);
+            if (existing is not null && existing.State != "received") return null;
+            var channelGapRecord = existing is not null
+                ? existing.Payload?["channel_gap"]?.DeepClone() as JsonObject
+                : await ReadChannelGapAsync(binding, discordMessageId, channelGap, ct);
+            var sessionContent = DiscordChannelGaps.Compose(channelGapRecord, content);
 
             if (behaviorContext is null)
             {
@@ -99,7 +109,7 @@ public sealed class DiscordConversationCoordinator(
 
             var ownerDisplayName = await userIdentities.ResolveDisplayNameAsync(
                 binding.OwnerId, ct);
-            var assessment = injection.Assess(content, ownerDisplayName);
+            var assessment = injection.Assess(sessionContent, ownerDisplayName);
             var verifiedUser = await userIdentities.ResolveAsync(
                 requestor.ExternalId, binding.OwnerId, ct);
             var payload = new JsonObject
@@ -130,6 +140,7 @@ public sealed class DiscordConversationCoordinator(
                 ["guild_context"] = guildContext?.DeepClone(),
                 ["behavior_context"] = behaviorContext.DeepClone(),
                 ["relay_context"] = relayContext?.DeepClone(),
+                ["channel_gap"] = channelGapRecord,
             };
             var (delivery, isNew) = await deliveries.ReceiveAsync(binding, discordMessageId, payload, ct);
             if (!isNew || delivery.State != "received") return null;
@@ -144,7 +155,7 @@ public sealed class DiscordConversationCoordinator(
             var admission = await provider.SendAsync(handle, new ExternalConversationInput(
                 discordMessageId,
                 requestor,
-                content,
+                sessionContent,
                 attachments ?? [],
                 new JsonObject
                 {
@@ -171,6 +182,7 @@ public sealed class DiscordConversationCoordinator(
                 binding = await bindings.RecordServerMapDisclosureAsync(binding, disclosed, ct);
             await deliveries.MarkAdmittedAsync(delivery, admission, ct);
             await bindings.MarkReceivedAsync(binding, discordMessageId, ct);
+            binding = await bindings.MarkDeliveredAsync(binding, discordMessageId, ct);
             await deliveries.CancelPendingOutboundAsync(
                 binding.BindingId,
                 binding.Generation,
@@ -181,6 +193,31 @@ public sealed class DiscordConversationCoordinator(
         finally
         {
             gate.Release();
+        }
+    }
+
+    private async Task<JsonObject?> ReadChannelGapAsync(
+        DiscordBinding binding, string discordMessageId, DiscordChannelGapSource? source,
+        CancellationToken ct)
+    {
+        // Every DM is admitted, so a DM session has no unseen channel history to carry.
+        if (source is null || binding.Kind == "dm") return null;
+        try
+        {
+            var gap = await source(binding, ct);
+            return gap is null ? null : DiscordChannelGaps.ToRecord(gap);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Earlier history is context, not a precondition: admit the turn and say so.
+            logger.LogWarning(ex,
+                "Discord channel gap for message {MessageId} on {BindingId} could not be read",
+                discordMessageId, binding.BindingId);
+            return DiscordChannelGaps.ToRecord(DiscordChannelGap.UnavailableGap);
         }
     }
 

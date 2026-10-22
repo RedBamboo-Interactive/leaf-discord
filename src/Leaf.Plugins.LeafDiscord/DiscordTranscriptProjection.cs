@@ -10,6 +10,8 @@ namespace Leaf.Plugins.LeafDiscord;
 /// (<c>&lt;discord-input-json&gt;</c>). Records written since RedCompute kept display text
 /// hold only the raw Discord text; their <c>attachmentsJson</c> still carries the Discord
 /// message IDs and Sentinel review, and authorship comes from the bridge's inbound store.
+/// A leading channel-gap block (earlier unseen channel messages the session received ahead
+/// of the turn) is removed, so each turn shows only what its author wrote.
 /// </summary>
 internal static class DiscordTranscriptProjection
 {
@@ -62,7 +64,7 @@ internal static class DiscordTranscriptProjection
                 var profile = await Profile(envelopeAuthor);
                 projected.Add(message with
                 {
-                    Content = parsed.Content,
+                    Content = DiscordChannelGaps.StripForDisplay(parsed.Content),
                     Metadata = WithDiscord(message, parsed, profile),
                 });
                 continue;
@@ -93,10 +95,12 @@ internal static class DiscordTranscriptProjection
                 var attachmentCount = inputs.Count == 1
                     ? author?.AttachmentCount ?? record.AttachmentCount
                     : record.AttachmentCount;
+                var display = DiscordChannelGaps.StripForDisplay(message.Content ?? "");
                 projected.Add(message with
                 {
+                    Content = display,
                     Metadata = WithDiscord(message,
-                        ToParsed(inputs[0], author, message.Content ?? "", attachmentCount),
+                        ToParsed(inputs[0], author, display, attachmentCount),
                         author is null ? null : await Profile(author.ExternalId)),
                 });
                 continue;
@@ -105,15 +109,16 @@ internal static class DiscordTranscriptProjection
             for (var i = 0; i < inputs.Count; i++)
             {
                 var author = attributions[i]!;
+                var display = DiscordChannelGaps.StripForDisplay(segments[i]);
                 var part = message with
                 {
                     MessageUid = inputs[i].InputMessageUid ?? $"{message.MessageUid}#{i}",
-                    Content = segments[i],
+                    Content = display,
                 };
                 projected.Add(part with
                 {
                     Metadata = WithDiscord(part,
-                        ToParsed(inputs[i], author, segments[i], author.AttachmentCount ?? 0),
+                        ToParsed(inputs[i], author, display, author.AttachmentCount ?? 0),
                         await Profile(author.ExternalId)),
                 });
             }

@@ -352,6 +352,13 @@ public sealed record DiscordBinding(
     public IReadOnlySet<string> AuthorizedAutomationIds { get; init; } =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public DiscordServerMapDisclosureState? ServerMapDisclosure { get; init; }
+    /// <summary>
+    /// The newest Discord message this binding delivered to its Agent session, valid only for
+    /// <see cref="LastDeliveredGeneration"/>. Unlike <see cref="LastReceivedSnowflake"/>, it
+    /// never advances for a message that was recorded but not admitted.
+    /// </summary>
+    public string? LastDeliveredSnowflake { get; init; }
+    public long? LastDeliveredGeneration { get; init; }
     [JsonIgnore]
     public string? WebhookToken { get; init; }
 }
@@ -598,6 +605,26 @@ public sealed class DiscordBindingStore(IEntityStore store)
             new JsonObject { ["last_received_snowflake"] = snowflake }, ct: ct);
 
     /// <summary>
+    /// Advances the delivered-to-session cursor for the binding's current generation. The
+    /// cursor only moves forward within a generation; a new generation starts it afresh.
+    /// </summary>
+    public async Task<DiscordBinding> MarkDeliveredAsync(
+        DiscordBinding binding, string snowflake, CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(snowflake, out var delivered)) return binding;
+        var current = await GetAsync(binding.EntityId, ct) ?? binding;
+        if (current.LastDeliveredGeneration == binding.Generation
+            && ulong.TryParse(current.LastDeliveredSnowflake, out var existing)
+            && existing >= delivered)
+            return current;
+        return Map(await store.PatchAsync(binding.EntityId, new JsonObject
+        {
+            ["last_delivered_snowflake"] = snowflake,
+            ["last_delivered_generation"] = binding.Generation,
+        }, ct: ct));
+    }
+
+    /// <summary>
     /// Records which server map the bound session now holds. Call only after the turn was
     /// handed to the session, so a filtered or failed turn can never hide a map change.
     /// </summary>
@@ -696,6 +723,10 @@ public sealed class DiscordBindingStore(IEntityStore store)
                 data, "authorized_automation_ids"),
             ServerMapDisclosure = DiscordServerMapDisclosure.FromJson(
                 data["server_map_disclosure"]),
+            LastDeliveredSnowflake = JsonRead.String(data, "last_delivered_snowflake"),
+            LastDeliveredGeneration = data["last_delivered_generation"] is null
+                ? null
+                : JsonRead.Long(data, "last_delivered_generation", 0),
             WebhookToken = JsonRead.String(data, "webhook_token"),
         };
     }

@@ -47,7 +47,10 @@ internal static class DiscordInboundAttributions
                     && owner.TryGetValue<bool>(out var isOwner) && isOwner,
             },
             ["attachment_count"] = (value["attachments"] as JsonArray)?.Count ?? 0,
-            ["content_length"] = content?.Length,
+            // The session received any channel gap block ahead of the message itself.
+            ["content_length"] = content is null
+                ? null
+                : (DiscordChannelGaps.Prefix(value["channel_gap"])?.Length ?? 0) + content.Length,
         };
     }
 
