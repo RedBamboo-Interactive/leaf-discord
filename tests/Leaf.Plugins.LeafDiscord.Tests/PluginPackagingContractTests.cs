@@ -96,7 +96,7 @@ public sealed class PluginPackagingContractTests
             && field.GetProperty("slug").GetString() == "bot_token");
         Assert.Equal("secret", perBotToken.GetProperty("fieldType").GetString());
 
-        foreach (var slug in new[] { "host-credential", "webhook-urls" })
+        foreach (var slug in new[] { "host-credential", "webhook-urls", "relay-targets" })
         {
             var commonsSecret = seeds.RootElement.EnumerateArray().Single(field =>
                 field.GetProperty("parentType").GetString()

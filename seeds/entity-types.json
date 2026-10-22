@@ -38,19 +38,19 @@
   {
     "typeSlug": "entity-type",
     "slug": "leaf-discord-commons-config",
-    "name": "Discord Commons Configuration",
+    "name": "Leaf Community Configuration",
     "data": {
       "icon": "ph-bold ph-globe-hemisphere-west",
       "color": "indigo",
       "folder": "integration",
       "versioning": true,
-      "description": "Owner-scoped Nova Commons relay configuration and encrypted credentials"
+      "description": "Owner-scoped Leaf Community relay configuration and encrypted credentials"
     }
   },
   {
     "typeSlug": "entity-type",
     "slug": "leaf-discord-commons-ingest",
-    "name": "Discord Commons Ingest Delivery",
+    "name": "Leaf Community Ingest Delivery",
     "data": {
       "icon": "ph-bold ph-arrow-square-out",
       "color": "indigo",

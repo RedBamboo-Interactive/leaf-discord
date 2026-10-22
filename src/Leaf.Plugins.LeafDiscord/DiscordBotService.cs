@@ -51,6 +51,14 @@ public sealed record DiscordGuildChannel(
     string ChannelId,
     string ChannelName);
 
+public sealed record DiscordGuildPermissionReport(
+    string GuildId,
+    string GuildName,
+    bool ManageChannels,
+    bool ManageWebhooks,
+    bool ManageRoles,
+    IReadOnlyList<string> Missing);
+
 public sealed record DiscordCommonsWebhookResult(
     string GuildId,
     string ChannelId,
@@ -387,6 +395,31 @@ public sealed class DiscordBotService(
         return await runtime.CreateGuildTextChannelAsync(guildId, request, ct);
     }
 
+    public async Task<DiscordGuildChannelCreateResult> CreateGuildCategoryAsync(
+        Guid botId,
+        string guildId,
+        DiscordGuildCategoryCreateRequest request,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.CreateGuildCategoryAsync(guildId, request, ct);
+    }
+
+    public async Task<DiscordGuildPermissionReport> GetGuildPermissionReportAsync(
+        Guid botId, string guildId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return runtime.GetGuildPermissionReport(guildId);
+    }
+
     public async Task<DiscordGuildChannelCreateResult> CreateGuildForumChannelAsync(
         Guid botId,
         string guildId,
@@ -415,19 +448,30 @@ public sealed class DiscordBotService(
         return await runtime.EnsureCommonsWebhookAsync(guildId, channelId, ct);
     }
 
+    public async Task<bool> IsCommonsChannelAsync(
+        Guid botId, string guildId, string channelId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.IsCommonsChannelAsync(guildId, channelId, ct);
+    }
+
     public async Task<DiscordBinding> CreateGuildChannelBindingAsync(
         Guid botId, string guildId, string channelId, string ownerUserId,
         CancellationToken ct = default)
     {
         var config = await configurations.GetAsync(botId, ct)
             ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
-        if (await commons.IsCommonsGuildAsync(botId, guildId, ct))
-            throw new UnauthorizedAccessException(
-                "Native Agent bindings are disabled in Commons guilds.");
         var runtime = runtimes.TryGetValue(config.EntityId, out var current)
             ? current
             : throw new InvalidOperationException("Discord bot is not running.");
         var channel = runtime.ResolveGuildChannel(guildId, channelId);
+        if (await runtime.IsCommonsChannelAsync(guildId, channelId, ct))
+            throw new UnauthorizedAccessException(
+                "Native Agent bindings are disabled in Leaf Community channels.");
         var behavior = await behaviors.ResolveAsync(
             config, "guild_channel", channel.GuildId, channel.ChannelId,
             null, DiscordResponseModes.Direct, ct);
@@ -703,6 +747,25 @@ internal sealed class DiscordBotRuntime(
             .ToArray();
     }
 
+    public DiscordGuildPermissionReport GetGuildPermissionReport(string guildId)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+        var guild = client?.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var permissions = guild.CurrentUser.GuildPermissions;
+        var missing = new List<string>();
+        if (!permissions.ManageChannels) missing.Add("Manage Channels");
+        if (!permissions.ManageWebhooks) missing.Add("Manage Webhooks");
+        if (!permissions.ManageRoles) missing.Add("Manage Roles");
+        return new DiscordGuildPermissionReport(
+            guildId, guild.Name,
+            permissions.ManageChannels,
+            permissions.ManageWebhooks,
+            permissions.ManageRoles,
+            missing);
+    }
+
     public async Task<DiscordForumPostResult> CreateForumPostAsync(
         string guildId,
         string forumId,
@@ -720,10 +783,6 @@ internal sealed class DiscordBotRuntime(
             throw new ArgumentException("A bounded idempotency key is required.");
         if (string.IsNullOrWhiteSpace(ownerUserId))
             throw new ArgumentException("The Leaf owner user ID is required.");
-        if (await commons.IsCommonsGuildAsync(configId, guildId, ct))
-            throw new UnauthorizedAccessException(
-                "Native Agent forum posts are disabled in Commons guilds.");
-
         title = title.Trim();
         content = content.Trim();
         idempotencyKey = idempotencyKey.Trim();
@@ -732,6 +791,10 @@ internal sealed class DiscordBotRuntime(
             throw new InvalidOperationException("Discord bridge is not connected.");
         var config = await GetConfigAsync(ct);
         var forum = ResolveWritableForum(activeClient, guildId, forumId);
+        if (await commons.IsCommonsLocationAsync(
+                configId, guildId, forum.Id.ToString(), forum.CategoryId?.ToString(), ct))
+            throw new UnauthorizedAccessException(
+                "Native Agent forum posts are disabled in Leaf Community channels.");
         var gateKey = $"{config.ApplicationId}:{guildId}:{forumId}:{idempotencyKey}";
         var gate = forumPostGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -910,6 +973,41 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
+    public async Task<DiscordGuildChannelCreateResult> CreateGuildCategoryAsync(
+        string guildId,
+        DiscordGuildCategoryCreateRequest request,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+        var payload = DiscordChannelEdits.BuildCategoryCreatePayload(request);
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var guild = activeClient.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        if (!guild.CurrentUser.GuildPermissions.ManageChannels)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs Manage Channels for that server.");
+        var config = await GetConfigAsync(ct);
+        var botToken = config.BotToken
+            ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        var gateKey = $"{config.ApplicationId}:{guildId}";
+        var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var response = await rest.CreateGuildChannelAsync(
+                botToken, guildId, payload,
+                "Leaf owner requested this category creation through Nova", ct);
+            return ProjectCreatedCategory(guild, response);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     public async Task<DiscordGuildChannelCreateResult> CreateGuildForumChannelAsync(
         string guildId,
         DiscordGuildForumChannelCreateRequest request,
@@ -970,9 +1068,9 @@ internal sealed class DiscordBotRuntime(
             throw new ArgumentException("Discord guild and channel IDs must be snowflakes.");
         var commonsConfig = await commonsConfigurations.GetAsync(configId, ct)
             ?? throw new InvalidOperationException("Discord Commons is not configured.");
-        if (!commonsConfig.GuildAllowlist.Contains(guildId))
+        if (!await IsCommonsChannelAsync(guildId, channelId, ct))
             throw new UnauthorizedAccessException(
-                "That Discord guild is not in the Commons allowlist.");
+                "That Discord channel is outside the configured Leaf Community scope.");
         var activeClient = client;
         if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
             throw new InvalidOperationException("Discord bridge is not connected.");
@@ -1020,6 +1118,19 @@ internal sealed class DiscordBotRuntime(
         {
             gate.Release();
         }
+    }
+
+    internal async Task<bool> IsCommonsChannelAsync(
+        string guildId, string channelId, CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId)
+            || !ulong.TryParse(channelId, out var parsedChannelId))
+            return false;
+        var channel = client?.GetGuild(parsedGuildId)?.GetChannel(parsedChannelId);
+        var location = channel is null ? null : CommonsLocation(channel);
+        return location is not null && await commons.IsCommonsLocationAsync(
+            configId, location.Value.GuildId, location.Value.ChannelId,
+            location.Value.CategoryId, ct);
     }
 
     private static string EditableChannelKind(SocketGuildChannel channel)
@@ -1088,6 +1199,26 @@ internal sealed class DiscordBotRuntime(
             response["position"]?.GetValue<int>() ?? 0,
             response["nsfw"]?.GetValue<bool>() ?? false,
             response["rate_limit_per_user"]?.GetValue<int>() ?? 0);
+    }
+
+    private static DiscordGuildChannelCreateResult ProjectCreatedCategory(
+        SocketGuild guild,
+        JsonObject response)
+    {
+        var channelId = response["id"]?.GetValue<string>()
+            ?? throw new InvalidOperationException(
+                "Discord category creation response has no id.");
+        if (!ulong.TryParse(channelId, out var parsedChannelId) || parsedChannelId == 0)
+            throw new InvalidOperationException(
+                "Discord category creation response has an invalid id.");
+        var channelName = response["name"]?.GetValue<string>()
+            ?? throw new InvalidOperationException(
+                "Discord category creation response has no name.");
+        if (response["type"]?.GetValue<int>() is not 4)
+            throw new InvalidOperationException("Discord did not create a category.");
+        return new DiscordGuildChannelCreateResult(
+            guild.Id.ToString(), guild.Name, channelId, channelName, "category",
+            null, null, response["position"]?.GetValue<int>() ?? 0, false, 0);
     }
 
     private static DiscordGuildChannelCreateResult ProjectCreatedForumChannel(
@@ -2131,10 +2262,14 @@ internal sealed class DiscordBotRuntime(
 
     private async Task ProcessMessageAsync(IUserMessage message)
     {
-        var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id.ToString();
-        if (await commons.IsCommonsGuildAsync(configId, guildId))
+        var commonsLocation = CommonsLocation(message.Channel);
+        if (commonsLocation is not null && await commons.IsCommonsLocationAsync(
+                configId,
+                commonsLocation.Value.GuildId,
+                commonsLocation.Value.ChannelId,
+                commonsLocation.Value.CategoryId))
         {
-            await ForwardCommonsMessageAsync(message);
+            await ForwardCommonsMessageAsync(message, commonsLocation.Value);
             return;
         }
         if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
@@ -2319,19 +2454,19 @@ internal sealed class DiscordBotRuntime(
                 item.MessageId, elapsed.TotalMilliseconds);
     }
 
-    private async Task ForwardCommonsMessageAsync(IUserMessage message)
+    private async Task ForwardCommonsMessageAsync(
+        IUserMessage message,
+        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location)
     {
-        var location = CommonsLocation(message.Channel);
-        if (location is null) return;
         if (message.Source == MessageSource.Webhook)
         {
-            await commons.EnqueueAsync(configId, message.Id.ToString(), new JsonObject
+            await commons.EnqueueAsync(configId, location.GuildId, message.Id.ToString(), new JsonObject
             {
                 ["type"] = "webhook_echo",
                 ["eventId"] = message.Id.ToString(),
                 ["messageId"] = message.Id.ToString(),
-                ["channel"] = location.Value.Channel,
-                ["threadRef"] = location.Value.ThreadRef,
+                ["channel"] = location.Channel,
+                ["threadRef"] = location.ThreadRef,
                 ["timestamp"] = message.Timestamp.ToUnixTimeMilliseconds(),
             });
             return;
@@ -2345,7 +2480,7 @@ internal sealed class DiscordBotRuntime(
             .Select(value => value.ToString())
             .Distinct(StringComparer.Ordinal)
             .ToArray();
-        await commons.EnqueueAsync(configId, message.Id.ToString(),
+        await commons.EnqueueAsync(configId, location.GuildId, message.Id.ToString(),
             DiscordCommonsRelayService.BuildHumanMessagePayload(
                 message.Id.ToString(),
                 message.Author.Id.ToString(),
@@ -2355,8 +2490,8 @@ internal sealed class DiscordBotRuntime(
                 message.Content,
                 mentions,
                 mentionRoles,
-                location.Value.Channel,
-                location.Value.ThreadRef,
+                location.Channel,
+                location.ThreadRef,
                 message.Reference?.MessageId.ToString(),
                 message.Timestamp.ToUnixTimeMilliseconds()));
     }
@@ -2373,12 +2508,13 @@ internal sealed class DiscordBotRuntime(
             var resolved = client?.GetChannel(channel.Id);
             var location = resolved is null ? null : CommonsLocation(resolved);
             if (location?.ThreadRef is null) return;
-            var guildId = (resolved as SocketGuildChannel)?.Guild.Id.ToString();
-            if (!await commons.IsCommonsGuildAsync(configId, guildId)) return;
+            if (!await commons.IsCommonsLocationAsync(
+                    configId, location.Value.GuildId, location.Value.ChannelId,
+                    location.Value.CategoryId)) return;
             if ((resolved as SocketGuildChannel)?.Guild.GetUser(reaction.UserId)?.IsBot == true)
                 return;
             var eventId = $"reaction:{reaction.MessageId}:{reaction.UserId}:stop";
-            await commons.EnqueueAsync(configId, eventId, new JsonObject
+            await commons.EnqueueAsync(configId, location.Value.GuildId, eventId, new JsonObject
             {
                 ["type"] = "stop_reaction",
                 ["eventId"] = eventId,
@@ -2392,14 +2528,20 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
-    private static (string Channel, string? ThreadRef)? CommonsLocation(
+    private static (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef)? CommonsLocation(
         IChannel channel)
         => channel switch
         {
             SocketThreadChannel thread => (
+                thread.Guild.Id.ToString(),
+                thread.ParentChannel.Id.ToString(),
+                (thread.ParentChannel as INestedChannel)?.CategoryId?.ToString(),
                 DiscordCommonsRelayService.ChannelName(thread.ParentChannel.Name),
                 thread.Id.ToString()),
             SocketGuildChannel guildChannel => (
+                guildChannel.Guild.Id.ToString(),
+                guildChannel.Id.ToString(),
+                (guildChannel as INestedChannel)?.CategoryId?.ToString(),
                 DiscordCommonsRelayService.ChannelName(guildChannel.Name),
                 null),
             _ => null,
@@ -2939,22 +3081,23 @@ internal sealed class DiscordBotRuntime(
     private async Task<bool> TryHandleCommonsCommandAsync(SocketSlashCommand command)
     {
         if (command.Data.Name is not ("ask" or "pause" or "resume")) return false;
-        var guildId = command.GuildId?.ToString();
-        if (!await commons.IsCommonsGuildAsync(configId, guildId))
-        {
-            await command.RespondAsync(
-                "That Commons command is available only in a configured Commons server.",
-                ephemeral: true);
-            return true;
-        }
         var channel = command.ChannelId is { } channelId
             ? client?.GetChannel(channelId)
             : null;
         var location = channel is null ? null : CommonsLocation(channel);
+        if (location is null || !await commons.IsCommonsLocationAsync(
+                configId, location.Value.GuildId, location.Value.ChannelId,
+                location.Value.CategoryId))
+        {
+            await command.RespondAsync(
+                "That Leaf Community command is available only in a configured community channel.",
+                ephemeral: true);
+            return true;
+        }
         if (location?.ThreadRef is null)
         {
             await command.RespondAsync(
-                "Use this command inside a Commons forum thread.", ephemeral: true);
+                "Use this command inside a Leaf Community forum thread.", ephemeral: true);
             return true;
         }
         var eventId = command.Id.ToString();
@@ -2971,7 +3114,7 @@ internal sealed class DiscordBotRuntime(
                     "Both an Envoy and a question are required.", ephemeral: true);
                 return true;
             }
-            await commons.EnqueueAsync(configId, eventId, new JsonObject
+            await commons.EnqueueAsync(configId, location.Value.GuildId, eventId, new JsonObject
             {
                 ["type"] = "ask",
                 ["eventId"] = eventId,
@@ -2985,10 +3128,10 @@ internal sealed class DiscordBotRuntime(
                 ["threadRef"] = location.Value.ThreadRef,
                 ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             });
-            await command.RespondAsync("Your question was queued for Nova Commons.", ephemeral: true);
+            await command.RespondAsync("Your question was queued for Leaf Community.", ephemeral: true);
             return true;
         }
-        await commons.EnqueueAsync(configId, eventId, new JsonObject
+        await commons.EnqueueAsync(configId, location.Value.GuildId, eventId, new JsonObject
         {
             ["type"] = command.Data.Name,
             ["eventId"] = eventId,
@@ -2997,8 +3140,8 @@ internal sealed class DiscordBotRuntime(
         });
         await command.RespondAsync(
             command.Data.Name == "pause"
-                ? "This Commons thread was queued to pause."
-                : "This Commons thread was queued to resume.",
+            ? "This Leaf Community thread was queued to pause."
+            : "This Leaf Community thread was queued to resume.",
             ephemeral: true);
         return true;
     }
@@ -3030,27 +3173,27 @@ internal sealed class DiscordBotRuntime(
             var commonsCommands = new ApplicationCommandProperties[]
             {
                 new SlashCommandBuilder().WithName("ask")
-                    .WithDescription("Ask a specific Commons Envoy in this thread")
+                    .WithDescription("Ask a specific Agent in this community thread")
                     .AddOption("envoy", ApplicationCommandOptionType.String,
-                        "Envoy ID or persona name", isRequired: true)
+                        "Agent ID or community name", isRequired: true)
                     .AddOption("question", ApplicationCommandOptionType.String,
                         "Question for the Envoy", isRequired: true)
                     .Build(),
                 new SlashCommandBuilder().WithName("pause")
-                    .WithDescription("Pause Envoy replies in this Commons thread").Build(),
+                    .WithDescription("Pause Agent replies in this community thread").Build(),
                 new SlashCommandBuilder().WithName("resume")
-                    .WithDescription("Resume Envoy replies in this Commons thread").Build(),
+                    .WithDescription("Resume Agent replies in this community thread").Build(),
             };
             var commonsConfig = await commons.GetConfigurationAsync(configId);
-            var commonsGuilds = commonsConfig is null
-                ? Array.Empty<string>()
-                : commonsConfig.GuildAllowlist.ToArray();
-            foreach (var guildId in commonsGuilds)
+            var commonsScopes = commonsConfig?.GuildScopes.Values
+                ?? Array.Empty<DiscordCommonsGuildScope>();
+            foreach (var scope in commonsScopes)
             {
-                if (!ulong.TryParse(guildId, out var parsedGuildId)) continue;
+                if (!ulong.TryParse(scope.GuildId, out var parsedGuildId)) continue;
                 var guild = client.GetGuild(parsedGuildId);
                 if (guild is not null)
-                    await guild.BulkOverwriteApplicationCommandAsync(commonsCommands);
+                    await guild.BulkOverwriteApplicationCommandAsync(
+                        scope.WholeGuild ? commonsCommands : []);
             }
         }
         catch (HttpException ex)
@@ -3223,13 +3366,13 @@ internal sealed class DiscordBotRuntime(
             var botConfig = await GetConfigAsync(ct);
             var botToken = botConfig.BotToken
                 ?? throw new InvalidOperationException("Discord bot token is unavailable.");
-            foreach (var guildId in config.GuildAllowlist)
+            foreach (var guildId in config.GuildScopes.Keys)
             {
                 if (!ulong.TryParse(guildId, out var parsedGuildId)) continue;
                 var guild = source.GetGuild(parsedGuildId)
                     ?? throw new InvalidOperationException(
                         "A configured public Agent guild is not visible to the Discord bot.");
-                var envoys = await commons.GetEnvoysAsync(configId, ct);
+                var envoys = await commons.GetEnvoysAsync(configId, guildId, ct);
                 envoyCount = envoys.Count;
                 DiscordCommonsRolePolicy.EnsureCanReconcile(
                     guild.CurrentUser.GuildPermissions.ManageRoles, envoys);
@@ -3243,10 +3386,10 @@ internal sealed class DiscordBotRuntime(
                     if (owner is not null && !string.Equals(
                             owner.DisplayName, envoy.OwnerDisplayName, StringComparison.Ordinal))
                         await commons.SyncOwnerDisplayNameAsync(
-                            configId, envoy.Id, owner.DisplayName, ct);
+                            configId, guildId, envoy.Id, owner.DisplayName, ct);
                 }
-                await commons.PushReservedNamesAsync(configId, members, ct);
-                envoys = await commons.GetEnvoysAsync(configId, ct);
+                await commons.PushReservedNamesAsync(configId, guildId, members, ct);
+                envoys = await commons.GetEnvoysAsync(configId, guildId, ct);
                 DiscordCommonsRolePolicy.EnsureCanReconcile(true, envoys);
 
                 var roles = (await rest.ListGuildRolesAsync(botToken, guildId, ct)).ToList();
@@ -3260,7 +3403,8 @@ internal sealed class DiscordBotRuntime(
                         if (recorded is not null && !recorded.Managed)
                             await rest.DeleteGuildRoleAsync(botToken, guildId, recorded.Id, ct);
                         if (envoy.DiscordRoleId is not null)
-                            await commons.SetDiscordRoleAsync(configId, envoy.Id, null, ct);
+                            await commons.SetDiscordRoleAsync(
+                                configId, guildId, envoy.Id, null, ct);
                         continue;
                     }
 
@@ -3281,7 +3425,7 @@ internal sealed class DiscordBotRuntime(
                     }
                     if (!string.Equals(envoy.DiscordRoleId, role.Id, StringComparison.Ordinal))
                         await commons.SetDiscordRoleAsync(
-                            configId, envoy.Id, role.Id, ct);
+                            configId, guildId, envoy.Id, role.Id, ct);
                 }
             }
             await commonsConfigurations.SetRoleReconciliationAsync(
@@ -3406,7 +3550,7 @@ internal sealed class DiscordBotRuntime(
 
     private async Task DrainBindingAsync(DiscordBinding binding, CancellationToken ct)
     {
-        if (await commons.IsCommonsGuildAsync(configId, binding.GuildId, ct)) return;
+        if (await IsCommonsBindingAsync(binding, ct)) return;
         var gate = outboxGates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
@@ -3535,6 +3679,20 @@ internal sealed class DiscordBotRuntime(
         {
             gate.Release();
         }
+    }
+
+    private async Task<bool> IsCommonsBindingAsync(
+        DiscordBinding binding, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(binding.GuildId)
+            || !ulong.TryParse(binding.ConversationId, out var channelId))
+            return false;
+        var location = client?.GetChannel(channelId) is { } channel
+            ? CommonsLocation(channel)
+            : null;
+        return location is not null && await commons.IsCommonsLocationAsync(
+            configId, location.Value.GuildId, location.Value.ChannelId,
+            location.Value.CategoryId, ct);
     }
 
     internal static async Task<ResolvedOutboundPayload> ResolveOutboundPayloadAsync(

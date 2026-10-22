@@ -10,6 +10,10 @@ public sealed record DiscordGuildChannelCreateRequest(
     bool Nsfw = false,
     int SlowModeSeconds = 0);
 
+public sealed record DiscordGuildCategoryCreateRequest(
+    string Name,
+    int? Position = null);
+
 public sealed record DiscordGuildForumChannelCreateRequest(
     string Name,
     string? Topic = null,
@@ -55,6 +59,21 @@ public sealed record DiscordChannelEditResult(
 
 internal static class DiscordChannelEdits
 {
+    public static JsonObject BuildCategoryCreatePayload(
+        DiscordGuildCategoryCreateRequest request)
+    {
+        var payload = new JsonObject
+        {
+            ["name"] = ValidName(request.Name),
+            ["type"] = 4,
+        };
+        if (request.Position is < 0)
+            throw new ArgumentException("Discord category position cannot be negative.");
+        if (request.Position is { } position)
+            payload["position"] = position;
+        return payload;
+    }
+
     public static JsonObject BuildTextChannelCreatePayload(
         DiscordGuildChannelCreateRequest request)
     {

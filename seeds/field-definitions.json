@@ -35,8 +35,10 @@
   { "parentType": "leaf-discord-commons-config", "slug": "bot-id", "name": "Discord Bot", "fieldType": "entity_ref", "sortOrder": 0, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-bot\u0022}" },
   { "parentType": "leaf-discord-commons-config", "slug": "relay-url", "name": "Relay URL", "fieldType": "string", "sortOrder": 1 },
   { "parentType": "leaf-discord-commons-config", "slug": "host-credential", "name": "Relay Host Credential", "fieldType": "secret", "sortOrder": 2, "description": "Encrypted by RedLeaf and never returned by plugin APIs" },
-  { "parentType": "leaf-discord-commons-config", "slug": "guild-allowlist", "name": "Commons Guild Allowlist", "fieldType": "json", "sortOrder": 3 },
+  { "parentType": "leaf-discord-commons-config", "slug": "guild-allowlist", "name": "Leaf Community Guild Allowlist", "fieldType": "json", "sortOrder": 3 },
   { "parentType": "leaf-discord-commons-config", "slug": "webhook-urls", "name": "Managed Webhook URLs", "fieldType": "secret", "sortOrder": 4, "description": "Encrypted JSON map, never returned by plugin APIs" },
+  { "parentType": "leaf-discord-commons-config", "slug": "guild-scopes", "name": "Leaf Community Guild Scopes", "fieldType": "json", "sortOrder": 5, "description": "Per-guild whole-server, category, and channel scope" },
+  { "parentType": "leaf-discord-commons-config", "slug": "relay-targets", "name": "Leaf Community Relay Targets", "fieldType": "secret", "sortOrder": 6, "description": "Encrypted per-guild relay URLs and host credentials; never returned by plugin APIs" },
 
   { "parentType": "leaf-discord-commons-ingest", "slug": "bot_id", "name": "Discord Bot", "fieldType": "entity_ref", "sortOrder": 0, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-bot\u0022}" },
   { "parentType": "leaf-discord-commons-ingest", "slug": "event_id", "name": "Event ID", "fieldType": "string", "sortOrder": 1 },

@@ -306,12 +306,14 @@ permission as channel editing. It creates only ordinary text channels and inheri
 selected category's permissions; it cannot create or alter permission overwrites. Use the
 existing binding route afterward when Nova should participate in the new channel.
 
-An Agent's public side is an optional host-only transport path (internally the
-Commons protocol). Fresh installations have no
-relay URL and an empty guild allowlist. Once an owner explicitly configures both,
-messages in an allowlisted guild are diverted before binding lookup: they can never
-create or enter a native Nova Agent session, and any old/manual binding for that
-guild is barred from outbound delivery. The host durably forwards human messages,
+Leaf Community is an optional host-only transport path (internally the Commons
+protocol). Fresh installations have no relay targets or guild scopes. Each configured
+guild is either whole-guild (the isolated lab) or restricted to explicit category and
+channel IDs. Only messages inside that scope are diverted before binding lookup: they
+can never create or enter a native Agent session, and any old/manual binding inside
+the scope is barred from outbound delivery. Native bindings elsewhere in the same
+guild continue unchanged. Each guild scope has its own encrypted relay URL and host
+credential. The host durably forwards human messages,
 webhook echoes, stop reactions, and the guild-scoped `/ask`, `/pause`, and `/resume`
 commands to the configured HTTPS relay.
 
@@ -331,7 +333,7 @@ selected Agent, hides the group when that Agent is not public, and renders threa
 messages and terminal blocked/failed outcomes in the same master-detail conversation
 surface. No separate Commons page is added.
 
-The bot owner or local administrator configures the relay without receiving secrets
+The bot owner or local administrator configures per-guild relay scopes without receiving secrets
 back in a response:
 
 ```text
@@ -339,12 +341,15 @@ GET /api/apps/leaf-discord/bots/{botEntityId}/commons
 PUT /api/apps/leaf-discord/bots/{botEntityId}/commons
 ```
 
-`host_credential` and the channel-to-webhook URL map are encrypted Entity secret
-fields. The safe view exposes only `hostCredentialConfigured` and webhook channel
-IDs. A signed private Nova Agent can create a forum with the same ownership and
-Manage Channels checks as text-channel creation:
+`relay_targets` and the channel-to-webhook URL map are encrypted Entity secret
+fields. The safe view exposes only per-scope `hostCredentialConfigured` and webhook
+channel IDs. A signed private Nova Agent can inspect required guild permissions and
+create a category or forum with the same ownership and Manage Channels checks as
+text-channel creation:
 
 ```text
+GET  /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/permissions
+POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/categories
 POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/forums
 ```
 
@@ -357,8 +362,8 @@ POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels/{channe
 ```
 
 The second route is a one-shot, owner-authorized operation. It writes the encrypted
-URL directly to `wrangler secret put --env lab` over stdin; stdout, stderr, and the
-URL are not returned. Commons webhooks are never used by the native Nova delivery
+URL directly to `wrangler secret put --env lab|production` over stdin; stdout, stderr,
+and the URL are not returned. Commons webhooks are never used by the native Nova delivery
 path.
 
 ## Avatar profiles

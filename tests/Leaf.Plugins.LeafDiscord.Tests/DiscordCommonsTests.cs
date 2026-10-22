@@ -23,15 +23,27 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
-    public void Commons_guild_messages_never_reach_a_native_agent_session()
+    public void Lab_whole_guild_is_silent_but_production_is_silent_only_in_its_category()
     {
-        var allowlist = new HashSet<string>([LabGuildId], StringComparer.Ordinal);
+        var lab = new DiscordCommonsGuildScope(
+            LabGuildId, true, new HashSet<string>(), new HashSet<string>(),
+            "https://lab.example.test", "lab-host");
+        var production = new DiscordCommonsGuildScope(
+            "400000000000000004", false,
+            new HashSet<string>(["500000000000000005"]),
+            new HashSet<string>(["700000000000000007"]),
+            "https://relay.example.test", "production-host");
 
         Assert.False(DiscordCommonsRelayService.ShouldReachNativeAgent(
-            LabGuildId, allowlist));
+            lab, "any-channel", null));
+        Assert.False(DiscordCommonsRelayService.ShouldReachNativeAgent(
+            production, "600000000000000006", "500000000000000005"));
+        Assert.False(DiscordCommonsRelayService.ShouldReachNativeAgent(
+            production, "700000000000000007", null));
         Assert.True(DiscordCommonsRelayService.ShouldReachNativeAgent(
-            "400000000000000004", allowlist));
-        Assert.True(DiscordCommonsRelayService.ShouldReachNativeAgent(null, allowlist));
+            production, "800000000000000008", "900000000000000009"));
+        Assert.True(DiscordCommonsRelayService.ShouldReachNativeAgent(
+            null, "800000000000000008", null));
     }
 
     [Fact]
@@ -56,6 +68,7 @@ public sealed class DiscordCommonsTests
                 (await configurations.GetAsync(botId))!));
 
         Assert.True(saved.Ready);
+        Assert.True(saved.Scope(LabGuildId)!.WholeGuild);
         Assert.DoesNotContain("host-secret-for-test", serialized, StringComparison.Ordinal);
         Assert.DoesNotContain("test-token", serialized, StringComparison.Ordinal);
         Assert.Contains("HostCredentialConfigured", serialized, StringComparison.Ordinal);
@@ -75,14 +88,54 @@ public sealed class DiscordCommonsTests
             ["content"] = "hello",
         };
 
-        var first = await deliveries.EnqueueAsync(botId, "gateway-event-1", payload);
-        var duplicate = await deliveries.EnqueueAsync(botId, "gateway-event-1", payload);
+        var first = await deliveries.EnqueueAsync(
+            botId, LabGuildId, "gateway-event-1", payload);
+        var duplicate = await deliveries.EnqueueAsync(
+            botId, LabGuildId, "gateway-event-1", payload);
 
         Assert.Equal(first.EntityId, duplicate.EntityId);
+        Assert.Equal(LabGuildId, first.GuildId);
         Assert.Single(await deliveries.PendingAsync());
         await deliveries.MarkSentAsync(first);
         Assert.Empty(await deliveries.PendingAsync());
         Assert.Null((await store.GetAsync(first.EntityId))!.Data["payload"]);
+    }
+
+    [Fact]
+    public async Task Per_guild_scopes_keep_separate_encrypted_relay_targets()
+    {
+        var configurations = new DiscordCommonsConfigurationStore(new MemoryEntityStore());
+        var botId = Guid.NewGuid();
+        var saved = await configurations.SaveAsync(botId,
+            new DiscordCommonsConfigurationUpdate("", null, false, null,
+            [
+                new DiscordCommonsGuildScopeUpdate(
+                    LabGuildId, true, [], [], "https://lab.example.test", "lab-secret"),
+                new DiscordCommonsGuildScopeUpdate(
+                    "400000000000000004", false, ["500000000000000005"], [],
+                    "https://relay.example.test", "production-secret"),
+            ]));
+
+        Assert.Equal("https://lab.example.test", saved.Scope(LabGuildId)!.RelayUrl);
+        Assert.True(saved.Scope(LabGuildId)!.Contains("anything", null));
+        var production = saved.Scope("400000000000000004")!;
+        Assert.True(production.Contains("600000000000000006", "500000000000000005"));
+        Assert.False(production.Contains("600000000000000006", "700000000000000007"));
+        var view = JsonSerializer.Serialize(DiscordCommonsConfigurationStore.View(saved));
+        Assert.DoesNotContain("lab-secret", view, StringComparison.Ordinal);
+        Assert.DoesNotContain("production-secret", view, StringComparison.Ordinal);
+        Assert.Equal(2, saved.GuildScopes.Count);
+
+        var preserved = await configurations.SaveAsync(botId,
+            new DiscordCommonsConfigurationUpdate("", null, false, null,
+                saved.GuildScopes.Values.Select(scope =>
+                    new DiscordCommonsGuildScopeUpdate(
+                        scope.GuildId, scope.WholeGuild,
+                        scope.CategoryIds.ToArray(), scope.ChannelIds.ToArray(),
+                        scope.RelayUrl, null)).ToArray()));
+        Assert.Equal("lab-secret", preserved.Scope(LabGuildId)!.HostCredential);
+        Assert.Equal("production-secret",
+            preserved.Scope("400000000000000004")!.HostCredential);
     }
 
     [Theory]

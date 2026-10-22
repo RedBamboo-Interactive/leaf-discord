@@ -358,6 +358,42 @@ public static class DiscordEndpoints
             }
         });
 
+        group.MapGet("/bots/{id:guid}/guilds/{guildId}/permissions", async (
+            Guid id,
+            string guildId,
+            HttpContext http,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+        {
+            var caller = ReadPrivateLeafAgentCaller(http);
+            if (caller is null)
+                return Forbidden("A signed private Nova Agent discussion is required.");
+            var config = await configurations.GetAsync(id, ct);
+            if (config is null) return Results.NotFound();
+            var agent = await agents.ResolveAsync(config.AgentId, ct);
+            if (!CanAddressBot(caller, config, agent?.Id.ToString()))
+                return Forbidden("This Agent cannot address that Discord bot.");
+            try
+            {
+                return Results.Ok(await bot.GetGuildPermissionReportAsync(id, guildId, ct));
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = "invalid_discord_guild", message = ex.Message });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = "discord_guild_not_found", message = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = "discord_bot_unavailable", message = ex.Message },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        });
+
         group.MapGet("/bots/{id:guid}/guilds/{guildId}/channels/{channelId}/messages", async (
             Guid id,
             string guildId,
@@ -378,9 +414,8 @@ public static class DiscordEndpoints
             var agent = await agents.ResolveAsync(config.AgentId, ct);
             if (!CanAddressBot(caller, config, agent?.Id.ToString()))
                 return Forbidden("This Agent cannot address that Discord bot.");
-            var commonsConfig = await commons.GetAsync(id, ct);
-            if (commonsConfig is null || !commonsConfig.GuildAllowlist.Contains(guildId))
-                return Forbidden("That Discord guild is not in the Commons allowlist.");
+            if (!await bot.IsCommonsChannelAsync(id, guildId, channelId, ct))
+                return Forbidden("That Discord channel is outside Leaf Community scope.");
             try
             {
                 return Results.Ok(new
@@ -730,6 +765,53 @@ public static class DiscordEndpoints
             }
         });
 
+        group.MapPost("/bots/{id:guid}/guilds/{guildId}/categories", async (
+            Guid id,
+            string guildId,
+            DiscordGuildCategoryCreateRequest request,
+            HttpContext http,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+        {
+            var caller = ReadPrivateLeafAgentCaller(http);
+            if (caller is null)
+                return Forbidden("A signed private Nova Agent discussion is required.");
+            var config = await configurations.GetAsync(id, ct);
+            if (config is null) return Results.NotFound();
+            var agent = await agents.ResolveAsync(config.AgentId, ct);
+            if (!CanAddressBot(caller, config, agent?.Id.ToString()))
+                return Forbidden("This Agent cannot address that Discord bot.");
+            try
+            {
+                return Results.Ok(await bot.CreateGuildCategoryAsync(id, guildId, request, ct));
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = "invalid_discord_category_create", message = ex.Message });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = "discord_guild_not_found", message = ex.Message });
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                return Results.Json(new { error = "discord_category_create_forbidden", message = ex.Message },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+            catch (DiscordRestException ex)
+            {
+                return Results.Json(new { error = "discord_category_create_rejected", message = ex.Message },
+                    statusCode: (int)ex.StatusCode);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = "discord_category_create_unavailable", message = ex.Message },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        });
+
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/forums", async (
             Guid id,
             string guildId,
@@ -750,8 +832,9 @@ public static class DiscordEndpoints
             if (!CanAddressBot(caller, config, agent?.Id.ToString()))
                 return Forbidden("This Agent cannot address that Discord bot.");
             var commonsConfig = await commons.GetAsync(id, ct);
-            if (commonsConfig is null || !commonsConfig.GuildAllowlist.Contains(guildId))
-                return Forbidden("That Discord guild is not in the Commons allowlist.");
+            if (commonsConfig?.Scope(guildId) is not { } guildScope
+                || !guildScope.Contains(null, request.ParentCategoryId))
+                return Forbidden("That Discord category is outside Leaf Community scope.");
             try
             {
                 return Results.Ok(await bot.CreateGuildForumChannelAsync(
@@ -874,6 +957,7 @@ public static class DiscordEndpoints
             DiscordCommonsConfigurationStore commons,
             DiscordCommonsSecretInstaller installer,
             DiscordAgentResolver agents,
+            DiscordBotService bot,
             CancellationToken ct) =>
         {
             var caller = ReadPrivateLeafAgentCaller(http);
@@ -884,9 +968,8 @@ public static class DiscordEndpoints
             var agent = await agents.ResolveAsync(config.AgentId, ct);
             if (!CanAddressBot(caller, config, agent?.Id.ToString()))
                 return Forbidden("This Agent cannot address that Discord bot.");
-            var commonsConfig = await commons.GetAsync(id, ct);
-            if (commonsConfig is null || !commonsConfig.GuildAllowlist.Contains(guildId))
-                return Forbidden("That Discord guild is not in the Commons allowlist.");
+            if (!await bot.IsCommonsChannelAsync(id, guildId, channelId, ct))
+                return Forbidden("That Discord channel is outside Leaf Community scope.");
             try
             {
                 return Results.Ok(await installer.InstallAsync(id, channelId, request, ct));

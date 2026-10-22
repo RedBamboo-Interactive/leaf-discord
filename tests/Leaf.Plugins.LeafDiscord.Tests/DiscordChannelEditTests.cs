@@ -29,6 +29,19 @@ public sealed class DiscordChannelEditTests
     }
 
     [Fact]
+    public void Category_creation_payload_is_bounded_and_explicit()
+    {
+        var payload = DiscordChannelEdits.BuildCategoryCreatePayload(
+            new DiscordGuildCategoryCreateRequest("  Leaf Community  ", 3));
+
+        Assert.Equal("Leaf Community", payload["name"]!.GetValue<string>());
+        Assert.Equal(4, payload["type"]!.GetValue<int>());
+        Assert.Equal(3, payload["position"]!.GetValue<int>());
+        Assert.Throws<ArgumentException>(() => DiscordChannelEdits.BuildCategoryCreatePayload(
+            new DiscordGuildCategoryCreateRequest("valid", -1)));
+    }
+
+    [Fact]
     public void Invalid_text_channel_creation_fields_fail_closed()
     {
         Assert.Throws<ArgumentException>(() => DiscordChannelEdits.BuildTextChannelCreatePayload(
