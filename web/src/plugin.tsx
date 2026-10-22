@@ -30,6 +30,7 @@ import {
   type PublicNovaConversation,
   type PublicNovaThread,
 } from "./public-nova"
+import { DISCORD_PRODUCT_COPY } from "./discord-product"
 
 function PublicNovaOutcomeStatus({ block }: { block: MessageBlock }) {
   const line = publicNovaOutcomeLine(block)
@@ -40,7 +41,7 @@ function PublicNovaOutcomeStatus({ block }: { block: MessageBlock }) {
       ? { color: "var(--color-accent-gold)", icon: "ph-bold ph-shield-warning" }
       : { color: "var(--color-text-muted)", icon: "ph-bold ph-info" }
   return (
-    <div role="status" aria-label={`Public Agent ${line.outcome}`} className="mt-1">
+    <div role="status" aria-label={`Leaf Community reply ${line.outcome}`} className="mt-1">
       <ChatStatusLine color={appearance.color} icon={appearance.icon} label={line.label} />
     </div>
   )
@@ -125,7 +126,7 @@ export function Page() {
     )
     const publicResult = await fetch(publicThreadsRequestUrl(publicAgentId)).then(async (response) => {
         if (response.status === 404 || response.status === 403) return null
-        if (!response.ok) throw new Error(`Public Agent HTTP ${response.status}`)
+        if (!response.ok) throw new Error(`Leaf Community HTTP ${response.status}`)
         return await response.json() as { items: PublicNovaThread[] }
       }).catch(() => null)
     setBots(botResult.items)
@@ -276,7 +277,7 @@ export function Page() {
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-[14px] font-medium text-contrast">{selectedPublicThread.title}</span>
         <span className="truncate text-xs text-text-muted">
-          {selectedPublicThread.agentName} public / #{selectedPublicThread.channelName} / {selectedPublicThread.scenario}
+          {selectedPublicThread.agentName} · Leaf Community / #{selectedPublicThread.channelName} / {selectedPublicThread.scenario}
         </span>
       </div>
     </PanelHeader>
@@ -374,17 +375,20 @@ export function Page() {
       <div className="min-h-0 flex-1 overflow-hidden">
         <div className="h-full overflow-y-auto">
           {publicThreads && <section aria-label={publicAgentId
-            ? `${selectedBot?.config.agentName ?? "Agent"} public discussions`
-            : "All Agents public discussions"}>
-            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
-              {publicAgentId
-                ? `Public ${publicThreads[0]?.agentName ?? selectedBot?.config.agentName ?? "Agent"}`
-                : "Public"}
+            ? `${selectedBot?.config.agentName ?? "Agent"} Leaf Community discussions`
+            : "All Agents Leaf Community discussions"}>
+            <div className="px-4 pb-1 pt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                {DISCORD_PRODUCT_COPY.communityTitle}
+              </div>
+              <div className="mt-0.5 text-[11px] leading-tight text-text-disabled">
+                {DISCORD_PRODUCT_COPY.communitySubtitle}
+              </div>
             </div>
             <ItemList
               items={publicThreads}
               keyFn={(thread) => thread.threadRef}
-              emptyMessage="Public threads appear here after this Agent posts or is pinged."
+              emptyMessage={DISCORD_PRODUCT_COPY.communityEmpty}
               renderItem={(thread) => <ItemListRow
                 selected={thread.threadRef === selectedPublicRef}
                 onClick={() => selectPublicThread(thread.threadRef)}
@@ -397,8 +401,15 @@ export function Page() {
               />}
             />
           </section>}
-          <section aria-label="Agent Discord discussions">
-            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Agent conversations</div>
+          <section aria-label="Discord servers and messages">
+            <div className="px-4 pb-1 pt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                {DISCORD_PRODUCT_COPY.conversationsTitle}
+              </div>
+              <div className="mt-0.5 text-[11px] leading-tight text-text-disabled">
+                {DISCORD_PRODUCT_COPY.conversationsSubtitle}
+              </div>
+            </div>
             <ItemList
               items={visibleBindings}
               keyFn={(binding) => binding.entityId}

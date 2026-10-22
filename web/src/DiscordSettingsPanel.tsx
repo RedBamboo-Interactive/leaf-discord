@@ -26,6 +26,7 @@ import {
   type ProtectedValueProtection,
   type ProtectedValueVerification,
 } from "@redbamboo/ui"
+import { DISCORD_PRODUCT_COPY } from "./discord-product"
 
 const SETTINGS_BASE = "/api/extensions/leaf-discord"
 const APP_BASE = "/api/apps/leaf-discord"
@@ -195,7 +196,7 @@ export function DiscordSettingsPanel() {
   const presenceField = optionField("presence_context_mode")
   return <div>
     <div className="flex items-center justify-between gap-3">
-      <SectionHeader>Discord bots</SectionHeader>
+      <SectionHeader>Bots</SectionHeader>
       <Button size="sm" onClick={() => setAdding(true)}>
         <i className="ph-bold ph-plus text-xs" />
         Add bot
@@ -353,6 +354,23 @@ export function DiscordSettingsPanel() {
       }}
       onError={(message) => setError(message)}
     />
+
+    <section className="mt-6 border-t border-overlay-6 pt-5" aria-labelledby="leaf-community-settings-title">
+      <SectionHeader>
+        <span id="leaf-community-settings-title">{DISCORD_PRODUCT_COPY.communityTitle}</span>
+      </SectionHeader>
+      <p className="mb-3 text-xs leading-relaxed text-text-muted">
+        {DISCORD_PRODUCT_COPY.communitySubtitle}. It is managed separately because it uses the official Leaf server and needs no Discord bot setup.
+      </p>
+      <a
+        href={DISCORD_PRODUCT_COPY.communitySettingsHref}
+        className="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium text-contrast transition-colors hover:bg-overlay-5"
+      >
+        <i className="ph-bold ph-leaf text-sm" aria-hidden="true" />
+        Open Leaf Community settings
+        <i className="ph-bold ph-arrow-right text-xs" aria-hidden="true" />
+      </a>
+    </section>
   </div>
 }
 
