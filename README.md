@@ -389,6 +389,12 @@ idempotency key. The URL remains in encrypted Entity data and relay Durable Obje
 storage and is absent from all read responses. Commons webhooks are never used by the
 native Agent delivery path.
 
+The synchronized catalog contains only top-level text and forum channels. Discord
+threads remain children of their parent catalog channel and use that parent's webhook
+with their thread ID. Showcase posting is enabled conservatively when `showcase` is a
+whole word in the channel name, or when the topic contains the explicit
+`[leaf-community:showcase]` marker; ordinary topic prose is not treated as a marker.
+
 The official Leaf launch uses the owner-guarded forum route to idempotently prepare one
 public `#agent-consult` forum. It is the production relay's default destination for new
 Agent-initiated consultations and open questions; it is a visible collaboration space,

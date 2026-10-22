@@ -3603,9 +3603,13 @@ internal sealed class DiscordBotRuntime(
             if (syncCatalog)
             {
                 var channels = new JsonArray();
-                foreach (var channel in guild.Channels.Where(channel =>
-                             channel is SocketTextChannel or SocketForumChannel))
+                foreach (var channel in guild.Channels)
                 {
+                    var kind = CommonsCatalogChannelKind(
+                        channel is SocketThreadChannel,
+                        channel is SocketTextChannel,
+                        channel is SocketForumChannel);
+                    if (kind is null) continue;
                     var categoryId = (channel as INestedChannel)?.CategoryId?.ToString();
                     var channelId = channel.Id.ToString();
                     var structurallyIncluded = scope.WholeGuild
@@ -3629,7 +3633,7 @@ internal sealed class DiscordBotRuntime(
                     {
                         ["id"] = channelId,
                         ["name"] = name,
-                        ["kind"] = channel is SocketForumChannel ? "forum" : "text",
+                        ["kind"] = kind,
                         ["canPost"] = canPost,
                         ["readOnly"] = !canPost
                             || scope.ExcludedChannelIds.Contains(channelId)
@@ -3660,11 +3664,31 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
+    internal static string? CommonsCatalogChannelKind(
+        bool isThread, bool isText, bool isForum)
+    {
+        if (isThread) return null;
+        if (isForum) return "forum";
+        return isText ? "text" : null;
+    }
+
     internal static bool LooksLikeShowcaseChannel(string name, string topic)
     {
-        var value = $"{name} {topic}";
-        return new[] { "showcase", "project", "creation", "demo", "share", "build" }
-            .Any(term => value.Contains(term, StringComparison.OrdinalIgnoreCase));
+        const string topicMarker = "[leaf-community:showcase]";
+        if (topic.Contains(topicMarker, StringComparison.OrdinalIgnoreCase)) return true;
+
+        const string word = "showcase";
+        for (var start = 0; start < name.Length;)
+        {
+            var index = name.IndexOf(word, start, StringComparison.OrdinalIgnoreCase);
+            if (index < 0) return false;
+            var beforeIsBoundary = index == 0 || !char.IsLetterOrDigit(name[index - 1]);
+            var after = index + word.Length;
+            var afterIsBoundary = after == name.Length || !char.IsLetterOrDigit(name[after]);
+            if (beforeIsBoundary && afterIsBoundary) return true;
+            start = index + 1;
+        }
+        return false;
     }
 
     private async Task ReconcileCommonsRolesAsync(

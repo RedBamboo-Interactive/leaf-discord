@@ -265,13 +265,27 @@ public sealed class DiscordCommonsTests
 
     [Theory]
     [InlineData("project-showcase", "", true)]
-    [InlineData("general", "Share your builds here", true)]
-    [InlineData("general", "General conversation", false)]
+    [InlineData("showcases", "", false)]
+    [InlineData("feedback", "Share projects, builds, creations, and demos here", false)]
+    [InlineData("general", "Share your builds here", false)]
+    [InlineData("general", "General conversation [leaf-community:showcase]", true)]
+    [InlineData("general", "[LEAF-COMMUNITY:SHOWCASE]", true)]
     [InlineData("agent-consult", "Public Agent consultations", false)]
-    public void Showcase_defaults_are_conservative_and_purpose_based(
+    public void Showcase_defaults_require_a_name_word_or_explicit_topic_marker(
         string name, string topic, bool expected)
         => Assert.Equal(expected,
             DiscordBotRuntime.LooksLikeShowcaseChannel(name, topic));
+
+    [Theory]
+    [InlineData(false, true, false, "text")]
+    [InlineData(false, false, true, "forum")]
+    [InlineData(false, false, false, null)]
+    [InlineData(true, true, false, null)]
+    [InlineData(true, false, true, null)]
+    public void Catalog_contains_only_top_level_text_and_forum_channels(
+        bool isThread, bool isText, bool isForum, string? expected)
+        => Assert.Equal(expected,
+            DiscordBotRuntime.CommonsCatalogChannelKind(isThread, isText, isForum));
 
     [Theory]
     [InlineData("général", "general")]
