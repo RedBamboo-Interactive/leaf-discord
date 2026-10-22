@@ -96,7 +96,8 @@ public sealed partial class DiscordEgressGuard
     [GeneratedRegex(@"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b")]
     private static partial Regex JwtPattern();
 
-    [GeneratedRegex(@"(?i)(?:[A-Z]:\\(?:Users|Projects|Workspaces|ProgramData|Windows)\\[^\s<>]+|/(?:home|Users|etc|var|root)/[^\s<>]+)")]
+    // Windows accepts either separator, and Agents often write forward slashes.
+    [GeneratedRegex(@"(?i)(?:[A-Z]:[\\/](?:Users|Projects|Workspaces|ProgramData|Windows)[\\/][^\s<>]+|/(?:home|Users|etc|var|root)/[^\s<>]+)")]
     private static partial Regex PrivatePathPattern();
 
     [GeneratedRegex(@"(?i)\b(REDLEAF_EXECUTION_TOKEN|parentExecutionId|beneficiaryId|executionId)\b\s*[:=]\s*[^\s,;]+")]

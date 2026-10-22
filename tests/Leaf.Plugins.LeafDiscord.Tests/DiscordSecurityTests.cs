@@ -53,6 +53,19 @@ public sealed class DiscordSecurityTests
         Assert.Contains("mass-mention", result.Findings);
     }
 
+    [Theory]
+    [InlineData("Source is at T:/Projects/leaf-discord. Let me check.", "T:/Projects")]
+    [InlineData("Memory in L:/Workspaces/Nova/memory/index.md", "L:/Workspaces")]
+    [InlineData("Logs under c:/users/example/AppData", "c:/users")]
+    public void Egress_redacts_forward_slash_windows_paths(string content, string leaked)
+    {
+        var result = new DiscordEgressGuard().Inspect(content);
+
+        Assert.True(result.Allowed);
+        Assert.DoesNotContain(leaked, result.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("private-path", result.Findings);
+    }
+
     [Fact]
     public void Discord_chunks_never_exceed_the_transport_limit()
     {
