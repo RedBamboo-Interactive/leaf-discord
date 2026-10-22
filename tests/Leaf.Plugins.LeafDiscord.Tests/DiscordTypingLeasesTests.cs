@@ -127,6 +127,42 @@ public sealed class DiscordTypingLeasesTests
     }
 
     [Fact]
+    public async Task Deferred_selective_turn_starts_typing_after_grace_period()
+    {
+        using var leases = new DiscordTypingLeases(TimeSpan.FromMinutes(1));
+        var createCount = 0;
+        var admission = leases.Begin("binding", () =>
+        {
+            Interlocked.Increment(ref createCount);
+            return new FakeIndicator();
+        }, startImmediately: false);
+        leases.ActivateAfter(admission, TimeSpan.FromMilliseconds(10));
+        await WaitUntilAsync(() => Volatile.Read(ref createCount) == 1);
+
+        Assert.Equal(1, createCount);
+    }
+
+    [Fact]
+    public async Task Deferred_no_reply_cancels_scheduled_typing_before_it_appears()
+    {
+        using var leases = new DiscordTypingLeases(TimeSpan.FromMinutes(1));
+        var createCount = 0;
+        var admission = leases.Begin("binding", () =>
+        {
+            Interlocked.Increment(ref createCount);
+            return new FakeIndicator();
+        }, startImmediately: false);
+        leases.MarkAdmitted(admission, "turn-1");
+        leases.ActivateAfter(admission, TimeSpan.FromMilliseconds(30));
+
+        leases.CompleteQuiescent(
+            Assert.IsType<DiscordTypingSnapshot>(leases.Capture("binding")));
+        await Task.Delay(80);
+
+        Assert.Equal(0, createCount);
+    }
+
+    [Fact]
     public void Refresh_restarts_a_visible_indicator_without_ending_the_lease()
     {
         using var leases = new DiscordTypingLeases(TimeSpan.FromMinutes(1));
@@ -170,5 +206,13 @@ public sealed class DiscordTypingLeasesTests
     {
         public int DisposeCount { get; private set; }
         public void Dispose() => DisposeCount++;
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+        while (!condition() && DateTimeOffset.UtcNow < deadline)
+            await Task.Delay(10);
+        Assert.True(condition());
     }
 }

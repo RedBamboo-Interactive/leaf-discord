@@ -61,6 +61,18 @@
   },
   {
     "typeSlug": "entity-type",
+    "slug": "leaf-discord-gateway-inbox",
+    "name": "Discord Gateway Inbox Item",
+    "data": {
+      "icon": "ph-bold ph-tray-arrow-down",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "Durable hand-off from the Discord gateway callback to ordered background processing"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
     "slug": "leaf-discord-reply-subscription",
     "name": "Discord Reply Callback",
     "data": {

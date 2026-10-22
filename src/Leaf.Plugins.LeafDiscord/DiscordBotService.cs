@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -85,6 +87,7 @@ public sealed class DiscordBotService(
     DiscordOwnerPresencePublisher ownerPresence,
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
+    DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
     IAssets assets,
     ILoggerFactory loggerFactory,
@@ -527,6 +530,7 @@ public sealed class DiscordBotService(
             ownerPresence,
             commons,
             commonsConfigurations,
+            gatewayInbox,
             replyNotifier,
             assets,
             loggerFactory.CreateLogger<DiscordBotRuntime>(),
@@ -593,6 +597,7 @@ internal sealed class DiscordBotRuntime(
     DiscordOwnerPresencePublisher ownerPresence,
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
+    DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
     IAssets assets,
     ILogger logger,
@@ -602,6 +607,7 @@ internal sealed class DiscordBotRuntime(
     private static readonly TimeSpan UserProfileCacheTtl = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MaintenanceRecoveryInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MaintenanceFailureBackoff = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan SelectiveTypingDelay = TimeSpan.FromSeconds(2);
     private const int GuildStartupBackfillLimit = 25;
     private const int DmStartupBackfillLimit = 50;
     private static readonly TimeSpan GuildStartupBackfillMaxAge = TimeSpan.FromMinutes(15);
@@ -625,6 +631,7 @@ internal sealed class DiscordBotRuntime(
     private string? maintenanceApplicationId;
     private CancellationTokenSource? runCts;
     private Task? outboxLoop;
+    private Task? gatewayInboxLoop;
     private Task? presenceLoop;
     private Task? commonsRoleLoop;
     private string state = "stopped";
@@ -1626,6 +1633,9 @@ internal sealed class DiscordBotRuntime(
             conversations.Reconciled += conversationReconciledHandler;
             runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
             outboxLoop = RunOutboxLoopAsync(runCts.Token);
+            gatewayInboxLoop = Task.Run(
+                () => RunGatewayInboxLoopAsync(next, runCts.Token),
+                CancellationToken.None);
             presenceLoop = RunPresenceLoopAsync(next, runCts.Token);
             commonsRoleLoop = RunCommonsRoleLoopAsync(next, runCts.Token);
             await OnReadyAsync(next);
@@ -1790,6 +1800,7 @@ internal sealed class DiscordBotRuntime(
             // A loop that already faulted must not keep the runtime from stopping, or the
             // fault would block every restart that could recover it.
             await ObserveBackgroundLoopAsync(outboxLoop, "outbox");
+            await ObserveBackgroundLoopAsync(gatewayInboxLoop, "gateway inbox");
             await ObserveBackgroundLoopAsync(presenceLoop, "presence");
             await ObserveBackgroundLoopAsync(commonsRoleLoop, "Public Agent role reconciliation");
             if (client is not null)
@@ -1800,6 +1811,7 @@ internal sealed class DiscordBotRuntime(
             runCts?.Dispose();
             runCts = null;
             outboxLoop = null;
+            gatewayInboxLoop = null;
             presenceLoop = null;
             commonsRoleLoop = null;
             connectedAt = null;
@@ -2096,7 +2108,25 @@ internal sealed class DiscordBotRuntime(
 
     private Task OnMessageAsync(SocketMessage raw)
     {
-        return raw is IUserMessage message ? ProcessMessageAsync(message) : Task.CompletedTask;
+        return raw is IUserMessage message
+            ? EnqueueGatewayMessageAsync(message)
+            : Task.CompletedTask;
+    }
+
+    private async Task EnqueueGatewayMessageAsync(IUserMessage message)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id.ToString();
+        await gatewayInbox.EnqueueAsync(
+            configId,
+            message.Id.ToString(),
+            message.Channel.Id.ToString(),
+            guildId);
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        if (elapsed >= TimeSpan.FromSeconds(1))
+            logger.LogWarning(
+                "Discord gateway inbox enqueue for message {MessageId} took {ElapsedMs} ms",
+                message.Id, elapsed.TotalMilliseconds);
     }
 
     private async Task ProcessMessageAsync(IUserMessage message)
@@ -2134,18 +2164,23 @@ internal sealed class DiscordBotRuntime(
             return;
         }
 
+        var startTypingImmediately = ShouldStartTypingImmediately(
+            binding.Kind, behavior.ResponseMode, mentioned, repliesToBot);
         var typingAdmission = typing.Begin(
             binding.BindingId,
             () => message.Channel.EnterTypingState(),
-            ShouldStartTypingImmediately(
-                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot));
+            startTypingImmediately);
+        if (!startTypingImmediately)
+            typing.ActivateAfter(typingAdmission, SelectiveTypingDelay);
         try
         {
+            var attachmentStarted = Stopwatch.GetTimestamp();
             var submittedAttachments = await attachmentIngestor.IngestAsync(
                 config, message.Id.ToString(), message.Attachments.Select(attachment =>
                     new DiscordAttachmentSource(
                         attachment.Id.ToString(), attachment.Filename, attachment.ContentType,
                         attachment.Size, attachment.Url)).ToArray());
+            LogSlowMessageStep(message.Id, "attachment ingest", attachmentStarted);
             var attachmentLines = submittedAttachments.Select(attachment =>
                 $"[Discord attachment: {attachment.Name}, {attachment.MediaType}, {attachment.Size} bytes, sha256 {attachment.Sha256}, quarantined asset {attachment.ScopeToken}]");
             var content = string.Join('\n', new[] { message.Content }.Concat(attachmentLines)).Trim();
@@ -2155,11 +2190,13 @@ internal sealed class DiscordBotRuntime(
                 return;
             }
             var guildContext = BuildGuildContext(message, config);
+            var submitStarted = Stopwatch.GetTimestamp();
             var admission = await conversations.SubmitAsync(binding, message.Id.ToString(),
                 new ExternalRequestor(message.Author.Id.ToString(),
                     message.Author.GlobalName ?? message.Author.Username, message.Author.Username),
                 content, submittedAttachments, guildContext: guildContext,
                 behaviorContext: behavior.ToTrustedMetadata());
+            LogSlowMessageStep(message.Id, "Agent session admission", submitStarted);
             if (admission is null)
                 typing.Cancel(typingAdmission);
             else
@@ -2194,6 +2231,92 @@ internal sealed class DiscordBotRuntime(
                     "Discord failure notice could not be queued for message {MessageId}", message.Id);
             }
         }
+    }
+
+    private void LogSlowMessageStep(ulong messageId, string step, long started)
+    {
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        if (elapsed >= TimeSpan.FromMilliseconds(500))
+            logger.LogInformation(
+                "Discord background processing step {Step} for message {MessageId} took {ElapsedMs} ms",
+                step, messageId, elapsed.TotalMilliseconds);
+    }
+
+    private async Task RunGatewayInboxLoopAsync(
+        DiscordSocketClient source, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var pending = await gatewayInbox.PendingAsync(configId, ct);
+            var due = DiscordGatewayInboxStore.DueChannelHeads(
+                pending, DateTimeOffset.UtcNow);
+            if (due.Count == 0)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), ct);
+                continue;
+            }
+
+            foreach (var item in due)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    await ProcessGatewayInboxItemAsync(source, item, ct);
+                    await gatewayInbox.MarkCompletedAsync(item, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (HttpException ex) when (ex.HttpCode == HttpStatusCode.NotFound)
+                {
+                    // A message deleted before the worker refetched it cannot ever be
+                    // admitted. Retrying it would permanently block later messages in
+                    // this binding, so settle the durable coordinate as gone.
+                    await gatewayInbox.MarkCompletedAsync(item, ct);
+                    logger.LogInformation(
+                        "Discord gateway inbox message {MessageId} disappeared before processing",
+                        item.MessageId);
+                }
+                catch (Exception ex)
+                {
+                    var safeError = ex.GetType().Name;
+                    await gatewayInbox.MarkRetryAsync(
+                        item,
+                        safeError,
+                        DiscordGatewayInboxStore.RetryDelay(item.Attempts),
+                        ct);
+                    logger.LogWarning(ex,
+                        "Discord gateway inbox message {MessageId} will be retried",
+                        item.MessageId);
+                }
+            }
+        }
+    }
+
+    private async Task ProcessGatewayInboxItemAsync(
+        DiscordSocketClient source,
+        DiscordGatewayInboxItem item,
+        CancellationToken ct)
+    {
+        if (!ulong.TryParse(item.ChannelId, out var channelId)
+            || !ulong.TryParse(item.MessageId, out var messageId))
+            return;
+        var options = new RequestOptions { CancelToken = ct };
+        var channel = source.GetChannel(channelId) as IMessageChannel
+            ?? await source.GetChannelAsync(channelId, options) as IMessageChannel;
+        if (channel is null) return;
+        var message = await channel.GetMessageAsync(
+            messageId, CacheMode.AllowDownload, options) as IUserMessage;
+        if (message is null) return;
+
+        var started = Stopwatch.GetTimestamp();
+        await ProcessMessageAsync(message);
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        if (elapsed >= TimeSpan.FromSeconds(3))
+            logger.LogInformation(
+                "Discord background processing for message {MessageId} completed in {ElapsedMs} ms",
+                item.MessageId, elapsed.TotalMilliseconds);
     }
 
     private async Task ForwardCommonsMessageAsync(IUserMessage message)

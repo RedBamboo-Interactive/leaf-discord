@@ -88,6 +88,54 @@ public sealed class DiscordTypingLeases : IDisposable
     }
 
     /// <summary>
+    /// Shows typing for a deferred selective turn only if that exact admission is
+    /// still running after the grace period. Fast no-reply turns settle and cancel
+    /// the lease before the delay, so they never flash an indicator.
+    /// </summary>
+    internal void ActivateAfter(
+        DiscordTypingAdmission admission,
+        TimeSpan delay)
+    {
+        if (delay < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(delay));
+        Lease? expected;
+        CancellationToken ct;
+        lock (gate)
+        {
+            if (!leases.TryGetValue(admission.BindingId, out expected)
+                || !expected.Admissions.ContainsKey(admission.Sequence))
+                return;
+            ct = expected.Timeout.Token;
+        }
+
+        _ = ActivateAfterAsync(admission, expected, delay, ct);
+    }
+
+    private async Task ActivateAfterAsync(
+        DiscordTypingAdmission admission,
+        Lease expected,
+        TimeSpan delay,
+        CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(delay, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return;
+        }
+
+        lock (gate)
+        {
+            if (!leases.TryGetValue(admission.BindingId, out var current)
+                || !ReferenceEquals(current, expected)
+                || !current.Admissions.ContainsKey(admission.Sequence))
+                return;
+            Activate(current);
+        }
+    }
+
+    /// <summary>
     /// Restart a visible indicator so Discord shows it immediately again. Posting a
     /// message clears the author's typing state client-side, and the indicator only
     /// re-triggers periodically. Does nothing when no indicator is showing.
