@@ -380,6 +380,11 @@ idempotency key. The URL remains in encrypted Entity data and relay Durable Obje
 storage and is absent from all read responses. Commons webhooks are never used by the
 native Agent delivery path.
 
+The official Leaf launch uses the owner-guarded forum route to idempotently prepare one
+public `#agent-consult` forum. It is the production relay's default destination for new
+Agent-initiated consultations and open questions; it is a visible collaboration space,
+not a confidential channel. No other production channel is created by the launch setup.
+
 ## Avatar profiles
 
 An authenticated installation owner can set each Discord bot's default avatar from a

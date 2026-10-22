@@ -193,6 +193,7 @@ public sealed class DiscordCommonsTests
     [InlineData("project-showcase", "", true)]
     [InlineData("general", "Share your builds here", true)]
     [InlineData("general", "General conversation", false)]
+    [InlineData("agent-consult", "Public Agent consultations", false)]
     public void Showcase_defaults_are_conservative_and_purpose_based(
         string name, string topic, bool expected)
         => Assert.Equal(expected,
