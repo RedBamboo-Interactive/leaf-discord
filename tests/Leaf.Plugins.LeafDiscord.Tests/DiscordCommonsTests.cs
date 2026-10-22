@@ -23,25 +23,25 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
-    public void Lab_whole_guild_is_silent_but_production_is_silent_only_in_its_category()
+    public void Lab_is_silent_but_production_participant_keeps_native_bindings_outside_exclusions()
     {
         var lab = new DiscordCommonsGuildScope(
             LabGuildId, true, new HashSet<string>(), new HashSet<string>(),
+            new HashSet<string>(), DiscordCommonsNativeAgentModes.SilentHost,
             "https://lab.example.test", "lab-host");
         var production = new DiscordCommonsGuildScope(
-            "400000000000000004", false,
-            new HashSet<string>(["500000000000000005"]),
+            "400000000000000004", true,
+            new HashSet<string>(), new HashSet<string>(),
             new HashSet<string>(["700000000000000007"]),
+            DiscordCommonsNativeAgentModes.Participant,
             "https://relay.example.test", "production-host");
 
         Assert.False(DiscordCommonsRelayService.ShouldReachNativeAgent(
             lab, "any-channel", null));
-        Assert.False(DiscordCommonsRelayService.ShouldReachNativeAgent(
-            production, "600000000000000006", "500000000000000005"));
-        Assert.False(DiscordCommonsRelayService.ShouldReachNativeAgent(
-            production, "700000000000000007", null));
         Assert.True(DiscordCommonsRelayService.ShouldReachNativeAgent(
-            production, "800000000000000008", "900000000000000009"));
+            production, "600000000000000006", "500000000000000005"));
+        Assert.True(DiscordCommonsRelayService.ShouldReachNativeAgent(
+            production, "700000000000000007", null));
         Assert.True(DiscordCommonsRelayService.ShouldReachNativeAgent(
             null, "800000000000000008", null));
     }
@@ -113,14 +113,17 @@ public sealed class DiscordCommonsTests
                     LabGuildId, true, [], [], "https://lab.example.test", "lab-secret"),
                 new DiscordCommonsGuildScopeUpdate(
                     "400000000000000004", false, ["500000000000000005"], [],
-                    "https://relay.example.test", "production-secret"),
+                    "https://relay.example.test", "production-secret", false,
+                    ["700000000000000007"], DiscordCommonsNativeAgentModes.Participant),
             ]));
 
         Assert.Equal("https://lab.example.test", saved.Scope(LabGuildId)!.RelayUrl);
         Assert.True(saved.Scope(LabGuildId)!.Contains("anything", null));
         var production = saved.Scope("400000000000000004")!;
         Assert.True(production.Contains("600000000000000006", "500000000000000005"));
+        Assert.False(production.Contains("700000000000000007", "500000000000000005"));
         Assert.False(production.Contains("600000000000000006", "700000000000000007"));
+        Assert.Equal(DiscordCommonsNativeAgentModes.Participant, production.NativeAgentMode);
         var view = JsonSerializer.Serialize(DiscordCommonsConfigurationStore.View(saved));
         Assert.DoesNotContain("lab-secret", view, StringComparison.Ordinal);
         Assert.DoesNotContain("production-secret", view, StringComparison.Ordinal);
@@ -132,11 +135,68 @@ public sealed class DiscordCommonsTests
                     new DiscordCommonsGuildScopeUpdate(
                         scope.GuildId, scope.WholeGuild,
                         scope.CategoryIds.ToArray(), scope.ChannelIds.ToArray(),
-                        scope.RelayUrl, null)).ToArray()));
+                        scope.RelayUrl, null, false,
+                        scope.ExcludedChannelIds.ToArray(), scope.NativeAgentMode)).ToArray()));
         Assert.Equal("lab-secret", preserved.Scope(LabGuildId)!.HostCredential);
         Assert.Equal("production-secret",
             preserved.Scope("400000000000000004")!.HostCredential);
     }
+
+    [Fact]
+    public async Task Production_whole_guild_participant_scope_persists_read_only_exclusions()
+    {
+        var configurations = new DiscordCommonsConfigurationStore(new MemoryEntityStore());
+        var botId = Guid.NewGuid();
+        var saved = await configurations.SaveAsync(botId,
+            new DiscordCommonsConfigurationUpdate("", null, false, null,
+            [
+                new DiscordCommonsGuildScopeUpdate(
+                    "400000000000000004", true, [], [],
+                    "https://relay.example.test", "production-secret", false,
+                    ["700000000000000007"], DiscordCommonsNativeAgentModes.Participant),
+            ]));
+
+        var scope = saved.Scope("400000000000000004")!;
+        Assert.True(scope.WholeGuild);
+        Assert.False(scope.Contains("700000000000000007", null));
+        Assert.True(scope.Contains("800000000000000008", null));
+        Assert.False(scope.SuppressesNativeAgent);
+        var view = DiscordCommonsConfigurationStore.View(saved).GuildScopes.Single();
+        Assert.Equal(["700000000000000007"], view.ExcludedChannelIds);
+        Assert.Equal(DiscordCommonsNativeAgentModes.Participant, view.NativeAgentMode);
+    }
+
+    [Fact]
+    public async Task Host_turn_context_is_durable_until_authorized_reply_is_reported()
+    {
+        var store = new MemoryEntityStore();
+        var turns = new DiscordCommonsHostTurnStore(store);
+        var bindingStore = new DiscordBindingStore(store);
+        var binding = await bindingStore.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "200000000000000002", "guild_channel",
+            "400000000000000004", null, "agent-1", "owner-1", "public",
+            "participate", "general", "Leaf", null));
+        var message = new DiscordCommonsHostMessage(
+            "message-1", "envoy-1", "Atlas · Alice", "Hello Nova", "message:1",
+            "channel_reply", "general", "200000000000000002");
+
+        var pending = await turns.SetPendingAsync(
+            binding, "200000000000000002", "general", message, "host:app");
+        Assert.Equal("pending", (await turns.GetPendingAsync(binding))!.State);
+        await turns.CompleteAsync(pending, "authorized");
+        Assert.Equal("authorized", (await turns.GetPendingAsync(binding))!.State);
+        await turns.CompleteAsync(pending, "posted");
+        Assert.Null(await turns.GetPendingAsync(binding));
+    }
+
+    [Theory]
+    [InlineData("project-showcase", "", true)]
+    [InlineData("general", "Share your builds here", true)]
+    [InlineData("general", "General conversation", false)]
+    public void Showcase_defaults_are_conservative_and_purpose_based(
+        string name, string topic, bool expected)
+        => Assert.Equal(expected,
+            DiscordBotRuntime.LooksLikeShowcaseChannel(name, topic));
 
     [Theory]
     [InlineData("général", "general")]
@@ -151,13 +211,15 @@ public sealed class DiscordCommonsTests
     {
         var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(
             "message-1", "human-1", "Lynial", "hello", [],
-            ["900000000000000009"], "nova-consult", "thread-1",
+            ["900000000000000009"], "700000000000000007", "nova-consult", "thread-1",
             "800000000000000008", 1234);
 
         Assert.Equal("800000000000000008",
             payload["referencedMessageId"]!.GetValue<string>());
         Assert.Equal("900000000000000009",
             payload["mentionRoles"]![0]!.GetValue<string>());
+        Assert.Equal("700000000000000007",
+            payload["channelId"]!.GetValue<string>());
         Assert.False(payload["opensFloor"]!.GetValue<bool>());
     }
 
@@ -166,7 +228,7 @@ public sealed class DiscordCommonsTests
     {
         var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(
             "announcement-1", "human-1", "Lynial", "Nova Lynial ships this",
-            ["user-mention"], ["role-mention"], "announcements", "announcements",
+            ["user-mention"], ["role-mention"], "700000000000000007", "announcements", "announcements",
             "envoy-message", 1234);
 
         Assert.Empty(payload["mentions"]!.AsArray());

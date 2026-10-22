@@ -37,7 +37,7 @@
   { "parentType": "leaf-discord-commons-config", "slug": "host-credential", "name": "Relay Host Credential", "fieldType": "secret", "sortOrder": 2, "description": "Encrypted by RedLeaf and never returned by plugin APIs" },
   { "parentType": "leaf-discord-commons-config", "slug": "guild-allowlist", "name": "Leaf Community Guild Allowlist", "fieldType": "json", "sortOrder": 3 },
   { "parentType": "leaf-discord-commons-config", "slug": "webhook-urls", "name": "Managed Webhook URLs", "fieldType": "secret", "sortOrder": 4, "description": "Encrypted JSON map, never returned by plugin APIs" },
-  { "parentType": "leaf-discord-commons-config", "slug": "guild-scopes", "name": "Leaf Community Guild Scopes", "fieldType": "json", "sortOrder": 5, "description": "Per-guild whole-server, category, and channel scope" },
+  { "parentType": "leaf-discord-commons-config", "slug": "guild-scopes", "name": "Leaf Community Guild Scopes", "fieldType": "json", "sortOrder": 5, "description": "Per-guild whole-server/category/channel scope, exclusions, and native host mode" },
   { "parentType": "leaf-discord-commons-config", "slug": "relay-targets", "name": "Leaf Community Relay Targets", "fieldType": "secret", "sortOrder": 6, "description": "Encrypted per-guild relay URLs and host credentials; never returned by plugin APIs" },
 
   { "parentType": "leaf-discord-commons-ingest", "slug": "bot_id", "name": "Discord Bot", "fieldType": "entity_ref", "sortOrder": 0, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-bot\u0022}" },
@@ -47,6 +47,18 @@
   { "parentType": "leaf-discord-commons-ingest", "slug": "attempts", "name": "Attempts", "fieldType": "number", "sortOrder": 4, "defaultValue": "0" },
   { "parentType": "leaf-discord-commons-ingest", "slug": "next_attempt_at", "name": "Next Attempt", "fieldType": "string", "sortOrder": 5 },
   { "parentType": "leaf-discord-commons-ingest", "slug": "last_error", "name": "Last Error", "fieldType": "string", "sortOrder": 6 },
+
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "binding_id", "name": "Binding ID", "fieldType": "string", "sortOrder": 0 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "generation", "name": "Generation", "fieldType": "number", "sortOrder": 1 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "guild_id", "name": "Guild ID", "fieldType": "string", "sortOrder": 2 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "channel_id", "name": "Channel ID", "fieldType": "string", "sortOrder": 3 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "channel", "name": "Channel", "fieldType": "string", "sortOrder": 4 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "thread_ref", "name": "Relay Thread", "fieldType": "string", "sortOrder": 5 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "source_message_id", "name": "Source Message", "fieldType": "string", "sortOrder": 6 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "source_envoy_id", "name": "Source Agent", "fieldType": "string", "sortOrder": 7 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "source_persona_name", "name": "Source Persona", "fieldType": "string", "sortOrder": 8 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "participant_id", "name": "Host Participant", "fieldType": "string", "sortOrder": 9 },
+  { "parentType": "leaf-discord-commons-host-turn", "slug": "state", "name": "State", "fieldType": "string", "sortOrder": 10 },
 
   { "parentType": "leaf-discord-gateway-inbox", "slug": "bot_id", "name": "Discord Bot", "fieldType": "entity_ref", "sortOrder": 0, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-bot\u0022}" },
   { "parentType": "leaf-discord-gateway-inbox", "slug": "message_id", "name": "Discord Message ID", "fieldType": "string", "sortOrder": 1 },

@@ -95,6 +95,7 @@ public sealed class DiscordBotService(
     DiscordOwnerPresencePublisher ownerPresence,
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
+    DiscordCommonsHostTurnStore commonsHostTurns,
     DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
     IAssets assets,
@@ -469,7 +470,7 @@ public sealed class DiscordBotService(
             ? current
             : throw new InvalidOperationException("Discord bot is not running.");
         var channel = runtime.ResolveGuildChannel(guildId, channelId);
-        if (await runtime.IsCommonsChannelAsync(guildId, channelId, ct))
+        if (await runtime.IsNativeSuppressedAsync(guildId, channelId, ct))
             throw new UnauthorizedAccessException(
                 "Native Agent bindings are disabled in Leaf Community channels.");
         var behavior = await behaviors.ResolveAsync(
@@ -574,6 +575,7 @@ public sealed class DiscordBotService(
             ownerPresence,
             commons,
             commonsConfigurations,
+            commonsHostTurns,
             gatewayInbox,
             replyNotifier,
             assets,
@@ -641,6 +643,7 @@ internal sealed class DiscordBotRuntime(
     DiscordOwnerPresencePublisher ownerPresence,
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
+    DiscordCommonsHostTurnStore commonsHostTurns,
     DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
     IAssets assets,
@@ -662,6 +665,7 @@ internal sealed class DiscordBotRuntime(
     private readonly ConcurrentDictionary<string, SemaphoreSlim> forumPostGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelEditGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelCreateGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> settledPeerTurns = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<ulong, CachedUserProfile> userProfiles = new();
     private readonly DiscordOwnerDirectMessenger ownerDirectMessages =
         new(bindings, behaviors, deliveries, conversations, rest, assets);
@@ -678,6 +682,7 @@ internal sealed class DiscordBotRuntime(
     private Task? gatewayInboxLoop;
     private Task? presenceLoop;
     private Task? commonsRoleLoop;
+    private Task? commonsWebhookLoop;
     private string state = "stopped";
     private DateTimeOffset? connectedAt;
     private string? lastError;
@@ -791,8 +796,7 @@ internal sealed class DiscordBotRuntime(
             throw new InvalidOperationException("Discord bridge is not connected.");
         var config = await GetConfigAsync(ct);
         var forum = ResolveWritableForum(activeClient, guildId, forumId);
-        if (await commons.IsCommonsLocationAsync(
-                configId, guildId, forum.Id.ToString(), forum.CategoryId?.ToString(), ct))
+        if (await IsNativeSuppressedAsync(guildId, forum.Id.ToString(), ct))
             throw new UnauthorizedAccessException(
                 "Native Agent forum posts are disabled in Leaf Community channels.");
         var gateKey = $"{config.ApplicationId}:{guildId}:{forumId}:{idempotencyKey}";
@@ -1131,6 +1135,22 @@ internal sealed class DiscordBotRuntime(
         return location is not null && await commons.IsCommonsLocationAsync(
             configId, location.Value.GuildId, location.Value.ChannelId,
             location.Value.CategoryId, ct);
+    }
+
+    internal async Task<bool> IsNativeSuppressedAsync(
+        string guildId, string channelId, CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId)
+            || !ulong.TryParse(channelId, out var parsedChannelId))
+            return false;
+        var channel = client?.GetGuild(parsedGuildId)?.GetChannel(parsedChannelId);
+        var location = channel is null ? null : CommonsLocation(channel);
+        var scope = location is null
+            ? null
+            : await commons.GetScopeAsync(configId, location.Value.GuildId, ct);
+        return scope is not null
+            && scope.Contains(location!.Value.ChannelId, location.Value.CategoryId)
+            && scope.SuppressesNativeAgent;
     }
 
     private static string EditableChannelKind(SocketGuildChannel channel)
@@ -1759,7 +1779,10 @@ internal sealed class DiscordBotRuntime(
             {
                 if (string.Equals(binding.ApplicationId, maintenanceApplicationId,
                         StringComparison.Ordinal))
+                {
+                    settledPeerTurns[binding.BindingId] = 0;
                     maintenance.RequestDrain(binding.BindingId);
+                }
             };
             conversations.Reconciled += conversationReconciledHandler;
             runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
@@ -1769,6 +1792,7 @@ internal sealed class DiscordBotRuntime(
                 CancellationToken.None);
             presenceLoop = RunPresenceLoopAsync(next, runCts.Token);
             commonsRoleLoop = RunCommonsRoleLoopAsync(next, runCts.Token);
+            commonsWebhookLoop = RunCommonsWebhookLoopAsync(next, runCts.Token);
             await OnReadyAsync(next);
         }
         catch (Exception ex)
@@ -1934,6 +1958,7 @@ internal sealed class DiscordBotRuntime(
             await ObserveBackgroundLoopAsync(gatewayInboxLoop, "gateway inbox");
             await ObserveBackgroundLoopAsync(presenceLoop, "presence");
             await ObserveBackgroundLoopAsync(commonsRoleLoop, "Public Agent role reconciliation");
+            await ObserveBackgroundLoopAsync(commonsWebhookLoop, "Leaf Community lazy webhooks");
             if (client is not null)
             {
                 await DisposeClientAsync(client);
@@ -1945,6 +1970,7 @@ internal sealed class DiscordBotRuntime(
             gatewayInboxLoop = null;
             presenceLoop = null;
             commonsRoleLoop = null;
+            commonsWebhookLoop = null;
             connectedAt = null;
             state = "stopped";
         }
@@ -2263,14 +2289,24 @@ internal sealed class DiscordBotRuntime(
     private async Task ProcessMessageAsync(IUserMessage message)
     {
         var commonsLocation = CommonsLocation(message.Channel);
-        if (commonsLocation is not null && await commons.IsCommonsLocationAsync(
-                configId,
-                commonsLocation.Value.GuildId,
-                commonsLocation.Value.ChannelId,
-                commonsLocation.Value.CategoryId))
+        var commonsScope = commonsLocation is null
+            ? null
+            : await commons.GetScopeAsync(configId, commonsLocation.Value.GuildId);
+        var inCommonsTransport = commonsLocation is not null
+            && commonsScope is not null
+            && commonsScope.Contains(
+                commonsLocation.Value.ChannelId, commonsLocation.Value.CategoryId)
+            && CanPostInCommonsLocation(message.Channel);
+        if (inCommonsTransport)
         {
-            await ForwardCommonsMessageAsync(message, commonsLocation.Value);
-            return;
+            await ForwardCommonsMessageAsync(message, commonsLocation!.Value);
+            if (commonsScope!.SuppressesNativeAgent) return;
+            if (message.Source == MessageSource.Webhook)
+            {
+                await TryAdmitCommonsEnvoyMessageAsync(
+                    message, commonsLocation.Value, commonsScope);
+                return;
+            }
         }
         if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
         var current = client?.CurrentUser;
@@ -2366,6 +2402,67 @@ internal sealed class DiscordBotRuntime(
                     "Discord failure notice could not be queued for message {MessageId}", message.Id);
             }
         }
+    }
+
+    private static bool CanPostInCommonsLocation(IMessageChannel channel)
+    {
+        if (channel is not SocketGuildChannel guildChannel) return false;
+        var permissions = guildChannel.Guild.CurrentUser.GetPermissions(guildChannel);
+        return permissions.ViewChannel && channel switch
+        {
+            SocketThreadChannel => permissions.SendMessagesInThreads,
+            SocketTextChannel => permissions.SendMessages,
+            SocketForumChannel => permissions.SendMessages,
+            _ => false,
+        };
+    }
+
+    private async Task TryAdmitCommonsEnvoyMessageAsync(
+        IUserMessage message,
+        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location,
+        DiscordCommonsGuildScope scope)
+    {
+        if (scope.SuppressesNativeAgent) return;
+        var verified = await commons.GetHostMessageAsync(
+            configId, location.GuildId, message.Id.ToString());
+        if (verified is null || string.IsNullOrWhiteSpace(verified.ThreadRef)) return;
+        var config = await GetConfigAsync();
+        var binding = await bindings.FindAsync(
+            config.ApplicationId, message.Channel.Id.ToString());
+        if (binding is null || !binding.Enabled) return;
+        var behavior = await behaviors.ResolveAsync(config, binding);
+        var participantId = $"host:{config.ApplicationId}";
+        var relayContext = new JsonObject
+        {
+            ["verified"] = true,
+            ["sender_kind"] = "peer-agent",
+            ["envoy_id"] = verified.EnvoyId,
+            ["persona_name"] = verified.PersonaName,
+            ["thread_ref"] = verified.ThreadRef,
+            ["scenario"] = verified.Scenario,
+            ["privacy_mandate"] = "Public audience: reason with private context when relevant, but never disclose owner-private information or unshared material.",
+        };
+        var hostTurn = await commonsHostTurns.SetPendingAsync(
+            binding, location.ChannelId, location.Channel,
+            verified, participantId);
+        var admission = await conversations.SubmitAsync(
+            binding,
+            message.Id.ToString(),
+            new ExternalRequestor($"envoy:{verified.EnvoyId}", verified.PersonaName),
+            verified.Content,
+            [],
+            guildContext: BuildGuildContext(message, config),
+            behaviorContext: behavior.ToTrustedMetadata(),
+            relayContext: relayContext);
+        if (admission is null)
+        {
+            await commonsHostTurns.CompleteAsync(hostTurn, "not-admitted");
+            return;
+        }
+        typing.MarkAdmitted(
+            typing.Begin(binding.BindingId, () => message.Channel.EnterTypingState(), true),
+            admission.MessageUid);
+        maintenance.RequestFull(binding.BindingId);
     }
 
     private void LogSlowMessageStep(ulong messageId, string step, long started)
@@ -2465,6 +2562,7 @@ internal sealed class DiscordBotRuntime(
                 ["type"] = "webhook_echo",
                 ["eventId"] = message.Id.ToString(),
                 ["messageId"] = message.Id.ToString(),
+                ["channelId"] = location.ChannelId,
                 ["channel"] = location.Channel,
                 ["threadRef"] = location.ThreadRef,
                 ["timestamp"] = message.Timestamp.ToUnixTimeMilliseconds(),
@@ -2490,6 +2588,7 @@ internal sealed class DiscordBotRuntime(
                 message.Content,
                 mentions,
                 mentionRoles,
+                location.ChannelId,
                 location.Channel,
                 location.ThreadRef,
                 message.Reference?.MessageId.ToString(),
@@ -3353,6 +3452,115 @@ internal sealed class DiscordBotRuntime(
             await ReconcileCommonsRolesAsync(source, ct);
     }
 
+    private async Task RunCommonsWebhookLoopAsync(
+        DiscordSocketClient source,
+        CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        var lastCatalogSync = DateTimeOffset.MinValue;
+        do
+        {
+            try
+            {
+                var syncCatalog = DateTimeOffset.UtcNow - lastCatalogSync
+                    >= TimeSpan.FromMinutes(2);
+                await ReconcileCommonsTransportAsync(source, syncCatalog, ct);
+                if (syncCatalog) lastCatalogSync = DateTimeOffset.UtcNow;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex,
+                    "Leaf Community channel/webhook reconciliation failed for {ConfigId}",
+                    configId);
+            }
+        } while (await timer.WaitForNextTickAsync(ct));
+    }
+
+    private async Task ReconcileCommonsTransportAsync(
+        DiscordSocketClient source,
+        bool syncCatalog,
+        CancellationToken ct)
+    {
+        if (!ReferenceEquals(client, source)) return;
+        var commonsConfig = await commonsConfigurations.GetAsync(configId, ct);
+        if (commonsConfig is not { Ready: true }) return;
+        foreach (var scope in commonsConfig.GuildScopes.Values.Where(candidate =>
+                     !candidate.SuppressesNativeAgent))
+        {
+            if (!ulong.TryParse(scope.GuildId, out var guildId)) continue;
+            var guild = source.GetGuild(guildId);
+            if (guild is null) continue;
+            if (syncCatalog)
+            {
+                var channels = new JsonArray();
+                foreach (var channel in guild.Channels.Where(channel =>
+                             channel is SocketTextChannel or SocketForumChannel))
+                {
+                    var categoryId = (channel as INestedChannel)?.CategoryId?.ToString();
+                    var channelId = channel.Id.ToString();
+                    var structurallyIncluded = scope.WholeGuild
+                        || scope.ChannelIds.Contains(channelId)
+                        || (!string.IsNullOrWhiteSpace(categoryId)
+                            && scope.CategoryIds.Contains(categoryId));
+                    if (!structurallyIncluded) continue;
+                    var permissions = guild.CurrentUser.GetPermissions(channel);
+                    var canPost = permissions.ViewChannel
+                        && permissions.SendMessages
+                        && permissions.ManageWebhooks;
+                    var name = DiscordCommonsRelayService.ChannelName(channel.Name);
+                    var purpose = channel switch
+                    {
+                        SocketTextChannel text => text.Topic ?? "",
+                        SocketForumChannel forum => forum.Topic ?? "",
+                        _ => "",
+                    };
+                    var showcaseEligible = LooksLikeShowcaseChannel(name, purpose);
+                    channels.Add(new JsonObject
+                    {
+                        ["id"] = channelId,
+                        ["name"] = name,
+                        ["kind"] = channel is SocketForumChannel ? "forum" : "text",
+                        ["canPost"] = canPost,
+                        ["readOnly"] = !canPost
+                            || scope.ExcludedChannelIds.Contains(channelId)
+                            || string.Equals(name, "announcements", StringComparison.Ordinal),
+                        ["showcaseEligible"] = showcaseEligible,
+                    });
+                }
+                await commons.SyncChannelsAsync(configId, scope.GuildId, channels, ct);
+                await commons.SetHostParticipantAsync(
+                    configId,
+                    scope.GuildId,
+                    $"host:{(await GetConfigAsync(ct)).ApplicationId}",
+                    guild.CurrentUser.DisplayName,
+                    guild.CurrentUser.Id.ToString(),
+                    guild.CurrentUser.Roles.Where(role => !role.IsEveryone)
+                        .Select(role => role.Id.ToString()).ToArray(),
+                    ct);
+            }
+            foreach (var channelId in await commons.PendingWebhookChannelsAsync(
+                         configId, scope.GuildId, ct))
+            {
+                _ = await EnsureCommonsWebhookAsync(scope.GuildId, channelId, ct);
+                var refreshed = await commonsConfigurations.GetAsync(configId, ct);
+                if (refreshed?.WebhookUrls.TryGetValue(channelId, out var webhookUrl) == true)
+                    await commons.RegisterChannelWebhookAsync(
+                        configId, scope.GuildId, channelId, webhookUrl, ct);
+            }
+        }
+    }
+
+    internal static bool LooksLikeShowcaseChannel(string name, string topic)
+    {
+        var value = $"{name} {topic}";
+        return new[] { "showcase", "project", "creation", "demo", "share", "build" }
+            .Any(term => value.Contains(term, StringComparison.OrdinalIgnoreCase));
+    }
+
     private async Task ReconcileCommonsRolesAsync(
         DiscordSocketClient source,
         CancellationToken ct)
@@ -3567,6 +3775,13 @@ internal sealed class DiscordBotRuntime(
             {
                 var delivery = pending[index];
                 if (delivery.Generation != binding.Generation) continue;
+                if (delivery.Kind == DiscordDeliveryStore.ProgressKind
+                    && await commonsHostTurns.GetPendingAsync(binding, ct) is not null)
+                {
+                    await deliveries.MarkFailedAsync(
+                        delivery, "relay_peer_turn_progress_suppressed", ct);
+                    continue;
+                }
                 if (delivery.Kind == DiscordDeliveryStore.ProgressKind)
                 {
                     var batch = new List<DiscordDelivery> { delivery };
@@ -3649,6 +3864,31 @@ internal sealed class DiscordBotRuntime(
                     await deliveries.MarkFailedAsync(delivery, "Queued outbound payload is missing", ct);
                     continue;
                 }
+                var hostTurn = await commonsHostTurns.GetPendingAsync(binding, ct);
+                if (hostTurn is { State: "pending" })
+                {
+                    var authorization = await commons.AuthorizeHostPostAsync(
+                        configId,
+                        hostTurn.GuildId,
+                        hostTurn.ParticipantId,
+                        hostTurn.ThreadRef,
+                        [hostTurn.SourceEnvoyId],
+                        hostTurn.SourceMessageId,
+                        ct);
+                    if (!authorization.Allowed)
+                    {
+                        foreach (var blocked in pending.Skip(index).Where(item =>
+                                     item.Kind == DiscordDeliveryStore.MessageKind))
+                            await deliveries.MarkFailedAsync(
+                                blocked,
+                                $"relay_{authorization.Reason ?? "governor_rejected"}",
+                                ct);
+                        await commonsHostTurns.CompleteAsync(hostTurn, "blocked", ct);
+                        break;
+                    }
+                    await commonsHostTurns.CompleteAsync(hostTurn, "authorized", ct);
+                    hostTurn = hostTurn with { State = "authorized" };
+                }
                 try
                 {
                     var sentId = useWebhook
@@ -3659,6 +3899,29 @@ internal sealed class DiscordBotRuntime(
                             binding.ConversationId, outbound.Content,
                             DiscordRestTransport.Nonce(delivery), outbound.Files, ct);
                     await deliveries.MarkSentAsync(delivery, sentId, ct);
+                    if (hostTurn is not null)
+                    {
+                        await commons.EnqueueAsync(
+                            configId,
+                            hostTurn.GuildId,
+                            $"host-post:{sentId}",
+                            new JsonObject
+                            {
+                                ["type"] = "host_participant_post",
+                                ["eventId"] = $"host-post:{sentId}",
+                                ["participantId"] = hostTurn.ParticipantId,
+                                ["content"] = outbound.Content,
+                                ["addresses"] = new JsonArray(
+                                    JsonValue.Create(hostTurn.SourceEnvoyId)),
+                                ["channel"] = hostTurn.Channel,
+                                ["channelId"] = hostTurn.ChannelId,
+                                ["threadRef"] = hostTurn.ThreadRef,
+                                ["messageId"] = sentId,
+                                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                            },
+                            ct);
+                        await commonsHostTurns.CompleteAsync(hostTurn, "posted", ct);
+                    }
                 }
                 catch (DiscordRestException ex) when ((int)ex.StatusCode == 429
                                                        || (int)ex.StatusCode >= 500)
@@ -3674,6 +3937,11 @@ internal sealed class DiscordBotRuntime(
                     break;
                 }
             }
+            if (settledPeerTurns.TryRemove(binding.BindingId, out _)
+                && await commonsHostTurns.GetPendingAsync(binding, ct) is
+                    { State: "pending" } settledTurn
+                && !await deliveries.HasPendingOutboundMessageAsync(binding.BindingId, ct))
+                await commonsHostTurns.CompleteAsync(settledTurn, "no-reply", ct);
         }
         finally
         {
@@ -3690,9 +3958,12 @@ internal sealed class DiscordBotRuntime(
         var location = client?.GetChannel(channelId) is { } channel
             ? CommonsLocation(channel)
             : null;
-        return location is not null && await commons.IsCommonsLocationAsync(
-            configId, location.Value.GuildId, location.Value.ChannelId,
-            location.Value.CategoryId, ct);
+        var scope = location is null
+            ? null
+            : await commons.GetScopeAsync(configId, location.Value.GuildId, ct);
+        return scope is not null
+            && scope.Contains(location!.Value.ChannelId, location.Value.CategoryId)
+            && scope.SuppressesNativeAgent;
     }
 
     internal static async Task<ResolvedOutboundPayload> ResolveOutboundPayloadAsync(

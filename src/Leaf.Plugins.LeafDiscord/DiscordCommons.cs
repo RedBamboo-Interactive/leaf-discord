@@ -32,6 +32,8 @@ public sealed record DiscordCommonsGuildScope(
     bool WholeGuild,
     IReadOnlySet<string> CategoryIds,
     IReadOnlySet<string> ChannelIds,
+    IReadOnlySet<string> ExcludedChannelIds,
+    string NativeAgentMode,
     string RelayUrl,
     string? HostCredential)
 {
@@ -40,9 +42,29 @@ public sealed record DiscordCommonsGuildScope(
                          && !string.IsNullOrWhiteSpace(HostCredential);
 
     public bool Contains(string? channelId, string? categoryId)
-        => WholeGuild
-           || (!string.IsNullOrWhiteSpace(categoryId) && CategoryIds.Contains(categoryId))
-           || (!string.IsNullOrWhiteSpace(channelId) && ChannelIds.Contains(channelId));
+        => (string.IsNullOrWhiteSpace(channelId) || !ExcludedChannelIds.Contains(channelId))
+           && (WholeGuild
+               || (!string.IsNullOrWhiteSpace(categoryId) && CategoryIds.Contains(categoryId))
+               || (!string.IsNullOrWhiteSpace(channelId) && ChannelIds.Contains(channelId)));
+
+    public bool SuppressesNativeAgent => string.Equals(
+        NativeAgentMode, DiscordCommonsNativeAgentModes.SilentHost,
+        StringComparison.Ordinal);
+}
+
+public static class DiscordCommonsNativeAgentModes
+{
+    public const string SilentHost = "silent-host";
+    public const string Participant = "participant";
+
+    public static string Normalize(string? value)
+        => value?.Trim().ToLowerInvariant() switch
+        {
+            Participant => Participant,
+            null or "" or SilentHost => SilentHost,
+            _ => throw new ArgumentException(
+                "Leaf Community nativeAgentMode must be silent-host or participant."),
+        };
 }
 
 public sealed record DiscordCommonsGuildScopeUpdate(
@@ -52,7 +74,9 @@ public sealed record DiscordCommonsGuildScopeUpdate(
     IReadOnlyList<string>? ChannelIds,
     string RelayUrl,
     string? HostCredential,
-    bool ClearHostCredential = false);
+    bool ClearHostCredential = false,
+    IReadOnlyList<string>? ExcludedChannelIds = null,
+    string? NativeAgentMode = null);
 
 public sealed record DiscordCommonsConfigurationUpdate(
     string RelayUrl,
@@ -66,6 +90,8 @@ public sealed record DiscordCommonsGuildScopeView(
     bool WholeGuild,
     IReadOnlyList<string> CategoryIds,
     IReadOnlyList<string> ChannelIds,
+    IReadOnlyList<string> ExcludedChannelIds,
+    string NativeAgentMode,
     string RelayUrl,
     bool HostCredentialConfigured);
 
@@ -98,6 +124,21 @@ public sealed record DiscordCommonsGuildMember(
     string UserId,
     string DisplayName,
     bool IsBot);
+
+public sealed record DiscordCommonsHostMessage(
+    string MessageId,
+    string EnvoyId,
+    string PersonaName,
+    string Content,
+    string ThreadRef,
+    string Scenario,
+    string Channel,
+    string? ChannelId);
+
+public sealed record DiscordCommonsHostPostAuthorization(
+    bool Allowed,
+    string? Reason,
+    string? Scenario);
 
 public static class DiscordCommonsRolePolicy
 {
@@ -247,6 +288,8 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                     scope.WholeGuild,
                     scope.CategoryIds.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
                     scope.ChannelIds.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
+                    scope.ExcludedChannelIds.OrderBy(value => value, StringComparer.Ordinal).ToArray(),
+                    scope.NativeAgentMode,
                     scope.RelayUrl,
                     !string.IsNullOrWhiteSpace(scope.HostCredential)))
                 .ToArray(),
@@ -301,6 +344,7 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                 guildId => guildId,
                 guildId => new DiscordCommonsGuildScope(
                     guildId, true, new HashSet<string>(), new HashSet<string>(),
+                    new HashSet<string>(), DiscordCommonsNativeAgentModes.SilentHost,
                     relayUrl, credential),
                 StringComparer.Ordinal);
         }
@@ -328,6 +372,7 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                 guildId => guildId,
                 guildId => new DiscordCommonsGuildScope(
                     guildId, true, new HashSet<string>(), new HashSet<string>(),
+                    new HashSet<string>(), DiscordCommonsNativeAgentModes.SilentHost,
                     relayUrl, credential),
                 StringComparer.Ordinal);
 
@@ -345,6 +390,8 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                 .ToHashSet(StringComparer.Ordinal);
             var channels = (update.ChannelIds ?? []).Select(RequiredSnowflake)
                 .ToHashSet(StringComparer.Ordinal);
+            var excludedChannels = (update.ExcludedChannelIds ?? []).Select(RequiredSnowflake)
+                .ToHashSet(StringComparer.Ordinal);
             if (!update.WholeGuild && categories.Count == 0 && channels.Count == 0)
                 throw new ArgumentException(
                     "A scoped Leaf Community guild needs a category or channel ID.");
@@ -360,7 +407,8 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                     ? previous?.HostCredential
                     : update.HostCredential.Trim();
             result[guildId] = new DiscordCommonsGuildScope(
-                guildId, update.WholeGuild, categories, channels,
+                guildId, update.WholeGuild, categories, channels, excludedChannels,
+                DiscordCommonsNativeAgentModes.Normalize(update.NativeAgentMode),
                 targetUrl, targetCredential);
         }
         return result;
@@ -387,6 +435,9 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                     item["wholeGuild"]?.GetValue<bool>() ?? false,
                     StringSet(item["categoryIds"]),
                     StringSet(item["channelIds"]),
+                    StringSet(item["excludedChannelIds"]),
+                    DiscordCommonsNativeAgentModes.Normalize(
+                        item["nativeAgentMode"]?.GetValue<string>()),
                     target?["relayUrl"]?.GetValue<string>() ?? "",
                     target?["hostCredential"]?.GetValue<string>());
             }
@@ -408,6 +459,10 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                     .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
                 ["channelIds"] = new JsonArray(scope.ChannelIds.OrderBy(value => value, StringComparer.Ordinal)
                     .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
+                ["excludedChannelIds"] = new JsonArray(scope.ExcludedChannelIds
+                    .OrderBy(value => value, StringComparer.Ordinal)
+                    .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
+                ["nativeAgentMode"] = scope.NativeAgentMode,
             }).ToArray()).ToJsonString();
 
     private static string SerializeRelayTargets(IEnumerable<DiscordCommonsGuildScope> scopes)
@@ -467,6 +522,94 @@ public sealed record DiscordCommonsIngestDelivery(
     string State,
     int Attempts,
     DateTimeOffset? NextAttemptAt);
+
+public sealed record DiscordCommonsHostTurn(
+    Guid EntityId,
+    string BindingId,
+    long Generation,
+    string GuildId,
+    string ChannelId,
+    string Channel,
+    string ThreadRef,
+    string SourceMessageId,
+    string SourceEnvoyId,
+    string SourcePersonaName,
+    string ParticipantId,
+    string State);
+
+public sealed class DiscordCommonsHostTurnStore(IEntityStore store)
+{
+    public const string TypeSlug = "leaf-discord-commons-host-turn";
+
+    public async Task<DiscordCommonsHostTurn> SetPendingAsync(
+        DiscordBinding binding, string channelId, string channel,
+        DiscordCommonsHostMessage message, string participantId,
+        CancellationToken ct = default)
+    {
+        var slug = $"commons-host-turn-{DiscordBindingStore.Hash(
+            $"{binding.BindingId}:{message.MessageId}")}";
+        var data = new JsonObject
+        {
+            ["binding_id"] = binding.BindingId,
+            ["generation"] = binding.Generation,
+            ["guild_id"] = binding.GuildId,
+            ["channel_id"] = channelId,
+            ["channel"] = channel,
+            ["thread_ref"] = message.ThreadRef,
+            ["source_message_id"] = message.MessageId,
+            ["source_envoy_id"] = message.EnvoyId,
+            ["source_persona_name"] = message.PersonaName,
+            ["participant_id"] = participantId,
+            ["state"] = "pending",
+        };
+        var existing = await store.GetBySlugAsync(TypeSlug, slug, ct);
+        var entity = existing is null
+            ? await store.UpsertBySlugAsync(TypeSlug, slug, "Leaf Community host turn", data, ct)
+            : existing;
+        return Map(entity);
+    }
+
+    public async Task<DiscordCommonsHostTurn?> GetPendingAsync(
+        DiscordBinding binding, CancellationToken ct = default)
+    {
+        var active = new List<LeafEntity>();
+        foreach (var state in new[] { "authorized", "pending" })
+            active.AddRange(await store.QueryAsync(new EntityQuery
+            {
+                TypeSlug = TypeSlug,
+                DataEquals = new Dictionary<string, object?>
+                {
+                    ["binding_id"] = binding.BindingId,
+                    ["state"] = state,
+                },
+                Limit = 50,
+            }, ct));
+        return active.OrderBy(entity => entity.CreatedAt)
+            .Select(Map)
+            .FirstOrDefault(turn => turn.Generation == binding.Generation
+                && (turn.State is "pending" or "authorized"));
+    }
+
+    public async Task CompleteAsync(
+        DiscordCommonsHostTurn turn, string state, CancellationToken ct = default)
+        => _ = await store.PatchAsync(turn.EntityId,
+            new JsonObject { ["state"] = state }, ct: ct);
+
+    private static DiscordCommonsHostTurn Map(LeafEntity entity)
+        => new(
+            entity.Id,
+            JsonRead.String(entity.Data, "binding_id") ?? "",
+            JsonRead.Long(entity.Data, "generation", 0),
+            JsonRead.String(entity.Data, "guild_id") ?? "",
+            JsonRead.String(entity.Data, "channel_id") ?? "",
+            JsonRead.String(entity.Data, "channel") ?? "",
+            JsonRead.String(entity.Data, "thread_ref") ?? "",
+            JsonRead.String(entity.Data, "source_message_id") ?? "",
+            JsonRead.String(entity.Data, "source_envoy_id") ?? "",
+            JsonRead.String(entity.Data, "source_persona_name") ?? "",
+            JsonRead.String(entity.Data, "participant_id") ?? "",
+            JsonRead.String(entity.Data, "state") ?? "pending");
+}
 
 public sealed class DiscordCommonsIngestStore(IEntityStore store)
 {
@@ -581,6 +724,10 @@ public sealed class DiscordCommonsRelayService(
         Guid botId, string? guildId, CancellationToken ct = default)
         => (await configurations.GetAsync(botId, ct))?.Scope(guildId) is not null;
 
+    public async Task<DiscordCommonsGuildScope?> GetScopeAsync(
+        Guid botId, string? guildId, CancellationToken ct = default)
+        => (await configurations.GetAsync(botId, ct))?.Scope(guildId);
+
     public Task<DiscordCommonsConfiguration?> GetConfigurationAsync(
         Guid botId, CancellationToken ct = default)
         => configurations.GetAsync(botId, ct);
@@ -658,6 +805,101 @@ public sealed class DiscordCommonsRelayService(
         response.EnsureSuccessStatusCode();
     }
 
+    public async Task<DiscordCommonsHostMessage?> GetHostMessageAsync(
+        Guid botId, string guildId, string messageId, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Get,
+            $"/v1/admin/host-participant/messages/{Uri.EscapeDataString(messageId)}",
+            null, ct);
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        if (!document.RootElement.TryGetProperty("addressed", out var addressed)
+            || !addressed.GetBoolean()
+            || !document.RootElement.TryGetProperty("message", out var message))
+            return null;
+        return new DiscordCommonsHostMessage(
+            messageId,
+            message.GetProperty("envoyId").GetString() ?? "",
+            message.GetProperty("personaName").GetString() ?? "Leaf Community Agent",
+            message.GetProperty("content").GetString() ?? "",
+            message.GetProperty("threadRef").GetString() ?? "",
+            message.GetProperty("scenario").GetString() ?? "consult",
+            message.GetProperty("channel").GetString() ?? "",
+            message.TryGetProperty("channelId", out var channelId)
+                && channelId.ValueKind == JsonValueKind.String ? channelId.GetString() : null);
+    }
+
+    public async Task<DiscordCommonsHostPostAuthorization> AuthorizeHostPostAsync(
+        Guid botId, string guildId, string participantId, string threadRef,
+        IReadOnlyList<string> addresses, string authorizationId,
+        CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Post,
+            "/v1/admin/host-participant/authorize-post", new JsonObject
+            {
+                ["participantId"] = participantId,
+                ["threadRef"] = threadRef,
+                ["addresses"] = new JsonArray(addresses.Select(value =>
+                    (JsonNode?)JsonValue.Create(value)).ToArray()),
+                ["authorizationId"] = authorizationId,
+            }, ct);
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        return new DiscordCommonsHostPostAuthorization(
+            response.IsSuccessStatusCode
+            && document.RootElement.TryGetProperty("allowed", out var allowed)
+            && allowed.GetBoolean(),
+            document.RootElement.TryGetProperty("reason", out var reason)
+                ? reason.GetString() : null,
+            document.RootElement.TryGetProperty("scenario", out var scenario)
+                ? scenario.GetString() : null);
+    }
+
+    public async Task SetHostParticipantAsync(
+        Guid botId, string guildId, string participantId, string displayName,
+        string discordUserId, IReadOnlyList<string> roleIds, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Put,
+            "/v1/admin/host-participant", new JsonObject
+            {
+                ["id"] = participantId,
+                ["displayName"] = displayName,
+                ["discordUserId"] = discordUserId,
+                ["roleIds"] = new JsonArray(roleIds.Select(value =>
+                    (JsonNode?)JsonValue.Create(value)).ToArray()),
+            }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task SyncChannelsAsync(
+        Guid botId, string guildId, JsonArray channels, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Put,
+            "/v1/admin/channels", new JsonObject { ["channels"] = channels }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    public async Task<IReadOnlyList<string>> PendingWebhookChannelsAsync(
+        Guid botId, string guildId, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Get,
+            "/v1/admin/webhooks/pending", null, ct);
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        return document.RootElement.GetProperty("channelIds").EnumerateArray()
+            .Select(item => item.GetString() ?? "")
+            .Where(item => item.Length > 0).ToArray();
+    }
+
+    public async Task RegisterChannelWebhookAsync(
+        Guid botId, string guildId, string channelId, string webhookUrl,
+        CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Put,
+            $"/v1/admin/channels/{Uri.EscapeDataString(channelId)}/webhook",
+            new JsonObject { ["webhookUrl"] = webhookUrl }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
     private async Task<HttpResponseMessage> SendHostAsync(
         Guid botId,
         string guildId,
@@ -711,7 +953,8 @@ public sealed class DiscordCommonsRelayService(
 
     internal static bool ShouldReachNativeAgent(
         DiscordCommonsGuildScope? scope, string? channelId, string? categoryId)
-        => scope is null || !scope.Contains(channelId, categoryId);
+        => scope is null || !scope.Contains(channelId, categoryId)
+           || !scope.SuppressesNativeAgent;
 
     internal static string ChannelName(string value)
     {
@@ -726,6 +969,7 @@ public sealed class DiscordCommonsRelayService(
         string content,
         IReadOnlyList<string> mentions,
         IReadOnlyList<string> mentionRoles,
+        string? channelId,
         string channel,
         string? threadRef,
         string? referencedMessageId,
@@ -749,6 +993,7 @@ public sealed class DiscordCommonsRelayService(
             ["mentionRoles"] = new JsonArray(forwardedRoles
                 .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
             ["referencedMessageId"] = forwardedReference,
+            ["channelId"] = channelId,
             ["channel"] = channel,
             ["threadRef"] = forwardedThread,
             ["opensFloor"] = !listeningOnly && forwardedThread is not null

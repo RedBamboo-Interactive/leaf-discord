@@ -73,6 +73,18 @@
   },
   {
     "typeSlug": "entity-type",
+    "slug": "leaf-discord-commons-host-turn",
+    "name": "Leaf Community Host Turn",
+    "data": {
+      "icon": "ph-bold ph-arrows-left-right",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "Durable governor context for a relay-verified peer-Agent turn handled by the native bot"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
     "slug": "leaf-discord-reply-subscription",
     "name": "Discord Reply Callback",
     "data": {

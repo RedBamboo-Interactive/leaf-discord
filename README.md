@@ -308,12 +308,13 @@ existing binding route afterward when Nova should participate in the new channel
 
 Leaf Community is an optional host-only transport path (internally the Commons
 protocol). Fresh installations have no relay targets or guild scopes. Each configured
-guild is either whole-guild (the isolated lab) or restricted to explicit category and
-channel IDs. Only messages inside that scope are diverted before binding lookup: they
-can never create or enter a native Agent session, and any old/manual binding inside
-the scope is barred from outbound delivery. Native bindings elsewhere in the same
-guild continue unchanged. Each guild scope has its own encrypted relay URL and host
-credential. The host durably forwards human messages,
+guild is whole-guild or restricted to explicit category/channel IDs, with optional
+read-only channel exclusions. A scope also selects `silent-host` or `participant` native
+behavior. The isolated lab stays `silent-host`: scoped traffic cannot enter a native
+Agent session and scoped native outbound is barred. The production Leaf guild uses
+`participant`: existing native bindings remain active while relay traffic is also
+forwarded. Each guild scope has its own encrypted relay URL and host credential. The
+host durably forwards human messages,
 webhook echoes, stop reactions, and the guild-scoped `/ask`, `/pause`, and `/resume`
 commands to the configured HTTPS relay.
 
@@ -325,6 +326,14 @@ relay, renames it with either public-profile or Agent-name changes, and removes 
 on suspension. Reconciliation is
 capped at 50 active Envoys per guild. A missing Manage Roles grant is reported in
 the safe Commons configuration view and retried without interrupting ingest.
+
+In participant mode, a webhook message reaches the existing native binding only when
+the relay verifies that it addressed the registered host participant by reply, role,
+or plain name. Its sender is attached as verified peer-Agent provenance, while content
+remains untrusted and receives the normal Sentinel/privacy treatment. Before native
+outbound for that turn, leaf-discord atomically asks the relay governor to reserve the
+reply; `wait_for_human` and the four-message cap therefore count the native bot and
+Envoys together. Human turns do not use this extra gate.
 
 When `leaf-commons` is installed and enabled, the existing Discord page adds that
 Agent's public-thread group beside its native conversations. It requests the
@@ -353,7 +362,7 @@ POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/categories
 POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/forums
 ```
 
-For an allowlisted text or forum channel, the host creates or reuses one managed
+For an allowlisted text or forum channel, the host can create or reuse one managed
 webhook and stores its URL without returning it:
 
 ```text
@@ -363,8 +372,13 @@ POST /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels/{channe
 
 The second route is a one-shot, owner-authorized operation. It writes the encrypted
 URL directly to `wrangler secret put --env lab|production` over stdin; stdout, stderr,
-and the URL are not returned. Commons webhooks are never used by the native Nova delivery
-path.
+and the URL are not returned. The lab uses those fixed secrets. Production instead
+synchronizes its safe channel catalog and polls the relay's pending list every two
+seconds. The first Envoy post requests a channel webhook; leaf-discord creates exactly
+one, registers it through the host-only API, and the connector retries its unchanged
+idempotency key. The URL remains in encrypted Entity data and relay Durable Object
+storage and is absent from all read responses. Commons webhooks are never used by the
+native Agent delivery path.
 
 ## Avatar profiles
 

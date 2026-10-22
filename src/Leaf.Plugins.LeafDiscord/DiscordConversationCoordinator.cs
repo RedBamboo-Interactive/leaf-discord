@@ -69,7 +69,8 @@ public sealed class DiscordConversationCoordinator(
         IReadOnlyList<ExternalConversationAttachment>? attachments = null,
         CancellationToken ct = default,
         JsonObject? guildContext = null,
-        JsonObject? behaviorContext = null)
+        JsonObject? behaviorContext = null,
+        JsonObject? relayContext = null)
     {
         var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -128,6 +129,7 @@ public sealed class DiscordConversationCoordinator(
                 }).ToArray()),
                 ["guild_context"] = guildContext?.DeepClone(),
                 ["behavior_context"] = behaviorContext.DeepClone(),
+                ["relay_context"] = relayContext?.DeepClone(),
             };
             var (delivery, isNew) = await deliveries.ReceiveAsync(binding, discordMessageId, payload, ct);
             if (!isNew || delivery.State != "received") return null;
@@ -163,6 +165,7 @@ public sealed class DiscordConversationCoordinator(
                     ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
                     ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
                     ["discord_behavior"] = behaviorContext.DeepClone(),
+                    ["leaf_community_peer"] = relayContext?.DeepClone(),
                 }), ct);
             if (serverMap.NextState is { } disclosed)
                 binding = await bindings.RecordServerMapDisclosureAsync(binding, disclosed, ct);

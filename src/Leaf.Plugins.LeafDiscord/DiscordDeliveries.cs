@@ -497,6 +497,20 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             .ThenBy(item => item.ChunkIndex)
             .ToList();
 
+    public async Task<bool> HasPendingOutboundMessageAsync(
+        string bindingId, CancellationToken ct = default)
+        => (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["binding_id"] = bindingId,
+            },
+            Limit = 500,
+        }, ct)).Select(Map).Any(item =>
+            item.Kind == MessageKind && item.State is "queued" or "retry");
+
     public async Task<DiscordDelivery?> FindSentOutboundAsync(
         string bindingId,
         long generation,
