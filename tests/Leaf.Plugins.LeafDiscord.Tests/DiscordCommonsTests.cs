@@ -167,26 +167,79 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
-    public async Task Host_turn_context_is_durable_until_authorized_reply_is_reported()
+    public async Task Fresh_verified_consult_binding_is_created_and_governed_through_posted_reply()
     {
         var store = new MemoryEntityStore();
         var turns = new DiscordCommonsHostTurnStore(store);
         var bindingStore = new DiscordBindingStore(store);
-        var binding = await bindingStore.CreateAsync(new CreateDiscordBinding(
-            "100000000000000001", "200000000000000002", "guild_channel",
-            "400000000000000004", null, "agent-1", "owner-1", "public",
-            "participate", "general", "Leaf", null));
+        var binding = await bindingStore.GetOrCreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "200000000000000002", "thread",
+            "400000000000000004", "300000000000000003", "agent-1", "owner-1", "public",
+            "participate", "Fresh consult", "Leaf", null));
+        Assert.Equal(binding.EntityId,
+            (await bindingStore.FindAsync(
+                "100000000000000001", "200000000000000002"))!.EntityId);
         var message = new DiscordCommonsHostMessage(
-            "message-1", "envoy-1", "Atlas · Alice", "Hello Nova", "message:1",
-            "channel_reply", "general", "200000000000000002");
+            "message-1", "envoy-1", "Atlas · Alice", "Alice", "Nova, can you help?",
+            "200000000000000002", "consult", "agent-consult", "300000000000000003");
 
         var pending = await turns.SetPendingAsync(
-            binding, "200000000000000002", "general", message, "host:app");
+            binding, "300000000000000003", "agent-consult", message, "host:app");
         Assert.Equal("pending", (await turns.GetPendingAsync(binding))!.State);
         await turns.CompleteAsync(pending, "authorized");
         Assert.Equal("authorized", (await turns.GetPendingAsync(binding))!.State);
         await turns.CompleteAsync(pending, "posted");
         Assert.Null(await turns.GetPendingAsync(binding));
+    }
+
+    [Fact]
+    public async Task Human_admission_completes_the_pending_peer_turn_before_native_reply()
+    {
+        var store = new MemoryEntityStore();
+        var turns = new DiscordCommonsHostTurnStore(store);
+        var binding = await new DiscordBindingStore(store).CreateAsync(
+            new CreateDiscordBinding(
+                "100000000000000001", "200000000000000002", "thread",
+                "400000000000000004", "300000000000000003", "agent-1", "owner-1",
+                "public", "participate", "Fresh consult", "Leaf", null));
+        var message = new DiscordCommonsHostMessage(
+            "message-1", "envoy-1", "Atlas · Alice", "Alice", "Nova, help", "thread-1",
+            "consult", "agent-consult", "300000000000000003");
+        await turns.SetPendingAsync(
+            binding, "300000000000000003", "agent-consult", message, "host:app");
+
+        Assert.True(await turns.CompletePendingAsync(binding, "human-joined"));
+        Assert.Null(await turns.GetPendingAsync(binding));
+        Assert.False(await turns.CompletePendingAsync(binding, "human-joined"));
+    }
+
+    [Theory]
+    [InlineData(true, DiscordResponseModes.Participate, true)]
+    [InlineData(true, DiscordResponseModes.Selective, true)]
+    [InlineData(true, DiscordResponseModes.ContextOnly, false)]
+    [InlineData(false, DiscordResponseModes.Participate, false)]
+    public async Task Verified_peer_respects_binding_enabled_and_context_only_modes(
+        bool enabled, string responseMode, bool expected)
+    {
+        var store = new MemoryEntityStore();
+        var bindings = new DiscordBindingStore(store);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "200000000000000002", "thread",
+            "400000000000000004", "300000000000000003", "agent-1", "owner-1",
+            "public", responseMode, "Fresh consult", "Leaf", null));
+        if (!enabled)
+        {
+            await store.PatchAsync(binding.EntityId,
+                new JsonObject { ["enabled"] = false });
+            binding = (await bindings.GetAsync(binding.EntityId))!;
+        }
+
+        var admitted = await DiscordBotRuntime.ApplyVerifiedPeerBindingPolicyAsync(
+            bindings, binding, responseMode, "peer-message-1");
+
+        Assert.Equal(expected, admitted);
+        var updated = (await bindings.GetAsync(binding.EntityId))!;
+        Assert.Equal(expected ? null : "peer-message-1", updated.LastReceivedSnowflake);
     }
 
     [Theory]

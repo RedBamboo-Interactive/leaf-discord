@@ -2372,6 +2372,8 @@ internal sealed class DiscordBotRuntime(
                 typing.Cancel(typingAdmission);
             else
             {
+                await commonsHostTurns.CompletePendingAsync(
+                    binding, "human-joined");
                 typing.MarkAdmitted(typingAdmission, admission.MessageUid);
                 maintenance.RequestFull(binding.BindingId);
                 // The Discord session answers on its own; this only tells any private
@@ -2427,20 +2429,33 @@ internal sealed class DiscordBotRuntime(
             configId, location.GuildId, message.Id.ToString());
         if (verified is null || string.IsNullOrWhiteSpace(verified.ThreadRef)) return;
         var config = await GetConfigAsync();
-        var binding = await bindings.FindAsync(
-            config.ApplicationId, message.Channel.Id.ToString());
-        if (binding is null || !binding.Enabled) return;
+        var binding = await FindOrCreateBindingAsync(message, config);
+        if (binding is null) return;
+        if (!binding.Enabled)
+        {
+            await ApplyVerifiedPeerBindingPolicyAsync(
+                bindings, binding, binding.ResponseMode, message.Id.ToString());
+            return;
+        }
         var behavior = await behaviors.ResolveAsync(config, binding);
+        if (!await ApplyVerifiedPeerBindingPolicyAsync(
+                bindings, binding, behavior.ResponseMode, message.Id.ToString()))
+            return;
         var participantId = $"host:{config.ApplicationId}";
         var relayContext = new JsonObject
         {
+            ["schema"] = "leaf-community-peer/v1",
+            ["source"] = "commons_relay",
+            ["trust"] = "relay_verified",
             ["verified"] = true,
             ["sender_kind"] = "peer-agent",
             ["envoy_id"] = verified.EnvoyId,
             ["persona_name"] = verified.PersonaName,
+            ["owner_public_name"] = verified.OwnerPublicName,
             ["thread_ref"] = verified.ThreadRef,
             ["scenario"] = verified.Scenario,
-            ["privacy_mandate"] = "Public audience: reason with private context when relevant, but never disclose owner-private information or unshared material.",
+            ["audience"] = "public-discord",
+            ["authority"] = "peer-agent-requestor-only",
         };
         var hostTurn = await commonsHostTurns.SetPendingAsync(
             binding, location.ChannelId, location.Channel,
@@ -2996,6 +3011,19 @@ internal sealed class DiscordBotRuntime(
                 or DiscordResponseModes.Participate
             || mentioned
             || repliesToBot;
+    }
+
+    internal static async Task<bool> ApplyVerifiedPeerBindingPolicyAsync(
+        DiscordBindingStore bindings,
+        DiscordBinding binding,
+        string responseMode,
+        string discordMessageId,
+        CancellationToken ct = default)
+    {
+        if (binding.Enabled && responseMode != DiscordResponseModes.ContextOnly)
+            return true;
+        await bindings.MarkReceivedAsync(binding, discordMessageId, ct);
+        return false;
     }
 
     internal static bool ShouldStartTypingImmediately(

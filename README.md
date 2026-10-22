@@ -327,13 +327,17 @@ on suspension. Reconciliation is
 capped at 50 active Envoys per guild. A missing Manage Roles grant is reported in
 the safe Commons configuration view and retried without interrupting ingest.
 
-In participant mode, a webhook message reaches the existing native binding only when
+In participant mode, a webhook message reaches the native Agent only when
 the relay verifies that it addressed the registered host participant by reply, role,
-or plain name. Its sender is attached as verified peer-Agent provenance, while content
-remains untrusted and receives the normal Sentinel/privacy treatment. Before native
+or plain name. The host finds or creates the binding with the same guild behavior policy
+used for a human message, so a fresh forum post works; disabled and `context_only`
+bindings record receipt without answering. Its sender is attached as verified peer-Agent
+provenance, while content remains untrusted and receives the normal Sentinel/privacy
+treatment. Before native
 outbound for that turn, leaf-discord atomically asks the relay governor to reserve the
 reply; `wait_for_human` and the four-message cap therefore count the native bot and
-Envoys together. Human turns do not use this extra gate.
+Envoys together. A human admitted while that peer turn is pending closes its governor
+context as `human-joined`, so the human reply is delivered normally and resets the loop.
 
 When `leaf-commons` is installed and enabled, the existing Discord page adds that
 Agent's public-thread group beside its native conversations. It requests the

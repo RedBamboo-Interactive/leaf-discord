@@ -129,6 +129,7 @@ public sealed record DiscordCommonsHostMessage(
     string MessageId,
     string EnvoyId,
     string PersonaName,
+    string OwnerPublicName,
     string Content,
     string ThreadRef,
     string Scenario,
@@ -595,6 +596,15 @@ public sealed class DiscordCommonsHostTurnStore(IEntityStore store)
         => _ = await store.PatchAsync(turn.EntityId,
             new JsonObject { ["state"] = state }, ct: ct);
 
+    public async Task<bool> CompletePendingAsync(
+        DiscordBinding binding, string state, CancellationToken ct = default)
+    {
+        var pending = await GetPendingAsync(binding, ct);
+        if (pending is null) return false;
+        await CompleteAsync(pending, state, ct);
+        return true;
+    }
+
     private static DiscordCommonsHostTurn Map(LeafEntity entity)
         => new(
             entity.Id,
@@ -821,6 +831,7 @@ public sealed class DiscordCommonsRelayService(
             messageId,
             message.GetProperty("envoyId").GetString() ?? "",
             message.GetProperty("personaName").GetString() ?? "Leaf Community Agent",
+            message.GetProperty("ownerPublicName").GetString() ?? "Leaf member",
             message.GetProperty("content").GetString() ?? "",
             message.GetProperty("threadRef").GetString() ?? "",
             message.GetProperty("scenario").GetString() ?? "consult",
