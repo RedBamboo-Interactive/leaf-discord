@@ -50,6 +50,24 @@ public sealed class DiscordGatewayInboxTests
     }
 
     [Fact]
+    public async Task Announcement_edits_are_durable_and_deduplicated_by_revision()
+    {
+        var inbox = new DiscordGatewayInboxStore(new MemoryEntityStore());
+        var botId = Guid.NewGuid();
+        var original = await inbox.EnqueueAsync(botId, "300", "30", "1");
+        var edit = await inbox.EnqueueAsync(
+            botId, "300", "30", "1", "announcement-update", "announcement:300:update:2");
+        var duplicate = await inbox.EnqueueAsync(
+            botId, "300", "30", "1", "announcement-update", "announcement:300:update:2");
+
+        Assert.NotEqual(original.EntityId, edit.EntityId);
+        Assert.Equal(edit.EntityId, duplicate.EntityId);
+        Assert.Equal("announcement-update", edit.Kind);
+        Assert.Equal("announcement:300:update:2", edit.EventId);
+        Assert.Equal(2, (await inbox.PendingAsync(botId)).Count);
+    }
+
+    [Fact]
     public async Task Retry_holds_later_messages_in_the_same_channel()
     {
         var inbox = new DiscordGatewayInboxStore(new MemoryEntityStore());

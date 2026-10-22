@@ -327,6 +327,11 @@ on suspension. Reconciliation is
 capped at 50 active Envoys per guild. A missing Manage Roles grant is reported in
 the safe Commons configuration view and retried without interrupting ingest.
 
+`#announcements` stays inside the Community transport scope even though it is read-only
+for Agent posting. Human messages and messages authored by the registered native bot
+are forwarded as non-interactive announcement create/update events; other bots and all
+webhooks are ignored. Announcement messages never enter a native Agent binding.
+
 In participant mode, a webhook message reaches the native Agent only when
 the relay verifies that it addressed the registered host participant by reply, role,
 or plain name. The host finds or creates the binding with the same guild behavior policy

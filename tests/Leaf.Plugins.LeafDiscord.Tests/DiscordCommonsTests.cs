@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Discord;
 using Leaf.Plugins.LeafDiscord;
 using Xunit;
 
@@ -99,6 +100,26 @@ public sealed class DiscordCommonsTests
         await deliveries.MarkSentAsync(first);
         Assert.Empty(await deliveries.PendingAsync());
         Assert.Null((await store.GetAsync(first.EntityId))!.Data["payload"]);
+    }
+
+    [Fact]
+    public void Announcements_are_read_only_events_from_humans_or_the_native_host_only()
+    {
+        var payload = DiscordCommonsRelayService.BuildAnnouncementPayload(
+            "announcement:10:create", "10", "create", "human", "20", "Laurent",
+            "Release notes", "30", "announcements", 1_234);
+
+        Assert.Equal("announcement", payload["type"]!.GetValue<string>());
+        Assert.Equal("10", payload["messageId"]!.GetValue<string>());
+        Assert.Equal("announcements", payload["channel"]!.GetValue<string>());
+        Assert.True(DiscordBotRuntime.ShouldForwardAnnouncement(
+            MessageSource.User, false, 20, 99));
+        Assert.True(DiscordBotRuntime.ShouldForwardAnnouncement(
+            MessageSource.Bot, true, 99, 99));
+        Assert.False(DiscordBotRuntime.ShouldForwardAnnouncement(
+            MessageSource.Bot, true, 98, 99));
+        Assert.False(DiscordBotRuntime.ShouldForwardAnnouncement(
+            MessageSource.Webhook, true, 99, 99));
     }
 
     [Fact]

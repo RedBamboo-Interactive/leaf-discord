@@ -1015,6 +1015,38 @@ public sealed class DiscordCommonsRelayService(
         };
     }
 
+    internal static JsonObject BuildAnnouncementPayload(
+        string eventId,
+        string messageId,
+        string operation,
+        string authorKind,
+        string authorId,
+        string displayName,
+        string content,
+        string? channelId,
+        string channel,
+        long timestamp)
+    {
+        if (operation is not ("create" or "update"))
+            throw new ArgumentException("Announcement operation must be create or update.", nameof(operation));
+        if (authorKind is not ("human" or "native_host"))
+            throw new ArgumentException("Announcement author must be a human or native host.", nameof(authorKind));
+        return new JsonObject
+        {
+            ["type"] = "announcement",
+            ["operation"] = operation,
+            ["eventId"] = eventId,
+            ["messageId"] = messageId,
+            ["authorKind"] = authorKind,
+            ["authorId"] = authorId,
+            ["displayName"] = displayName,
+            ["content"] = content,
+            ["channelId"] = channelId,
+            ["channel"] = ChannelName(channel),
+            ["timestamp"] = timestamp,
+        };
+    }
+
     private async Task RunAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)

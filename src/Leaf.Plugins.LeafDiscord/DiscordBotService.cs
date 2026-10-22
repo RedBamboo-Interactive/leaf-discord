@@ -1763,6 +1763,7 @@ internal sealed class DiscordBotRuntime(
             clientReadyHandler = readyHandler;
             next.Ready += readyHandler;
             next.MessageReceived += OnMessageAsync;
+            next.MessageUpdated += OnMessageUpdatedAsync;
             next.ReactionAdded += OnReactionAddedAsync;
             next.SlashCommandExecuted += OnSlashCommandAsync;
             Func<SocketUser, SocketPresence, SocketPresence, Task> presenceHandler =
@@ -2270,7 +2271,24 @@ internal sealed class DiscordBotRuntime(
             : Task.CompletedTask;
     }
 
-    private async Task EnqueueGatewayMessageAsync(IUserMessage message)
+    private Task OnMessageUpdatedAsync(
+        Cacheable<IMessage, ulong> _, SocketMessage after, ISocketMessageChannel __)
+    {
+        if (after is not IUserMessage message) return Task.CompletedTask;
+        var location = CommonsLocation(message.Channel);
+        if (location is null || !string.Equals(
+                DiscordCommonsRelayService.ChannelName(location.Value.Channel),
+                "announcements", StringComparison.Ordinal))
+            return Task.CompletedTask;
+        var editedAt = message.EditedTimestamp ?? DateTimeOffset.UtcNow;
+        return EnqueueGatewayMessageAsync(
+            message,
+            "announcement-update",
+            $"announcement:{message.Id}:update:{editedAt.ToUnixTimeMilliseconds()}");
+    }
+
+    private async Task EnqueueGatewayMessageAsync(
+        IUserMessage message, string kind = "message", string? eventId = null)
     {
         var started = Stopwatch.GetTimestamp();
         var guildId = (message.Channel as SocketGuildChannel)?.Guild.Id.ToString();
@@ -2278,7 +2296,9 @@ internal sealed class DiscordBotRuntime(
             configId,
             message.Id.ToString(),
             message.Channel.Id.ToString(),
-            guildId);
+            guildId,
+            kind,
+            eventId);
         var elapsed = Stopwatch.GetElapsedTime(started);
         if (elapsed >= TimeSpan.FromSeconds(1))
             logger.LogWarning(
@@ -2292,14 +2312,19 @@ internal sealed class DiscordBotRuntime(
         var commonsScope = commonsLocation is null
             ? null
             : await commons.GetScopeAsync(configId, commonsLocation.Value.GuildId);
-        var inCommonsTransport = commonsLocation is not null
+        var inCommonsScope = commonsLocation is not null
             && commonsScope is not null
             && commonsScope.Contains(
-                commonsLocation.Value.ChannelId, commonsLocation.Value.CategoryId)
+                commonsLocation.Value.ChannelId, commonsLocation.Value.CategoryId);
+        var announcements = commonsLocation is not null && string.Equals(
+            DiscordCommonsRelayService.ChannelName(commonsLocation.Value.Channel),
+            "announcements", StringComparison.Ordinal);
+        var inCommonsTransport = inCommonsScope
             && CanPostInCommonsLocation(message.Channel);
-        if (inCommonsTransport)
+        if (inCommonsScope && (inCommonsTransport || announcements))
         {
             await ForwardCommonsMessageAsync(message, commonsLocation!.Value);
+            if (announcements) return;
             if (commonsScope!.SuppressesNativeAgent) return;
             if (message.Source == MessageSource.Webhook)
             {
@@ -2418,6 +2443,11 @@ internal sealed class DiscordBotRuntime(
             _ => false,
         };
     }
+
+    internal static bool ShouldForwardAnnouncement(
+        MessageSource source, bool authorIsBot, ulong authorId, ulong? nativeBotId)
+        => source != MessageSource.Webhook
+           && (!authorIsBot || nativeBotId is not null && authorId == nativeBotId.Value);
 
     private async Task TryAdmitCommonsEnvoyMessageAsync(
         IUserMessage message,
@@ -2558,7 +2588,10 @@ internal sealed class DiscordBotRuntime(
         if (message is null) return;
 
         var started = Stopwatch.GetTimestamp();
-        await ProcessMessageAsync(message);
+        if (item.Kind == "announcement-update")
+            await ProcessAnnouncementUpdateAsync(message, item.EventId);
+        else
+            await ProcessMessageAsync(message);
         var elapsed = Stopwatch.GetElapsedTime(started);
         if (elapsed >= TimeSpan.FromSeconds(3))
             logger.LogInformation(
@@ -2566,10 +2599,55 @@ internal sealed class DiscordBotRuntime(
                 item.MessageId, elapsed.TotalMilliseconds);
     }
 
+    private async Task ProcessAnnouncementUpdateAsync(
+        IUserMessage message, string eventId)
+    {
+        var location = CommonsLocation(message.Channel);
+        if (location is null || !string.Equals(
+                DiscordCommonsRelayService.ChannelName(location.Value.Channel),
+                "announcements", StringComparison.Ordinal))
+            return;
+        var scope = await commons.GetScopeAsync(configId, location.Value.GuildId);
+        if (scope is null || !scope.Contains(
+                location.Value.ChannelId, location.Value.CategoryId))
+            return;
+        await ForwardCommonsMessageAsync(
+            message, location.Value, "update", eventId);
+    }
+
     private async Task ForwardCommonsMessageAsync(
         IUserMessage message,
-        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location)
+        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location,
+        string announcementOperation = "create",
+        string? eventId = null)
     {
+        if (string.Equals(
+                DiscordCommonsRelayService.ChannelName(location.Channel),
+                "announcements", StringComparison.Ordinal))
+        {
+            if (!ShouldForwardAnnouncement(
+                    message.Source, message.Author.IsBot, message.Author.Id,
+                    client?.CurrentUser.Id))
+                return;
+            var nativeHost = message.Author.IsBot
+                && message.Author.Id == client?.CurrentUser.Id;
+            var id = eventId ?? $"announcement:{message.Id}:create";
+            await commons.EnqueueAsync(configId, location.GuildId, id,
+                DiscordCommonsRelayService.BuildAnnouncementPayload(
+                    id,
+                    message.Id.ToString(),
+                    announcementOperation,
+                    nativeHost ? "native_host" : "human",
+                    message.Author.Id.ToString(),
+                    message.Author is SocketGuildUser announcementMember
+                        ? announcementMember.DisplayName
+                        : message.Author.GlobalName ?? message.Author.Username,
+                    message.Content,
+                    location.ChannelId,
+                    location.Channel,
+                    (message.EditedTimestamp ?? message.Timestamp).ToUnixTimeMilliseconds()));
+            return;
+        }
         if (message.Source == MessageSource.Webhook)
         {
             await commons.EnqueueAsync(configId, location.GuildId, message.Id.ToString(), new JsonObject
@@ -4079,6 +4157,7 @@ internal sealed class DiscordBotRuntime(
         if (readyHandler is not null) target.Ready -= readyHandler;
         if (disconnectedHandler is not null) target.Disconnected -= disconnectedHandler;
         target.MessageReceived -= OnMessageAsync;
+        target.MessageUpdated -= OnMessageUpdatedAsync;
         target.ReactionAdded -= OnReactionAddedAsync;
         target.SlashCommandExecuted -= OnSlashCommandAsync;
         if (clientPresenceHandler is not null)

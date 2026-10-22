@@ -12,6 +12,8 @@ public sealed record DiscordGatewayInboxItem(
     string MessageId,
     string ChannelId,
     string? GuildId,
+    string Kind,
+    string EventId,
     string State,
     int Attempts,
     DateTimeOffset EnqueuedAt,
@@ -31,11 +33,18 @@ public sealed class DiscordGatewayInboxStore(IEntityStore store)
         string messageId,
         string channelId,
         string? guildId,
+        string kind = "message",
+        string? eventId = null,
         CancellationToken ct = default)
     {
         if (!ulong.TryParse(messageId, out _) || !ulong.TryParse(channelId, out _))
             throw new ArgumentException("Discord inbox coordinates must be snowflakes.");
-        var slug = $"discord-gateway-{Hash($"{botId:N}:{channelId}:{messageId}")}";
+        if (kind is not ("message" or "announcement-update"))
+            throw new ArgumentException("Unknown Discord inbox event kind.", nameof(kind));
+        eventId ??= messageId;
+        if (string.IsNullOrWhiteSpace(eventId) || eventId.Length > 200)
+            throw new ArgumentException("A bounded Discord event ID is required.", nameof(eventId));
+        var slug = $"discord-gateway-{Hash($"{botId:N}:{channelId}:{messageId}:{kind}:{eventId}")}";
         var existing = await store.GetBySlugAsync(TypeSlug, slug, ct);
         if (existing is not null) return Map(existing);
         var now = DateTimeOffset.UtcNow;
@@ -46,6 +55,8 @@ public sealed class DiscordGatewayInboxStore(IEntityStore store)
                 ["message_id"] = messageId,
                 ["channel_id"] = channelId,
                 ["guild_id"] = guildId,
+                ["kind"] = kind,
+                ["event_id"] = eventId,
                 ["state"] = "queued",
                 ["attempts"] = 0,
                 ["enqueued_at"] = now.ToString("O"),
@@ -127,6 +138,8 @@ public sealed class DiscordGatewayInboxStore(IEntityStore store)
             JsonRead.String(data, "message_id") ?? "",
             JsonRead.String(data, "channel_id") ?? "",
             JsonRead.String(data, "guild_id"),
+            JsonRead.String(data, "kind") ?? "message",
+            JsonRead.String(data, "event_id") ?? JsonRead.String(data, "message_id") ?? "",
             JsonRead.String(data, "state") ?? "queued",
             (int)JsonRead.Long(data, "attempts", 0),
             enqueuedAt == default ? entity.CreatedAt : enqueuedAt,
