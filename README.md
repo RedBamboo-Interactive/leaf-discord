@@ -1,56 +1,26 @@
-# Leaf Discord
+# Discord (`leaf-discord`)
 
-Multi-Agent Discord transport for externally scoped Leaf Agent conversations.
-Each configured Agent owns a dedicated Discord application, token, access scope,
-and Gateway runtime. Each allowlisted DM, guild channel, or thread owns one
-isolated binding generation. Discord participants are external requestors, never
-owner delegates.
+Discord puts your Leaf Agent on any Discord server through a bot that you own. The
+Agent keeps its Leaf identity, workspace, memory, tools, and ongoing conversations;
+Discord becomes another place where people can talk with it. You choose the servers,
+channels, direct-message users, and response behavior it may use.
 
-The plugin owns Discord Gateway/REST delivery, durable inbox/outbox records,
-binding generations, deterministic egress checks, independent Discord avatar profiles,
-and a compact editable progress message for commentary and tool
-activity. The selected Leaf Agent owns the persistent model session and ordered transcript through
-`IExternalAgentConversationProvider`. A separately configured one-shot Sentinel
-AI Session reviews each inbound message for prompt-injection signals before the
-main turn starts.
+Each public Agent needs its own Discord application and bot token. Setup therefore
+requires a free Discord developer application, enabling the Message Content intent,
+inviting the bot to servers you control, and entering its credentials in Leaf. Leaf
+stores the token as an encrypted secret and never returns it through the plugin API.
 
-Discord remains an independently installable extension. Settings contains only its
-backend setup: credentials, runtime, compute, access, intents, and optional presence
-integration. Its conversation browser and Agent behavior editor are contributed to
-Nova's `app-section` slot at `/apps/nova/discord`, so Agent conversations and their
-Discord configuration live with the Agent surface instead of appearing as a standalone
-Leaf app. The former `/apps/leaf-discord` route redirects to the contributed section.
+The extension appears in the existing **Discord** tab, where each Agent's server,
+thread, and direct-message conversations remain separate. Discord participants are
+external requestors, not owner delegates. A Sentinel review checks inbound messages,
+and the Agent still applies its normal privacy and authority rules before replying or
+using tools.
 
-Existing singleton installations migrate to one per-Agent bot Entity without
-changing application IDs, binding IDs, generations, sessions, transcript cursors,
-or durable delivery identities. Discord avatars are explicit bot configuration and
-never follow the Agent Entity's base `avatar` or the optional Outfits extension.
+## Install the extension
 
-## Install the plugin
-
-Prerequisites: a running Leaf source installation with Nova installed, plus access
-to its private Settings surface.
-
-1. Clone this repository next to your other Leaf checkouts, in the same parent
-   folder as `redleaf` and `redbamboo-packages`. The frontend links the shared
-   packages through `../../redbamboo-packages`, so the sibling layout matters:
-
-   ```powershell
-   git clone https://github.com/RedBamboo-Interactive/leaf-discord.git
-   ```
-
-2. Add `"../leaf-discord"` to the `plugins` array of `redleaf/leaf.workspace.local.json`
-   (copy `leaf.workspace.example.json` if you do not have one yet), or register the
-   folder through **Extensions > Add dev plugin**.
-3. Build and load it from the `redleaf` checkout:
-
-   ```powershell
-   ./rebuild.ps1 -Only leaf-discord
-   ```
-
-4. Confirm that **Extensions** lists Discord as enabled and that Nova shows a
-   **Discord** section. The bridge stays `not-configured` until you complete the
-   bot setup below.
+Install **Discord** from Leaf's extension catalog, then open **Settings → Discord →
+Bots**. The extension remains `not-configured` until you add your Discord bot. Source
+contributors can instead use the development commands at the end of this README.
 
 ## Set up your own bot
 
@@ -73,7 +43,7 @@ Each Leaf Agent needs its own Discord application.
    channel create/edit tools require **Manage Channels**; Commons webhooks and
    per-channel avatar delivery require **Manage Webhooks**. Open the generated URL
    and invite the bot to the server you own.
-4. In Leaf Settings > Discord, choose **Add bot**. Enter the application ID,
+4. In **Leaf Settings → Discord → Bots**, choose **Add bot**. Enter the application ID,
    interaction public key, and bot token; select the Leaf Agent and quality modes;
    then create the configuration. The token is stored as an encrypted Entity secret
    and is never returned by the plugin API. Add exact Discord user IDs to the
