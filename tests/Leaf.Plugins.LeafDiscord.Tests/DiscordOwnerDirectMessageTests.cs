@@ -299,7 +299,7 @@ public sealed class DiscordOwnerDirectMessageTests
                 new DiscordRuntimeOptionsResolver(entities),
                 new DiscordUserIdentityResolver(entities, NullLogger<DiscordUserIdentityResolver>.Instance),
                 compute, [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-                new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance);
+                new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
             var discord = new FakeDiscord();
             var messenger = new DiscordOwnerDirectMessenger(
                 bindings, new DiscordBehaviorStore(entities), deliveries, coordinator,

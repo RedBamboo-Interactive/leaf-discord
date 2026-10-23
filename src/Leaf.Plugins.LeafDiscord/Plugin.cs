@@ -85,7 +85,22 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         group.AddEndpointFilter(async (context, next) =>
         {
             context.HttpContext.Response.Headers.CacheControl = "private, no-store";
-            return await next(context);
+            try
+            {
+                return await next(context);
+            }
+            catch (DiscordSentinelRefusedException ex)
+            {
+                // The calling session wrote the content; it gets what the Sentinel did and why.
+                return Results.Json(new
+                {
+                    error = ex.Unavailable ? "sentinel_unavailable" : "sentinel_held",
+                    message = ex.Message,
+                    sentinel = ex.Review,
+                }, statusCode: ex.Unavailable
+                    ? StatusCodes.Status503ServiceUnavailable
+                    : StatusCodes.Status422UnprocessableEntity);
+            }
         });
         DiscordEndpoints.Map(group);
     }

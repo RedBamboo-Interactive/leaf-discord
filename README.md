@@ -81,13 +81,17 @@ Each Leaf Agent needs its own Discord application.
   security boundary. Its verdict is advisory; the selected Agent remains responsible for every action.
 - The selected Agent must not disclose its owner's personal information or private context, and
   consequential actions on the owner's behalf require confirmation on a private Leaf surface.
-- Each final reply passes the deterministic egress guard (credentials, tokens, private paths),
-  then one outbound Sentinel review before it leaves the durable outbox. The reply waits in
-  review; a reply after it never overtakes it. A held reply is not posted: the session is told
-  why and may rewrite once per participant message, and a rewrite held again is replaced by a
-  short notice in Discord. Every verdict is recorded on the reply's outbox rows and shown as
-  `metadata.discord.outboundSentinel` in the transcript. Commentary and tool progress are not
-  reviewed.
+- No model-written text reaches Discord without an outbound Sentinel review. Each final reply
+  passes the deterministic egress guard (credentials, tokens, private paths, and hidden
+  characters, which are stripped), then one review of the complete reply before it leaves the
+  durable outbox; a reply after it never overtakes it. A held reply is not posted: the session is
+  told why and may rewrite once per participant message, and a rewrite held again is replaced by
+  a short notice. Hidden characters and images hold a reply without a model call (the tool-free
+  Sentinel cannot see images). Commentary is never posted; tool progress shows only markers.
+  Outreach, binding messages, forum posts, owner DMs, corrections, and channel names and topics
+  are reviewed before Discord sees them and answer 422 (held) or 503 (unavailable) with the
+  verdict. A verdict counts only when the Sentinel echoes the outbound direction. Every verdict
+  is recorded on the outbox rows and shown as `metadata.discord.outboundSentinel`.
 - The bridge fails closed when the Sentinel is unavailable (not installed or disabled, model
   call failed, unparseable verdict). An inbound message is not admitted: it stays stored, a
   short fixed notice is posted (at most once per quarter hour per conversation), later messages

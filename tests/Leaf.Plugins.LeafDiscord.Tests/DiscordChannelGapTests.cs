@@ -412,7 +412,7 @@ public sealed class DiscordChannelGapTests
                 new DiscordUserIdentityResolver(entities, NullLogger<DiscordUserIdentityResolver>.Instance),
                 new NoComputeGateway(), [provider], new PromptInjectionDetector(),
                 new DiscordEgressGuard(), new DiscordTypingLeases(),
-                NullLogger<DiscordConversationCoordinator>.Instance);
+                NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
             return new Harness
             {
                 Entities = entities,

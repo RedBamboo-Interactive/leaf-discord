@@ -30,7 +30,7 @@ public sealed class DiscordOutboundReviewTests
         var pending = await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId);
         var row = Assert.Single(pending);
         Assert.Equal(DiscordDeliveryStore.ReviewingState, row.State);
-        Assert.True(await h.Deliveries.HasPendingOutboundMessageAsync(h.Binding.BindingId));
+        Assert.True(await h.Deliveries.HasPendingOutboundMessageAsync(h.Binding.BindingId, h.Binding.Generation));
         Assert.Empty(h.Sentinel.Requests);
 
         Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
@@ -83,7 +83,7 @@ public sealed class DiscordOutboundReviewTests
         Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
 
         Assert.Empty(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
-        Assert.False(await h.Deliveries.HasPendingOutboundMessageAsync(h.Binding.BindingId));
+        Assert.False(await h.Deliveries.HasPendingOutboundMessageAsync(h.Binding.BindingId, h.Binding.Generation));
         var held = Assert.Single(await h.Rows("reply-1"));
         Assert.Equal(DiscordDeliveryStore.HeldState, held.State);
         Assert.Equal("held", held.OutboundReview?["outcome"]?.GetValue<string>());
@@ -490,20 +490,20 @@ public sealed class DiscordOutboundReviewTests
     }
 
     [Fact]
-    public async Task Commentary_and_outreach_copies_are_not_held_for_review()
+    public async Task Commentary_is_never_posted_and_an_outreach_shaped_reply_without_rows_is_reviewed()
     {
         var h = await Harness.CreateAsync(_ => Leak);
         h.Provider.Messages.Add(new ExternalConversationMessage(
             new ExternalConversationCursor("epoch-1", 1), "turn-1", "assistant", "commentary",
-            "Looking at the logs.", DateTimeOffset.UtcNow));
+            "Looking at Laurent's inbox now.", DateTimeOffset.UtcNow));
         h.Reply(2, "discord-outreach-abc", "Proactive hello.");
         await h.ReconcileAsync();
 
-        var pending = await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId);
-        Assert.Equal(2, pending.Count);
-        Assert.All(pending, item => Assert.Equal("queued", item.State));
-        Assert.False(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
-        Assert.Empty(h.Sentinel.Requests);
+        var pending = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        Assert.Equal("discord-outreach-abc", pending.MessageUid);
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, pending.State);
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        Assert.Single(h.Sentinel.Requests);
     }
 
     [Fact]
@@ -546,6 +546,202 @@ public sealed class DiscordOutboundReviewTests
         Assert.Equal("high", outbound?["risk"]?.GetValue<string>());
         Assert.Null(outbound?["turn"]);
         Assert.Null(projected[1].Metadata?["discord"]);
+    }
+
+    [Fact]
+    public async Task A_verdict_that_does_not_prove_the_outbound_direction_counts_as_unavailable()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Sentinel.EchoDirection = false;
+        h.Reply(1, "reply-1", "Here is the fix.");
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        var waiting = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, waiting.State);
+        Assert.Equal(1, waiting.ReviewAttempts);
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId),
+            item => item.State == "queued");
+    }
+
+    [Fact]
+    public async Task Hidden_characters_are_stripped_and_hold_the_reply_without_asking_the_sentinel()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Reply(1, "reply-1", "Sure\u200B thing\U000E0041\U000E0042.");
+        await h.ReconcileAsync();
+
+        var row = Assert.Single(await h.Rows("reply-1"));
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Empty(h.Sentinel.Requests);
+        var held = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.HeldState, held.State);
+        Assert.Contains("hidden-characters", held.OutboundReview!["signals"]!.AsArray()
+            .Select(signal => signal!.GetValue<string>()));
+        var notice = Assert.Single(h.Provider.Inputs);
+        Assert.Equal("held", notice.Metadata?["outbound_sentinel_notice"]?["outcome"]?.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData("pass\u200Bword", "password")]
+    [InlineData("\u202Eevil\u202C", "evil")]
+    [InlineData("tag\U000E0041\U000E007F", "tag")]
+    [InlineData("soft\u00ADhyphen", "softhyphen")]
+    [InlineData("a\uFE0F\uFE0Fb", "ab")]
+    public void The_egress_guard_strips_hidden_characters(string input, string expected)
+    {
+        var inspected = new DiscordEgressGuard().Inspect(input);
+
+        Assert.Equal(expected, inspected.Content);
+        Assert.Contains(DiscordEgressGuard.HiddenCharactersFinding, inspected.Findings);
+    }
+
+    [Theory]
+    [InlineData("Family: \U0001F468\u200D\U0001F469\u200D\U0001F467")]
+    [InlineData("Love \u2764\uFE0F")]
+    [InlineData("Plain text.")]
+    public void The_egress_guard_keeps_emoji_joiners_and_single_variation_selectors(string input)
+    {
+        var inspected = new DiscordEgressGuard().Inspect(input);
+
+        Assert.Equal(input, inspected.Content);
+        Assert.DoesNotContain(DiscordEgressGuard.HiddenCharactersFinding, inspected.Findings);
+    }
+
+    [Fact]
+    public async Task A_reply_with_an_image_is_held_as_unreviewable_without_asking_the_sentinel()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Provider.Messages.Add(new ExternalConversationMessage(
+            new ExternalConversationCursor("epoch-1", 1), "reply-1", "assistant", "text",
+            "Here you go.", DateTimeOffset.UtcNow)
+        {
+            OutputAssets = [new ExternalConversationOutputAsset("a.png", "A cat")],
+        });
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Empty(h.Sentinel.Requests);
+        var held = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.HeldState, held.State);
+        Assert.Contains(DiscordConversationCoordinator.ImageNotReviewableSignal,
+            held.OutboundReview!["signals"]!.AsArray().Select(signal => signal!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task An_incomplete_reply_is_not_reviewed_or_released_in_part()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        var message = new ExternalConversationMessage(
+            new ExternalConversationCursor("epoch-1", 1), "reply-1", "assistant", "text", "x",
+            DateTimeOffset.UtcNow);
+        await h.Deliveries.EnqueueOutboundForReviewAsync(
+            h.Binding, message, 0, "first half", [], 2, "1:-", false);
+
+        Assert.False(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+        Assert.Empty(h.Sentinel.Requests);
+
+        await h.Deliveries.EnqueueOutboundForReviewAsync(
+            h.Binding, message, 1, "second half", [], 2, "1:-", false);
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+
+        Assert.Equal("first half\nsecond half", Assert.Single(h.Sentinel.Requests).Content);
+        Assert.Equal(2, (await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId))
+            .Count(item => item.State == "queued"));
+    }
+
+    [Fact]
+    public async Task A_reply_keeps_the_turn_it_was_written_in_even_if_reviewed_after_a_new_message()
+    {
+        var h = await Harness.CreateAsync(_ => Leak);
+        h.Reply(1, "reply-1", "He lives at 14 rue des Lilas.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        // The rewrite is written in the same turn, but a participant message is admitted
+        // before its review finishes.
+        h.Reply(3, "reply-2", "Fine: 14 rue des Lilas.");
+        await h.ReconcileAsync();
+        await h.Coordinator.SubmitAsync(h.Binding, "300000000000000003",
+            new ExternalRequestor("400000000000000004", "Participant"), "Hello?");
+        await h.RefreshAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal("withheld", (await h.Rows("reply-2"))[0].OutboundReview?["outcome"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Old_generation_rows_in_review_do_not_count_as_pending_after_clear()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Reply(1, "reply-1", "Old generation.");
+        await h.ReconcileAsync();
+        Assert.True(await h.Deliveries.HasPendingOutboundMessageAsync(h.Binding.BindingId, h.Binding.Generation));
+
+        Assert.False(await h.Deliveries.HasPendingOutboundMessageAsync(h.Binding.BindingId, h.Binding.Generation + 1));
+    }
+
+    [Fact]
+    public async Task A_message_queued_without_a_review_goes_back_to_review_and_notices_are_exempt()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        var legacy = new ExternalConversationMessage(
+            new ExternalConversationCursor("epoch-1", 1), "legacy-1", "assistant", "text", "x",
+            DateTimeOffset.UtcNow);
+        await h.Deliveries.EnqueueOutboundAsync(h.Binding, legacy, 0, "queued before the pass", []);
+        await h.Deliveries.EnqueueOutboundAsync(h.Binding, legacy, 1, "second chunk", []);
+        await h.Coordinator.EnqueueNoticeAsync(h.Binding, "notice-1", "A fixed notice.");
+
+        var pending = await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId);
+        Assert.Equal(DiscordDeliveryStore.BridgeNoticeExemption,
+            Assert.Single(pending, item => item.MessageUid != "legacy-1").ReviewExempt);
+
+        await h.Deliveries.MarkUnreviewedForReviewAsync(h.Binding, "legacy-1");
+        Assert.All(await h.Rows("legacy-1"), item => Assert.Equal(DiscordDeliveryStore.ReviewingState, item.State));
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal("queued before the pass\nsecond chunk", Assert.Single(h.Sentinel.Requests).Content);
+        Assert.All(await h.Rows("legacy-1"), item => Assert.Equal("delivered",
+            item.OutboundReview?["outcome"]?.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task Outreach_held_or_unreviewable_is_refused_before_injection_or_queueing()
+    {
+        var held = await Harness.CreateAsync(_ => Leak);
+        var refused = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            held.Coordinator.SendExistingProactiveAsync(held.Binding, "out-1", "He lives at 14 rue des Lilas."));
+        Assert.False(refused.Unavailable);
+        Assert.Equal("high", refused.Review["risk"]?.GetValue<string>());
+        Assert.Equal(UntrustedContentDirection.Outbound, Assert.Single(held.Sentinel.Requests).Direction);
+        Assert.Empty(await held.Deliveries.PendingOutboundAsync(held.Binding.BindingId));
+
+        var down = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable());
+        var unavailable = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            down.Coordinator.SendExistingProactiveAsync(down.Binding, "out-1", "Hello."));
+        Assert.True(unavailable.Unavailable);
+        Assert.Empty(await down.Deliveries.PendingOutboundAsync(down.Binding.BindingId));
+
+        var none = await Harness.CreateAsync(null);
+        Assert.True((await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            none.Coordinator.SendExistingProactiveAsync(none.Binding, "out-1", "Hello."))).Unavailable);
+    }
+
+    [Fact]
+    public void Channel_settings_are_reviewed_as_their_text_fields()
+    {
+        var text = DiscordBotRuntime.ChannelSettingsText(new JsonObject
+        {
+            ["name"] = "showcase",
+            ["topic"] = "Share projects",
+            ["nsfw"] = false,
+            ["available_tags"] = new JsonArray(new JsonObject { ["name"] = "bug" }),
+        }, "").ToArray();
+
+        Assert.Equal(["name: showcase", "topic: Share projects", "available_tags[0].name: bug"], text);
     }
 
     private sealed class Harness
@@ -671,6 +867,8 @@ public sealed class DiscordOutboundReviewTests
         : IUntrustedContentReview
     {
         public List<UntrustedContentReviewRequest> Requests { get; } = [];
+        /// <summary>False acts like a cap-sentinel that predates outbound reviews.</summary>
+        public bool EchoDirection { get; set; } = true;
 
         public Task<UntrustedContentReviewResult> ReviewAsync(
             UntrustedContentReviewRequest request, CancellationToken ct = default)
@@ -678,7 +876,7 @@ public sealed class DiscordOutboundReviewTests
             Requests.Add(request);
             return Task.FromResult(new UntrustedContentReviewResult(
                 decide(request), null, [], new UntrustedContentScreening(0, [], [], request.Content, []),
-                "job-1", "trace-1"));
+                "job-1", "trace-1") { Direction = EchoDirection ? request.Direction : UntrustedContentDirection.Inbound });
         }
 
         public UntrustedContentScreening Screen(

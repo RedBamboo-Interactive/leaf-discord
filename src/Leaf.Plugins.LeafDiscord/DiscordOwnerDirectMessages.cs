@@ -124,6 +124,13 @@ internal sealed class DiscordOwnerDirectMessenger(
             if (operation.Result is not null)
                 return operation.Result with { Replayed = true };
 
+            // Reviewed before Discord sees it; a replay of a delivered DM returned above.
+            await conversations.ReviewOutgoingOrThrowAsync(
+                new DiscordOutgoingContext(ownerUserId, config.AgentId, config.SentinelQualityMode,
+                    $"{config.ApplicationId}:dm:{recipientUserId}",
+                    await conversations.DirectMessageAudienceAsync(recipientUserId, ownerUserId, ct)),
+                prepared.DeliveryContent, prepared.OutputAssets.Count, prepared.HiddenCharacters,
+                $"owner-dm:{config.ApplicationId}:{idempotencyKey}", ct);
             DiscordDirectMessageChannel channel;
             try
             {

@@ -61,7 +61,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities),
             IdentityResolver(entities), new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
         var attachment = new ExternalConversationAttachment(
             "a1", "trace.txt", "text/plain", 12, new string('a', 64), "/api/assets/a1.txt");
         var guildContext = new System.Text.Json.Nodes.JsonObject
@@ -193,7 +193,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await Submit(coordinator, binding, "1001", "general");
         await Submit(coordinator, binding, "1002", "general");
@@ -215,7 +215,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
     private static Task<ExternalConversationAdmission?> Submit(
         DiscordConversationCoordinator coordinator, DiscordBinding binding,
@@ -246,7 +246,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [new FlakyProvider(false)], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var result = await coordinator.SendProactiveAsync(
             binding, "followup-1", "Could you send me the complete trace?");
@@ -279,7 +279,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [new FlakyProvider(false)], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var result = await coordinator.RecordDeliveredProactiveAsync(
             binding, "forum-create-1", "Opening this workstream.",
@@ -320,7 +320,7 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance);
+            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var first = await coordinator.SendExistingProactiveAsync(
             binding, "owner-request-1", "Please apply RedLeaf 0.1.22.");
@@ -338,7 +338,7 @@ public sealed class DiscordCoordinatorTests
     }
 
     [Fact]
-    public async Task Existing_binding_message_preserves_canonical_markdown_and_queues_typed_asset()
+    public async Task Existing_binding_message_with_an_image_is_held_before_injection_or_delivery()
     {
         var entities = new MemoryEntityStore();
         await SeedQualityMode(entities);
@@ -357,29 +357,26 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance);
+            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
         const string canonical =
             "A casual image.\n\n![Quiet science-fiction reading nook](/api/assets/casual.png)";
 
-        var result = await coordinator.SendExistingProactiveAsync(
-            binding,
-            "owner-image-request-1",
-            canonical,
-            "A casual image.",
-            [new ExternalConversationOutputAsset(
-                "casual.png", "Quiet science-fiction reading nook")]);
+        // The tool-free Sentinel cannot see images, so an image is unreviewable and held
+        // (fail closed) until Laurent decides otherwise.
+        var refused = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            coordinator.SendExistingProactiveAsync(
+                binding,
+                "owner-image-request-1",
+                canonical,
+                "A casual image.",
+                [new ExternalConversationOutputAsset(
+                    "casual.png", "Quiet science-fiction reading nook")]));
 
-        using var injected = JsonDocument.Parse(Assert.Single(compute.Requests).Body);
-        Assert.Equal(canonical,
-            injected.RootElement.GetProperty("content").GetString());
-        var queued = Assert.Single(await deliveries.PendingOutboundAsync(binding.BindingId));
-        Assert.Equal(result.MessageUid, queued.MessageUid);
-        Assert.Equal("A casual image.", queued.Payload?["content"]?.GetValue<string>());
-        var asset = Assert.IsType<System.Text.Json.Nodes.JsonObject>(
-            Assert.Single(Assert.IsType<System.Text.Json.Nodes.JsonArray>(queued.Payload?["assets"])));
-        Assert.Equal("casual.png", asset["asset_id"]?.GetValue<string>());
-        Assert.Equal("Quiet science-fiction reading nook",
-            asset["description"]?.GetValue<string>());
+        Assert.False(refused.Unavailable);
+        Assert.Contains("image-not-reviewable", refused.Review["signals"]!.AsArray()
+            .Select(signal => signal!.GetValue<string>()));
+        Assert.Empty(compute.Requests);
+        Assert.Empty(await deliveries.PendingOutboundAsync(binding.BindingId));
     }
 
     [Fact]
@@ -402,7 +399,7 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance);
+            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var error = await Assert.ThrowsAsync<ArgumentException>(() =>
             coordinator.SendExistingProactiveAsync(
@@ -435,7 +432,7 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance);
+            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             coordinator.SendExistingProactiveAsync(
@@ -460,7 +457,7 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance);
+            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await Assert.ThrowsAsync<DiscordBindingSessionChangedException>(() =>
             coordinator.SendExistingProactiveAsync(
@@ -516,25 +513,30 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), new FakeComputeGateway(),
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.ReconcileAsync(binding);
         var firstPass = await deliveries.PendingOutboundAsync(binding.BindingId);
 
-        Assert.Equal(6, firstPass.Count);
-        Assert.All(firstPass.Take(5), item =>
+        // Commentary is model-written and never posted; only the markers rail is.
+        Assert.Equal(4, firstPass.Count);
+        Assert.All(firstPass.Take(3), item =>
         {
             Assert.Equal("turn-1", item.MessageUid);
             Assert.Equal(DiscordDeliveryStore.ProgressKind, item.Kind);
         });
         Assert.Equal(
-            $"I found the cause.\n\n-# {DiscordDeliveryStore.ToolUseMarker} {DiscordDeliveryStore.ToolResultMarker} {DiscordDeliveryStore.MutatingToolMarker}",
-            firstPass[4].Payload?["content"]?.GetValue<string>());
-        Assert.DoesNotContain("Set-Content", firstPass[4].Payload?["content"]?.GetValue<string>(),
+            $"-# {DiscordDeliveryStore.ToolUseMarker} {DiscordDeliveryStore.ToolResultMarker} {DiscordDeliveryStore.MutatingToolMarker}",
+            firstPass[2].Payload?["content"]?.GetValue<string>());
+        Assert.DoesNotContain(firstPass, item =>
+            item.Payload?["content"]?.GetValue<string>().Contains("cause", StringComparison.Ordinal) == true
+            || item.Payload?["content"]?.GetValue<string>().Contains("checking", StringComparison.Ordinal) == true);
+        Assert.DoesNotContain("Set-Content", firstPass[2].Payload?["content"]?.GetValue<string>(),
             StringComparison.Ordinal);
-        Assert.Equal("turn-1", firstPass[5].MessageUid);
-        Assert.Equal(DiscordDeliveryStore.MessageKind, firstPass[5].Kind);
-        Assert.Equal("Found it.", firstPass[5].Payload?["content"]?.GetValue<string>());
+        Assert.Equal("turn-1", firstPass[3].MessageUid);
+        Assert.Equal(DiscordDeliveryStore.MessageKind, firstPass[3].Kind);
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, firstPass[3].State);
+        Assert.Equal("Found it.", firstPass[3].Payload?["content"]?.GetValue<string>());
 
         binding = await bindings.GetAsync(binding.EntityId) ?? throw new InvalidOperationException();
         Assert.Equal("epoch-1", binding.Epoch);
@@ -542,7 +544,7 @@ public sealed class DiscordCoordinatorTests
 
         await coordinator.ReconcileAsync(binding);
 
-        Assert.Equal(6, (await deliveries.PendingOutboundAsync(binding.BindingId)).Count);
+        Assert.Equal(4, (await deliveries.PendingOutboundAsync(binding.BindingId)).Count);
     }
 
     [Fact]
@@ -583,16 +585,15 @@ public sealed class DiscordCoordinatorTests
             bindings, deliveries, configurations,
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), new FakeComputeGateway(),
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.ReconcileAsync(binding);
         var pending = await deliveries.PendingOutboundAsync(binding.BindingId);
 
-        Assert.Equal(2, pending.Count);
-        Assert.Equal(DiscordDeliveryStore.ProgressKind, pending[0].Kind);
-        Assert.Equal("I am checking that now.", pending[0].Payload?["content"]?.GetValue<string>());
-        Assert.Equal(DiscordDeliveryStore.MessageKind, pending[1].Kind);
-        Assert.Equal("Found it.", pending[1].Payload?["content"]?.GetValue<string>());
+        // No tool squares and no commentary: only the reply, waiting for its review.
+        var reply = Assert.Single(pending);
+        Assert.Equal(DiscordDeliveryStore.MessageKind, reply.Kind);
+        Assert.Equal("Found it.", reply.Payload?["content"]?.GetValue<string>());
         binding = await bindings.GetAsync(binding.EntityId) ?? throw new InvalidOperationException();
         Assert.Equal(4, binding.Sequence);
     }
@@ -633,7 +634,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.ReconcileAsync(binding);
 
@@ -683,7 +684,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var quiescent = await coordinator.ReconcileAsync(binding);
 
@@ -725,7 +726,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.ReconcileAsync(binding);
 
@@ -757,7 +758,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var quiescent = await coordinator.ReconcileAsync(binding);
 
@@ -792,7 +793,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await Task.WhenAll(
             coordinator.ReconcileAsync(binding),
@@ -826,7 +827,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         var reconciliation = coordinator.ReconcileAsync(binding);
         await provider.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
@@ -876,7 +877,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), typing,
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.ReconcileAsync(binding);
         binding = await bindings.GetAsync(binding.EntityId)
@@ -926,13 +927,15 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), typing,
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.ReconcileAsync(binding);
 
         Assert.Equal(1, createCount);
         Assert.Equal(1, indicator.DisposeCount);
-        Assert.Single(await deliveries.PendingOutboundAsync(binding.BindingId));
+        // Commentary still shows typing but is never posted.
+        Assert.Equal(kind == "commentary" ? 0 : 1,
+            (await deliveries.PendingOutboundAsync(binding.BindingId)).Count);
     }
 
     [Fact]
@@ -957,7 +960,7 @@ public sealed class DiscordCoordinatorTests
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
 
         await coordinator.SubmitAsync(binding, "1002",
             new ExternalRequestor("200000000000000002", "Owner"), "Hello");

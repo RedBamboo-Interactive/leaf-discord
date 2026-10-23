@@ -32,6 +32,19 @@ public sealed record DiscordDelivery(
     public int ReviewAttempts { get; init; }
     public DateTimeOffset? ReviewNextAt { get; init; }
 
+    /// <summary>How many chunks the reply has, so only a complete reply is reviewed.</summary>
+    public int? ChunkCount { get; init; }
+
+    /// <summary>The inbound turn the reply was written in (see DiscordConversationCoordinator.TurnKey).</summary>
+    public string? ReplyTurn { get; init; }
+
+    /// <summary>Why a message row may leave without an outbound review: a fixed bridge notice, or a
+    /// message reviewed and delivered before its transcript copy existed.</summary>
+    public string? ReviewExempt { get; init; }
+
+    /// <summary>The egress guard removed hidden characters from this chunk.</summary>
+    public bool HiddenCharacters { get; init; }
+
     /// <summary>An inbound message the session refused because the Sentinel was unavailable.
     /// It stays <c>received</c> and is retried in order at <see cref="NextAttemptAt"/>.</summary>
     public bool SentinelRefused { get; init; }
@@ -61,6 +74,8 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
     /// </summary>
     internal const string ReviewingState = "reviewing";
     internal const string HeldState = "held";
+    internal const string BridgeNoticeExemption = "bridge-notice";
+    internal const string DeliveredBeforeTranscriptExemption = "delivered-before-transcript";
 
     private static readonly HashSet<string> MutatingTools = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -266,6 +281,15 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
         => await EnqueueOutboundCoreAsync(
             binding, message, chunkIndex, content, outputAssets, MessageKind, ct);
 
+    /// <summary>Enqueues a queued chunk with extra fields set at creation (a recorded review or an
+    /// exemption), so the drain never sees it without them.</summary>
+    internal async Task<DiscordDelivery> EnqueueOutboundAsync(
+        DiscordBinding binding, ExternalConversationMessage message, int chunkIndex,
+        string content, IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        JsonObject extra, CancellationToken ct = default)
+        => await EnqueueOutboundCoreAsync(
+            binding, message, chunkIndex, content, outputAssets, MessageKind, ct, extra: extra);
+
     /// <summary>
     /// Enqueues a reply chunk in <see cref="ReviewingState"/>. The stable delivery identity is the
     /// one <see cref="EnqueueOutboundAsync(DiscordBinding, ExternalConversationMessage, int, string, IReadOnlyList{ExternalConversationOutputAsset}, CancellationToken)"/>
@@ -274,10 +298,47 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
     public async Task<DiscordDelivery> EnqueueOutboundForReviewAsync(
         DiscordBinding binding, ExternalConversationMessage message, int chunkIndex,
         string content, IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        int chunkCount, string replyTurn, bool hiddenCharacters,
         CancellationToken ct = default)
         => await EnqueueOutboundCoreAsync(
             binding, message, chunkIndex, content, outputAssets, MessageKind, ct,
-            initialState: ReviewingState);
+            initialState: ReviewingState,
+            extra: new JsonObject
+            {
+                ["chunk_count"] = chunkCount,
+                ["reply_turn"] = replyTurn,
+                ["hidden_characters"] = hiddenCharacters,
+            });
+
+    /// <summary>
+    /// The drain's safety net: a model-written message row that is queued without a review or an
+    /// exemption (for example one queued before the outbound pass existed) goes back to review,
+    /// all of its chunks together.
+    /// </summary>
+    public async Task MarkUnreviewedForReviewAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+    {
+        var rows = (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["binding_id"] = binding.BindingId,
+                ["message_uid"] = messageUid,
+            },
+            Limit = 100,
+        }, ct)).Select(Map)
+            .Where(item => item.Generation == binding.Generation && item.Kind == MessageKind)
+            .ToList();
+        foreach (var row in rows.Where(item => item.State is "queued" or "retry"
+                     && item.OutboundReview is null && item.ReviewExempt is null))
+            _ = await store.PatchAsync(row.EntityId, new JsonObject
+            {
+                ["state"] = ReviewingState,
+                ["chunk_count"] = rows.Count,
+            }, ct: ct);
+    }
 
     /// <summary>Reply chunks of the binding's current generation still waiting for review,
     /// oldest first.</summary>
@@ -620,7 +681,7 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
     private async Task<DiscordDelivery> EnqueueOutboundCoreAsync(
         DiscordBinding binding, ExternalConversationMessage message, int chunkIndex,
         string content, IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
-        string kind, CancellationToken ct, string initialState = "queued")
+        string kind, CancellationToken ct, string initialState = "queued", JsonObject? extra = null)
     {
         var isOutreach = message.MessageUid.StartsWith(
             "discord-outreach-", StringComparison.Ordinal);
@@ -683,56 +744,59 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
                 ["payload"] = payload,
             }, ct: ct));
         }
+        var data = new JsonObject
+        {
+            ["direction"] = "outbound",
+            ["kind"] = kind,
+            ["binding_id"] = binding.BindingId,
+            ["generation"] = binding.Generation,
+            ["state"] = initialState,
+            ["message_uid"] = message.MessageUid,
+            ["chunk_index"] = chunkIndex,
+            ["payload_hash"] = payloadHash,
+            ["payload"] = payload,
+            ["attempts"] = 0,
+            ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
+        };
+        foreach (var (key, value) in extra ?? [])
+            data[key] = value?.DeepClone();
         var entity = await store.UpsertBySlugAsync(TypeSlug, slug,
-            $"Discord outbound {message.MessageUid}/{chunkIndex}", new JsonObject
-            {
-                ["direction"] = "outbound",
-                ["kind"] = kind,
-                ["binding_id"] = binding.BindingId,
-                ["generation"] = binding.Generation,
-                ["state"] = initialState,
-                ["message_uid"] = message.MessageUid,
-                ["chunk_index"] = chunkIndex,
-                ["payload_hash"] = payloadHash,
-                ["payload"] = payload,
-                ["attempts"] = 0,
-                ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
-            }, ct);
+            $"Discord outbound {message.MessageUid}/{chunkIndex}", data, ct);
         return Map(entity);
     }
 
     public async Task<IReadOnlyList<DiscordDelivery>> PendingOutboundAsync(
         string bindingId, CancellationToken ct = default)
-        => (await store.QueryAsync(new EntityQuery
-        {
-            TypeSlug = TypeSlug,
-            DataEquals = new Dictionary<string, object?>
-            {
-                ["direction"] = "outbound",
-                ["binding_id"] = bindingId,
-            },
-            Limit = 500,
-        }, ct)).Select(Map)
+        => (await OutboundInStatesAsync(bindingId, [ReviewingState, "queued", "retry"], ct))
             .Where(item => item.State == ReviewingState
-                           || item.State is "queued" or "retry"
-                           && (item.NextAttemptAt is null || item.NextAttemptAt <= DateTimeOffset.UtcNow))
+                           || item.NextAttemptAt is null || item.NextAttemptAt <= DateTimeOffset.UtcNow)
             .OrderBy(item => item.CreatedAt)
             .ThenBy(item => item.ChunkIndex)
             .ToList();
 
     public async Task<bool> HasPendingOutboundMessageAsync(
-        string bindingId, CancellationToken ct = default)
-        => (await store.QueryAsync(new EntityQuery
-        {
-            TypeSlug = TypeSlug,
-            DataEquals = new Dictionary<string, object?>
+        string bindingId, long generation, CancellationToken ct = default)
+        => (await OutboundInStatesAsync(bindingId, [ReviewingState, "queued", "retry"], ct))
+            .Any(item => item.Kind == MessageKind && item.Generation == generation);
+
+    private async Task<IReadOnlyList<DiscordDelivery>> OutboundInStatesAsync(
+        string bindingId, IReadOnlyList<string> states, CancellationToken ct)
+    {
+        var rows = new List<DiscordDelivery>();
+        foreach (var state in states)
+            rows.AddRange((await store.QueryAsync(new EntityQuery
             {
-                ["direction"] = "outbound",
-                ["binding_id"] = bindingId,
-            },
-            Limit = 500,
-        }, ct)).Select(Map).Any(item =>
-            item.Kind == MessageKind && item.State is "queued" or "retry" or ReviewingState);
+                TypeSlug = TypeSlug,
+                DataEquals = new Dictionary<string, object?>
+                {
+                    ["direction"] = "outbound",
+                    ["binding_id"] = bindingId,
+                    ["state"] = state,
+                },
+                Limit = 500,
+            }, ct)).Select(Map));
+        return rows;
+    }
 
     public async Task<DiscordDelivery?> FindSentOutboundAsync(
         string bindingId,
@@ -901,6 +965,11 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
                 : null,
             SentinelRefused = data["sentinel_refused"] is JsonValue refused
                 && refused.TryGetValue<bool>(out var isRefused) && isRefused,
+            ChunkCount = data["chunk_count"] is null ? null : checked((int)JsonRead.Long(data, "chunk_count", 0)),
+            ReplyTurn = JsonRead.String(data, "reply_turn"),
+            ReviewExempt = JsonRead.String(data, "review_exempt"),
+            HiddenCharacters = data["hidden_characters"] is JsonValue hidden
+                && hidden.TryGetValue<bool>(out var hasHidden) && hasHidden,
         };
     }
 

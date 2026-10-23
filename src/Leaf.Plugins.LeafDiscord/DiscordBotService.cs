@@ -794,7 +794,10 @@ internal sealed class DiscordBotRuntime(
         if (string.IsNullOrWhiteSpace(ownerUserId))
             throw new ArgumentException("The Leaf owner user ID is required.");
         title = title.Trim();
-        content = content.Trim();
+        var guarded = conversations.PrepareOutreach(content.Trim(), null, []);
+        var hiddenInPost = guarded.HiddenCharacters
+            || !ReferenceEquals(DiscordEgressGuard.StripHiddenCharacters(title), title);
+        content = guarded.DeliveryContent;
         idempotencyKey = idempotencyKey.Trim();
         var activeClient = client;
         if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
@@ -818,6 +821,13 @@ internal sealed class DiscordBotRuntime(
             if (thread is null && operation.State == "sent")
                 throw new InvalidOperationException(
                     "The recorded Discord forum post is no longer visible to this bot.");
+            if (thread is null)
+                await conversations.ReviewOutgoingOrThrowAsync(
+                    new DiscordOutgoingContext(ownerUserId, config.AgentId, config.SentinelQualityMode,
+                        $"{config.ApplicationId}:{guildId}:{forumId}",
+                        "a new post in a Discord server forum, readable by every member who can see it"),
+                    $"{title}\n\n{content}", 0, hiddenInPost,
+                    $"forum:{config.ApplicationId}:{idempotencyKey}", ct);
             thread ??= await forum.CreatePostAsync(
                 title,
                 forum.DefaultAutoArchiveDuration,
@@ -895,6 +905,7 @@ internal sealed class DiscordBotRuntime(
         var botToken = config.BotToken
             ?? throw new InvalidOperationException("Discord bot token is unavailable.");
         var gateKey = $"{config.ApplicationId}:{guildId}:{channelId}";
+        await ReviewChannelSettingsAsync(config, guildId, patch, ct);
         var gate = channelEditGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
@@ -963,6 +974,7 @@ internal sealed class DiscordBotRuntime(
         var config = await GetConfigAsync(ct);
         var botToken = config.BotToken
             ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        await ReviewChannelSettingsAsync(config, guildId, payload, ct);
         var gateKey = $"{config.ApplicationId}:{guildId}";
         var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -1001,6 +1013,7 @@ internal sealed class DiscordBotRuntime(
         var config = await GetConfigAsync(ct);
         var botToken = config.BotToken
             ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        await ReviewChannelSettingsAsync(config, guildId, payload, ct);
         var gateKey = $"{config.ApplicationId}:{guildId}";
         var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -1048,6 +1061,7 @@ internal sealed class DiscordBotRuntime(
         var config = await GetConfigAsync(ct);
         var botToken = config.BotToken
             ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        await ReviewChannelSettingsAsync(config, guildId, payload, ct);
         var gateKey = $"{config.ApplicationId}:{guildId}";
         var gate = channelCreateGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -2941,6 +2955,12 @@ internal sealed class DiscordBotRuntime(
         var prepared = conversations.InspectCorrection(
             content, deliveryContent, outputAssets);
         var replacesContent = content is not null || deliveryContent is not null;
+        if (replacesContent || prepared.OutputAssets is { Count: > 0 })
+            await conversations.ReviewOutgoingOrThrowAsync(
+                await conversations.OutgoingContextAsync(binding, ct),
+                prepared.DeliveryContent ?? "", prepared.OutputAssets?.Count ?? 0, prepared.HiddenCharacters,
+                $"correction:{binding.BindingId}:{messageUid}:{DiscordBindingStore.Hash(prepared.DeliveryContent ?? "")}",
+                ct);
         var chunks = replacesContent
             ? DiscordMessageChunker.Split(prepared.DeliveryContent ?? "")
             : [];
@@ -4029,6 +4049,16 @@ internal sealed class DiscordBotRuntime(
                     RequestOutboundReview(binding, ct);
                     break;
                 }
+                if (delivery.Kind == DiscordDeliveryStore.MessageKind
+                    && delivery.OutboundReview is null && delivery.ReviewExempt is null)
+                {
+                    // Safety net: a model-written message never leaves without a review, even one
+                    // queued before the outbound pass existed or by a path that forgot it.
+                    if (delivery.MessageUid is not null)
+                        await deliveries.MarkUnreviewedForReviewAsync(binding, delivery.MessageUid, ct);
+                    RequestOutboundReview(binding, ct);
+                    break;
+                }
                 if (delivery.Kind == DiscordDeliveryStore.ProgressKind
                     && await commonsHostTurns.GetPendingAsync(binding, ct) is not null)
                 {
@@ -4194,12 +4224,48 @@ internal sealed class DiscordBotRuntime(
             if (settledPeerTurns.TryRemove(binding.BindingId, out _)
                 && await commonsHostTurns.GetPendingAsync(binding, ct) is
                     { State: "pending" } settledTurn
-                && !await deliveries.HasPendingOutboundMessageAsync(binding.BindingId, ct))
+                && !await deliveries.HasPendingOutboundMessageAsync(
+                    binding.BindingId, binding.Generation, ct))
                 await commonsHostTurns.CompleteAsync(settledTurn, "no-reply", ct);
         }
         finally
         {
             gate.Release();
+        }
+    }
+
+    /// <summary>Channel names, topics and tags written by a private Nova session are public text:
+    /// they get the outbound pass like any message.</summary>
+    private async Task ReviewChannelSettingsAsync(
+        LeafDiscordConfig config, string guildId, JsonObject settings, CancellationToken ct)
+    {
+        var text = string.Join("\n", ChannelSettingsText(settings, ""));
+        if (text.Length == 0) return;
+        await conversations.ReviewOutgoingOrThrowAsync(
+            new DiscordOutgoingContext(config.OwnerUserId, config.AgentId, config.SentinelQualityMode,
+                $"{config.ApplicationId}:{guildId}",
+                "the name, topic and settings of a channel in a Discord server, visible to every member who can see it"),
+            text, 0, !ReferenceEquals(DiscordEgressGuard.StripHiddenCharacters(text), text),
+            $"channel:{config.ApplicationId}:{guildId}:{DiscordBindingStore.Hash(text)}", ct);
+    }
+
+    internal static IEnumerable<string> ChannelSettingsText(JsonNode? node, string path)
+    {
+        switch (node)
+        {
+            case JsonObject value:
+                foreach (var (key, child) in value)
+                    foreach (var line in ChannelSettingsText(child, path.Length == 0 ? key : $"{path}.{key}"))
+                        yield return line;
+                break;
+            case JsonArray items:
+                for (var i = 0; i < items.Count; i++)
+                    foreach (var line in ChannelSettingsText(items[i], $"{path}[{i}]"))
+                        yield return line;
+                break;
+            case JsonValue leaf when leaf.TryGetValue<string>(out var text) && !string.IsNullOrWhiteSpace(text):
+                yield return $"{path}: {text}";
+                break;
         }
     }
 

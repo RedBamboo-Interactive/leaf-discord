@@ -11,11 +11,35 @@ namespace Leaf.Plugins.LeafDiscord;
 internal sealed record DiscordPreparedOutreach(
     string Content,
     string DeliveryContent,
-    IReadOnlyList<ExternalConversationOutputAsset> OutputAssets);
+    IReadOnlyList<ExternalConversationOutputAsset> OutputAssets,
+    bool HiddenCharacters = false);
 
 internal sealed record DiscordPreparedCorrection(
     string? DeliveryContent,
-    IReadOnlyList<ExternalConversationOutputAsset>? OutputAssets);
+    IReadOnlyList<ExternalConversationOutputAsset>? OutputAssets,
+    bool HiddenCharacters = false);
+
+/// <summary>Who an outbound review is for when the text does not come from a binding's own reply.</summary>
+internal sealed record DiscordOutgoingContext(
+    string? OwnerUserId,
+    string AgentId,
+    string SentinelQualityMode,
+    string SourceRef,
+    string Audience);
+
+/// <summary>
+/// The outbound Sentinel refused content on a path that answers its caller directly (outreach,
+/// forum posts, owner DMs, corrections, channel names and topics). Nothing was sent to Discord.
+/// The endpoint filter turns it into 422 (held) or 503 (unavailable) with the verdict.
+/// </summary>
+public sealed class DiscordSentinelRefusedException(bool unavailable, JsonObject review) : Exception(
+    unavailable
+        ? "The outbound Sentinel review is unavailable, so nothing was sent to Discord."
+        : "The outbound Sentinel held this content, so nothing was sent to Discord.")
+{
+    public bool Unavailable { get; } = unavailable;
+    public JsonObject Review { get; } = review;
+}
 
 public sealed class DiscordConversationCoordinator(
     DiscordBindingStore bindings,
@@ -46,11 +70,12 @@ public sealed class DiscordConversationCoordinator(
         PromptInjectionDetector injection,
         DiscordEgressGuard egress,
         DiscordTypingLeases typing,
-        ILogger<DiscordConversationCoordinator> logger)
+        ILogger<DiscordConversationCoordinator> logger,
+        IUntrustedContentReview? sentinel = null)
         : this(bindings, deliveries, botConfigurations,
             new DiscordBehaviorStore(botConfigurations.EntityStore),
             runtimeOptions, userIdentities, compute, providers, injection,
-            egress, typing, logger)
+            egress, typing, logger, sentinel)
     {
     }
 
@@ -403,9 +428,11 @@ public sealed class DiscordConversationCoordinator(
         IReadOnlyList<ExternalConversationOutputAsset>? outputAssets)
     {
         string? inspectedCanonical = null;
+        var hiddenCharacters = false;
         if (content is not null)
         {
             var inspected = egress.Inspect(content);
+            hiddenCharacters |= inspected.Findings.Contains(DiscordEgressGuard.HiddenCharactersFinding);
             if (!inspected.Allowed)
                 throw new ArgumentException(
                     "Discord correction content was rejected by the egress guard");
@@ -419,6 +446,7 @@ public sealed class DiscordConversationCoordinator(
             if (!inspected.Allowed)
                 throw new ArgumentException(
                     "Discord correction delivery content was rejected by the egress guard");
+            hiddenCharacters |= inspected.Findings.Contains(DiscordEgressGuard.HiddenCharactersFinding);
             inspectedDelivery = inspected.Content;
         }
 
@@ -439,7 +467,7 @@ public sealed class DiscordConversationCoordinator(
             throw new ArgumentException(
                 "Private RedLeaf Asset Markdown requires explicit Discord delivery content");
 
-        return new DiscordPreparedCorrection(inspectedDelivery, inspectedAssets);
+        return new DiscordPreparedCorrection(inspectedDelivery, inspectedAssets, hiddenCharacters);
     }
 
     private async Task<(DiscordBinding Binding, string MessageUid)> SendProactiveCoreAsync(
@@ -453,6 +481,17 @@ public sealed class DiscordConversationCoordinator(
         IReadOnlyList<ExternalConversationOutputAsset>? outputAssets,
         CancellationToken ct)
     {
+        // A message delivered before its transcript copy existed was reviewed by its caller
+        // before Discord saw it; everything queued here is reviewed now, outside the gate.
+        JsonObject? review = null;
+        if (deliveredDiscordMessageId is null)
+        {
+            var toReview = PrepareOutreach(content, deliveryContent, outputAssets);
+            review = await ReviewOutgoingOrThrowAsync(
+                await OutgoingContextAsync(binding, ct), toReview.DeliveryContent,
+                toReview.OutputAssets.Count, toReview.HiddenCharacters,
+                $"outreach:{binding.BindingId}:{requestId}", ct);
+        }
         var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
@@ -514,6 +553,16 @@ public sealed class DiscordConversationCoordinator(
                     i,
                     i < chunks.Count ? chunks[i] : "",
                     i < assetGroups.Length ? assetGroups[i] : [],
+                    review is null
+                        ? new JsonObject
+                        {
+                            ["review_exempt"] = DiscordDeliveryStore.DeliveredBeforeTranscriptExemption,
+                        }
+                        : new JsonObject
+                        {
+                            ["outbound_review"] = review.DeepClone(),
+                            ["review_action"] = JsonRead.String(review, "outcome"),
+                        },
                     ct);
                 if (deliveredDiscordMessageId is not null)
                 {
@@ -544,6 +593,8 @@ public sealed class DiscordConversationCoordinator(
         if (!inspected.Allowed)
             throw new ArgumentException("Discord outreach content was rejected by the egress guard");
         var inspectedDelivery = egress.Inspect(deliveryContent ?? inspected.Content);
+        var hiddenCharacters = inspected.Findings.Contains(DiscordEgressGuard.HiddenCharactersFinding)
+            || inspectedDelivery.Findings.Contains(DiscordEgressGuard.HiddenCharactersFinding);
         if (!inspectedDelivery.Allowed)
             throw new ArgumentException(
                 "Discord outreach delivery content was rejected by the egress guard");
@@ -564,7 +615,7 @@ public sealed class DiscordConversationCoordinator(
             throw new ArgumentException(
                 "Private RedLeaf Asset Markdown requires typed Discord output Assets");
         return new DiscordPreparedOutreach(
-            inspected.Content, inspectedDelivery.Content, inspectedAssets);
+            inspected.Content, inspectedDelivery.Content, inspectedAssets, hiddenCharacters);
     }
 
     private static bool LooksLikePrivateAssetImageMarkdown(string content)
@@ -660,6 +711,15 @@ public sealed class DiscordConversationCoordinator(
                     continue;
                 }
                 if (message.Kind is not ("text" or "commentary")) continue;
+                if (message.Kind == "commentary")
+                {
+                    // No model-written text leaves unreviewed, and reviewing every progress note
+                    // would delay the answer, so commentary is never posted. Tool markers (when
+                    // shown) and typing still say that work is under way.
+                    if (!string.IsNullOrWhiteSpace(message.Content))
+                        typing.Activate(binding.BindingId, message.MessageUid);
+                    continue;
+                }
 
                 var deliveryContent = message.Kind == "text"
                     ? message.DeliveryContent ?? message.Content ?? ""
@@ -686,18 +746,11 @@ public sealed class DiscordConversationCoordinator(
                     : [];
                 if (!string.IsNullOrWhiteSpace(inspected.Content) || outputAssets.Length > 0)
                     typing.Activate(binding.BindingId, message.MessageUid);
-                if (message.Kind == "commentary")
-                {
-                    await deliveries.EnqueueProgressAsync(
-                        binding, message, inspected.Content, marker: null, ct);
-                    continue;
-                }
-
                 // A reply reaches Discord only after its outbound Sentinel review. The review is
                 // durable in the outbox (see ReviewPendingOutboundAsync). Without a verdict the
                 // reply is not delivered.
-                var reviewed = !message.MessageUid.StartsWith(
-                    "discord-outreach-", StringComparison.Ordinal);
+                // A transcript copy of reviewed outreach finds its existing rows and adds none.
+                var hidden = inspected.Findings.Contains(DiscordEgressGuard.HiddenCharactersFinding);
                 var chunks = DiscordMessageChunker.Split(inspected.Content);
                 var assetGroups = outputAssets.Chunk(10).ToArray();
                 var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
@@ -706,11 +759,9 @@ public sealed class DiscordConversationCoordinator(
                     var chunk = i < chunks.Count ? chunks[i] : "";
                     IReadOnlyList<ExternalConversationOutputAsset> assets =
                         i < assetGroups.Length ? assetGroups[i] : [];
-                    _ = reviewed
-                        ? await deliveries.EnqueueOutboundForReviewAsync(
-                            binding, message, i, chunk, assets, ct)
-                        : await deliveries.EnqueueOutboundAsync(
-                            binding, message, i, chunk, assets, ct);
+                    await deliveries.EnqueueOutboundForReviewAsync(
+                        binding, message, i, chunk, assets, deliveryCount, TurnKey(binding),
+                        hidden, ct);
                 }
             }
 
@@ -758,13 +809,28 @@ public sealed class DiscordConversationCoordinator(
         {
             var current = await bindings.GetAsync(binding.EntityId, ct);
             if (current is null || !current.Enabled) return progressed;
-            var pending = await deliveries.PendingReviewAsync(
-                current.BindingId, current.Generation, ct);
+            // Read under the gate: reconcile writes every chunk of a reply in one gate hold, so a
+            // reply is never seen half written.
+            IReadOnlyList<DiscordDelivery> pending;
+            var gate = gates.GetOrAdd(current.BindingId, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(ct);
+            try
+            {
+                pending = await deliveries.PendingReviewAsync(current.BindingId, current.Generation, ct);
+            }
+            finally
+            {
+                gate.Release();
+            }
             if (pending.Count == 0) return progressed;
             var messageUid = pending[0].MessageUid;
             var chunks = pending
                 .Where(item => string.Equals(item.MessageUid, messageUid, StringComparison.Ordinal))
                 .ToList();
+            // A reply is reviewed and released as one unit. One left incomplete by a stop
+            // mid-write is completed by the next settled read, which re-reads from the cursor.
+            var expected = chunks.Max(item => item.ChunkCount ?? chunks.Count);
+            if (chunks.Select(item => item.ChunkIndex).Distinct().Count() < expected) return progressed;
             // A reply waiting to ask the Sentinel again also holds every later reply.
             if (chunks.Any(item => item.ReviewNextAt > clock.GetUtcNow())) return progressed;
             var review = chunks.Select(item => item.OutboundReview).FirstOrDefault(item => item is not null)
@@ -791,11 +857,19 @@ public sealed class DiscordConversationCoordinator(
             return string.Join("\n", new[] { text }.Concat(assets)
                 .Where(part => !string.IsNullOrEmpty(part)));
         }));
-        var turn = TurnKey(binding);
+        var turn = chunks[0].ReplyTurn ?? TurnKey(binding);
         var watch = Stopwatch.StartNew();
-        var result = await RunOutboundReviewAsync(binding, messageUid, content, ct);
+        var deterministic = DeterministicHoldSignals(
+            chunks.Any(chunk => chunk.HiddenCharacters),
+            chunks.Any(chunk => chunk.Payload?["assets"] is JsonArray { Count: > 0 }));
+        UntrustedContentReviewResult? result = null;
+        var verdict = deterministic.Count > 0
+            ? DeterministicHold(deterministic)
+            : EffectiveVerdict(result = await RunOutboundReviewAsync(
+                binding.OwnerId, binding.AgentId, binding.SentinelQualityMode,
+                $"{binding.BindingId}:{binding.Generation}", await AudienceAsync(binding, ct),
+                $"sentinel-outbound:{binding.BindingId}:{binding.Generation}:{messageUid}", content, ct));
         watch.Stop();
-        var verdict = result?.Verdict ?? UntrustedContentVerdict.Unavailable();
         if (!verdict.Available)
         {
             // Fail closed: no verdict, no delivery. Ask again a bounded number of times while
@@ -812,8 +886,7 @@ public sealed class DiscordConversationCoordinator(
                 return null;
             }
         }
-        var hold = verdict.Available
-                   && (verdict.Risk == "high" || verdict.Handling == "require_private_approval");
+        var hold = IsHold(verdict);
         // One rewrite per inbound turn: a held rewrite, or any later held reply before the next
         // participant message, is withheld for good and Discord sees a short notice instead.
         var outcome = !verdict.Available ? "withheld"
@@ -829,14 +902,80 @@ public sealed class DiscordConversationCoordinator(
             watch.ElapsedMilliseconds);
     }
 
+    internal const string ImageNotReviewableSignal = "image-not-reviewable";
+
+    /// <summary>
+    /// Holds that need no model: hidden characters the egress guard removed (a covert channel),
+    /// and images, which the tool-free Sentinel cannot see, so their content is unreviewable.
+    /// </summary>
+    private static IReadOnlyList<string> DeterministicHoldSignals(bool hiddenCharacters, bool images)
+    {
+        var signals = new List<string>();
+        if (hiddenCharacters) signals.Add(DiscordEgressGuard.HiddenCharactersFinding);
+        if (images) signals.Add(ImageNotReviewableSignal);
+        return signals;
+    }
+
+    private static UntrustedContentVerdict DeterministicHold(IReadOnlyList<string> signals)
+        => new("high", signals, "require_private_approval", true, UntrustedContentIsolation.Unknown);
+
+    /// <summary>
+    /// A verdict counts only when the Sentinel proves it applied the outbound rubric; an older
+    /// reviewer that ignored Direction is unavailable here, so the reply fails closed.
+    /// </summary>
+    internal static UntrustedContentVerdict EffectiveVerdict(UntrustedContentReviewResult? result)
+        => result is { Direction: UntrustedContentDirection.Outbound }
+            ? result.Verdict
+            : UntrustedContentVerdict.Unavailable(result?.Verdict.Isolation ?? UntrustedContentIsolation.Unknown);
+
+    private static bool IsHold(UntrustedContentVerdict verdict)
+        => verdict.Available && (verdict.Risk == "high" || verdict.Handling == "require_private_approval");
+
+    internal async Task<DiscordOutgoingContext> OutgoingContextAsync(
+        DiscordBinding binding, CancellationToken ct)
+        => new(binding.OwnerId, binding.AgentId, binding.SentinelQualityMode,
+            $"{binding.BindingId}:{binding.Generation}", await AudienceAsync(binding, ct));
+
+    /// <summary>
+    /// The outbound pass for content whose caller is waiting (outreach, forum posts, owner DMs,
+    /// corrections, channel names and topics). Fail closed: held or unavailable throws
+    /// <see cref="DiscordSentinelRefusedException"/> before anything reaches Discord, and the
+    /// caller, the session that wrote the content, gets the verdict in the response.
+    /// </summary>
+    internal async Task<JsonObject> ReviewOutgoingOrThrowAsync(
+        DiscordOutgoingContext context, string content, int assetCount, bool hiddenCharacters,
+        string key, CancellationToken ct)
+    {
+        var watch = Stopwatch.StartNew();
+        var deterministic = DeterministicHoldSignals(hiddenCharacters, assetCount > 0);
+        UntrustedContentReviewResult? result = null;
+        var verdict = deterministic.Count > 0
+            ? DeterministicHold(deterministic)
+            : EffectiveVerdict(result = await RunOutboundReviewAsync(
+                context.OwnerUserId, context.AgentId, context.SentinelQualityMode, context.SourceRef,
+                context.Audience, $"sentinel-outbound:{key}", content, ct));
+        watch.Stop();
+        var hold = IsHold(verdict);
+        var review = OutboundReviewRecord(verdict,
+            !verdict.Available ? "withheld" : hold ? "held" : "delivered", "-",
+            result?.JobId, result?.TraceId, watch.ElapsedMilliseconds);
+        logger.LogInformation(
+            "Discord outbound review of {Key}: {Outcome} (available {Available}, risk {Risk}, {ElapsedMs} ms)",
+            key, JsonRead.String(review, "outcome"), verdict.Available, verdict.Risk, watch.ElapsedMilliseconds);
+        if (!verdict.Available || hold)
+            throw new DiscordSentinelRefusedException(!verdict.Available, review);
+        return review;
+    }
+
     private async Task<UntrustedContentReviewResult?> RunOutboundReviewAsync(
-        DiscordBinding binding, string messageUid, string content, CancellationToken ct)
+        string? ownerUserId, string agentId, string sentinelQualityMode, string sourceRef,
+        string audience, string idempotencyKey, string content, CancellationToken ct)
     {
         if (sentinel is null) return null;
         try
         {
             UntrustedContentCompute? compute = null;
-            if (await runtimeOptions.ResolveQualityModeAsync(binding.SentinelQualityMode, ct) is { } mode)
+            if (await runtimeOptions.ResolveQualityModeAsync(sentinelQualityMode, ct) is { } mode)
                 compute = new UntrustedContentCompute
                 {
                     Provider = string.IsNullOrWhiteSpace(mode.Provider) ? null : mode.Provider,
@@ -848,20 +987,19 @@ public sealed class DiscordConversationCoordinator(
             {
                 Content = content,
                 Origin = new UntrustedContentOrigin(
-                    UntrustedContentSources.Discord, $"{binding.BindingId}:{binding.Generation}",
-                    binding.OwnerId, LeafDiscordPlugin.PluginId),
+                    UntrustedContentSources.Discord, sourceRef, ownerUserId, LeafDiscordPlugin.PluginId),
                 Compute = compute,
-                AgentRef = binding.AgentId,
+                AgentRef = agentId,
                 Direction = UntrustedContentDirection.Outbound,
-                Audience = await AudienceAsync(binding, ct),
-                IdempotencyKey = $"sentinel-outbound:{binding.BindingId}:{binding.Generation}:{messageUid}",
+                Audience = audience,
+                IdempotencyKey = idempotencyKey.Length <= 200 ? idempotencyKey : idempotencyKey[..200],
                 JobName = "Discord outbound review",
             }, ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            // The Sentinel never throws for runtime failures; anything else is still advisory.
-            logger.LogWarning(ex, "Discord outbound review of {MessageUid} failed", messageUid);
+            // The Sentinel never throws for runtime failures; anything else is unavailable.
+            logger.LogWarning(ex, "Discord outbound review {Key} failed", idempotencyKey);
             return null;
         }
     }
@@ -870,17 +1008,21 @@ public sealed class DiscordConversationCoordinator(
     private async Task<string> AudienceAsync(DiscordBinding binding, CancellationToken ct)
     {
         if (binding.Kind == "dm")
-        {
-            var counterpart = binding.CounterpartyUserId is null
-                ? null
-                : await userIdentities.ResolveAsync(binding.CounterpartyUserId, binding.OwnerId, ct);
-            return counterpart?.IsConversationOwner == true
-                ? "a Discord direct message with the verified owner (Discord is still an external service)"
-                : "a Discord direct message with a participant who is not the owner";
-        }
+            return await DirectMessageAudienceAsync(binding.CounterpartyUserId, binding.OwnerId, ct);
         return binding.Kind is "thread" or "forum_post"
             ? "a thread in a Discord server, readable by every member who can see it"
             : "a channel in a Discord server, readable by every member who can see it";
+    }
+
+    internal async Task<string> DirectMessageAudienceAsync(
+        string? recipientUserId, string ownerUserId, CancellationToken ct)
+    {
+        var counterpart = recipientUserId is null
+            ? null
+            : await userIdentities.ResolveAsync(recipientUserId, ownerUserId, ct);
+        return counterpart?.IsConversationOwner == true
+            ? "a Discord direct message with the verified owner (Discord is still an external service)"
+            : "a Discord direct message with a participant who is not the owner";
     }
 
     private async Task<bool> ApplyOutboundReviewAsync(
@@ -1011,7 +1153,8 @@ public sealed class DiscordConversationCoordinator(
             "assistant", "text", inspected.Content, DateTimeOffset.UtcNow);
         var chunks = DiscordMessageChunker.Split(inspected.Content);
         for (var i = 0; i < chunks.Count; i++)
-            await deliveries.EnqueueOutboundAsync(binding, message, i, chunks[i], ct);
+            await deliveries.EnqueueOutboundAsync(binding, message, i, chunks[i], [],
+                new JsonObject { ["review_exempt"] = DiscordDeliveryStore.BridgeNoticeExemption }, ct);
     }
 
     internal static string NoticeMessageUid(DiscordBinding binding, string requestId)

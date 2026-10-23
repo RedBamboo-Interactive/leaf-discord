@@ -65,7 +65,8 @@ public sealed partial class DiscordEgressGuard
     public EgressAssessment Inspect(string content)
     {
         var findings = new List<string>();
-        var output = content;
+        var output = StripHiddenCharacters(content);
+        if (!ReferenceEquals(output, content)) findings.Add(HiddenCharactersFinding);
         output = Replace(CredentialPattern(), "[redacted credential]", "credential");
         output = Replace(JwtPattern(), "[redacted token]", "token");
         output = Replace(PrivatePathPattern(), "[redacted private path]", "private-path");
@@ -88,6 +89,59 @@ public sealed partial class DiscordEgressGuard
             findings.Add(finding);
             return regex.Replace(output, replacement);
         }
+    }
+
+    public const string HiddenCharactersFinding = "hidden-characters";
+
+    /// <summary>
+    /// Removes what a reader would not see but a model or client could: Unicode tag characters,
+    /// bidi controls, zero-width and other invisible format characters, a byte-order mark, joiners
+    /// that split ASCII (joiners inside emoji stay), and runs of two or more variation selectors.
+    /// The same rules as cap-sentinel's hidden-content scanner. Returns the input instance when
+    /// nothing was removed.
+    /// </summary>
+    internal static string StripHiddenCharacters(string content)
+    {
+        System.Text.StringBuilder? output = null;
+        var previous = -1;
+        for (var index = 0; index < content.Length;)
+        {
+            var codePoint = CodePointAt(content, index, out var width);
+            var next = index + width < content.Length ? CodePointAt(content, index + width, out _) : -1;
+            var remove = codePoint is 0xE0001 or (>= 0xE0020 and <= 0xE007F)
+                    or (>= 0x202A and <= 0x202E) or (>= 0x2066 and <= 0x2069)
+                    or 0x200B or 0x2060 or 0x2061 or 0x2062 or 0x2063 or 0x2064 or 0x180E or 0x00AD or 0xFEFF
+                || codePoint is 0x200C or 0x200D && NeighboursAscii(content, index)
+                || IsVariationSelector(codePoint) && (IsVariationSelector(next) || IsVariationSelector(previous));
+            if (remove)
+                output ??= new System.Text.StringBuilder(content, 0, index, content.Length);
+            else
+                output?.Append(content, index, width);
+            previous = codePoint;
+            index += width;
+        }
+        return output?.ToString() ?? content;
+    }
+
+    private static int CodePointAt(string text, int index, out int width)
+    {
+        if (char.IsHighSurrogate(text[index]) && index + 1 < text.Length && char.IsLowSurrogate(text[index + 1]))
+        {
+            width = 2;
+            return char.ConvertToUtf32(text[index], text[index + 1]);
+        }
+        width = 1;
+        return text[index];
+    }
+
+    private static bool IsVariationSelector(int codePoint)
+        => codePoint is (>= 0xFE00 and <= 0xFE0F) or (>= 0xE0100 and <= 0xE01EF);
+
+    private static bool NeighboursAscii(string content, int index)
+    {
+        var before = index > 0 ? content[index - 1] : ' ';
+        var after = index + 1 < content.Length ? content[index + 1] : ' ';
+        return before < 0x80 || after < 0x80;
     }
 
     [GeneratedRegex(@"(?i)\b(api[_-]?key|access[_-]?token|client[_-]?secret|bot[_-]?token|password)\s*[:=]\s*[^\s,;]{8,}")]
