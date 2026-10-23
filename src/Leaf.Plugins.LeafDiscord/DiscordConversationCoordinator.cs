@@ -974,12 +974,20 @@ public sealed class DiscordConversationCoordinator(
         {
             // No compute: the Sentinel always runs on its configured tier (fast by default) on
             // the installation's default provider.
+            // The reviewer runs with no request or execution scope to inherit, so it states its
+            // own provenance; RedLeaf turns that into the signed execution identity Compute needs.
+            var provenance = await DiscordComputeProvenance.CreateAsync(
+                botConfigurations.EntityStore, agentId, ownerUserId,
+                [new ComputeContextReference("external-conversation", sourceRef),
+                 new ComputeContextReference("outbound-review", idempotencyKey)],
+                idempotencyKey, ct);
             return await sentinel.ReviewAsync(new UntrustedContentReviewRequest
             {
                 Content = content,
                 Origin = new UntrustedContentOrigin(
                     UntrustedContentSources.Discord, sourceRef, ownerUserId, LeafDiscordPlugin.PluginId),
                 AgentRef = agentId,
+                ComputeProvenance = provenance,
                 Direction = UntrustedContentDirection.Outbound,
                 Audience = audience,
                 IdempotencyKey = idempotencyKey.Length <= 200 ? idempotencyKey : idempotencyKey[..200],

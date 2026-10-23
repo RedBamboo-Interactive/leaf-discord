@@ -2846,16 +2846,30 @@ internal sealed class DiscordBotRuntime(
     public async Task AddReactionAsync(
         DiscordBinding binding, string messageId, string emoji, CancellationToken ct = default)
     {
-        if (!ulong.TryParse(messageId, out _))
+        if (!ulong.TryParse(messageId, out var parsedMessageId))
             throw new ArgumentException("Discord message id must be a snowflake", nameof(messageId));
-        emoji = emoji.Trim();
-        if (emoji.Length is < 1 or > 128 || emoji.Any(char.IsControl))
-            throw new ArgumentException("Discord reaction emoji is invalid", nameof(emoji));
+        // Validate before checking transport availability so malformed public requests are a
+        // deterministic 400 and never become Discord's opaque 10014 "Unknown Emoji" response.
+        var reaction = DiscordReactionEmoji.Parse(emoji);
         var config = await GetConfigAsync(ct);
         if (client is null || string.IsNullOrWhiteSpace(config.BotToken))
             throw new InvalidOperationException("Discord is not connected");
-        await rest.AddReactionAsync(
-            config.BotToken, binding.ConversationId, messageId, emoji, ct);
+        if (!ulong.TryParse(binding.ConversationId, out var channelId))
+            throw new InvalidOperationException("Discord binding channel is invalid");
+        try
+        {
+            // Use the connected Discord.Net client's reaction operation. Its IEmote-aware route
+            // owns Discord's Unicode/custom identifier encoding and shares the gateway client's
+            // authenticated REST and rate-limit state.
+            await client.Rest.AddReactionAsync(channelId, parsedMessageId, reaction,
+                new RequestOptions { CancelToken = ct });
+        }
+        catch (HttpException ex)
+        {
+            var discordCode = ex.DiscordCode is null ? "" : $" (Discord code {ex.DiscordCode})";
+            throw new DiscordRestException(ex.HttpCode,
+                $"Discord REST {(int)ex.HttpCode}: {ex.Reason}{discordCode}");
+        }
     }
 
     public async Task<string> PinExistingBindingMessageAsync(
@@ -4271,9 +4285,23 @@ internal sealed class DiscordBotRuntime(
         {
             outboundReviewRequests.Add(binding.BindingId);
             if (outboundReviewRunners.ContainsKey(binding.BindingId)) return;
-            outboundReviewRunners[binding.BindingId] = Task.Run(
-                () => RunOutboundReviewsAsync(binding, ct), CancellationToken.None);
+            // A review never borrows the identity of whatever request kicked the drain: it runs
+            // as the binding's own background work and states its provenance explicitly.
+            outboundReviewRunners[binding.BindingId] = RunDetached(
+                () => RunOutboundReviewsAsync(binding, ct));
         }
+    }
+
+    /// <summary>
+    /// Starts bridge-owned background work without flowing an HTTP request, signed execution
+    /// scope, or any other ambient AsyncLocal state from the caller.
+    /// </summary>
+    internal static Task RunDetached(Func<Task> work)
+    {
+        if (ExecutionContext.IsFlowSuppressed())
+            return Task.Run(work, CancellationToken.None);
+        using (ExecutionContext.SuppressFlow())
+            return Task.Run(work, CancellationToken.None);
     }
 
     private async Task RunOutboundReviewsAsync(DiscordBinding binding, CancellationToken ct)

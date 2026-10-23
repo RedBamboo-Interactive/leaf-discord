@@ -781,6 +781,91 @@ public sealed class DiscordOutboundReviewTests
             h.Coordinator.SendExistingProactiveAsync(h.Binding, "out-2", "Hello again."))).Unavailable);
     }
 
+    /// <summary>
+    /// The reviewer runs with no request or execution scope, so RedLeaf's ComputeGateway can issue
+    /// a signed execution identity only from the provenance on the request. These are the fields it
+    /// needs: an actor id, and a user beneficiary with an id (or the system).
+    /// </summary>
+    private static void AssertGatewayCanIssue(
+        ComputeProvenance? provenance, string ownerId, string agentEntityId,
+        string sourceRef, string reviewRef)
+    {
+        Assert.NotNull(provenance);
+        Assert.Equal(ComputeProvenance.CurrentSchemaVersion, provenance!.SchemaVersion);
+        Assert.Equal("redleaf", provenance.Origin.Service);
+        Assert.Equal("leaf-discord", provenance!.Origin.App.Id);
+        Assert.Equal("discord", provenance.Origin.Entrypoint.Kind);
+        Assert.Equal(DiscordComputeProvenance.ReviewRoute, provenance.Origin.Entrypoint.Route);
+        Assert.Equal("REVIEW", provenance.Origin.Entrypoint.Method);
+        Assert.Equal("agent", provenance.Actor.Kind);
+        Assert.Equal(agentEntityId, provenance.Actor.EntityId);
+        Assert.False(string.IsNullOrWhiteSpace(provenance.Actor.Id ?? provenance.Actor.EntityId));
+        Assert.Equal("user", provenance.OnBehalfOf.Kind);
+        Assert.Equal(ownerId, provenance.OnBehalfOf.Id);
+        Assert.Equal(ComputeProvenanceAssurance.Verified, provenance.Assurance);
+        Assert.Contains(provenance.Context,
+            item => item.Kind == "external-conversation" && item.Id == sourceRef);
+        Assert.Contains(provenance.Context,
+            item => item.Kind == "outbound-review" && item.Id == reviewRef);
+        Assert.Equal(reviewRef, provenance.Trace.CorrelationId);
+    }
+
+    [Fact]
+    public async Task Background_and_direct_reviews_carry_the_provenance_the_gateway_needs()
+    {
+        var entities = new MemoryEntityStore();
+        var owner = await entities.UpsertBySlugAsync("user", "owner", "Owner Example", new JsonObject());
+        var agent = await entities.UpsertBySlugAsync("agent", "nova", "Nova", new JsonObject());
+        _ = await entities.UpsertBySlugAsync("plugin", "leaf-discord", "Discord", new JsonObject());
+        var h = await Harness.CreateAsync(_ => Clean, entities, ownerId: owner.Id.ToString(), acceptInjection: true);
+        h.Reply(1, "reply-1", "Here is the fix.");
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        await h.Coordinator.SendExistingProactiveAsync(h.Binding, "out-1", "Hello there.");
+
+        Assert.Equal(2, h.Sentinel.Requests.Count);
+        AssertGatewayCanIssue(h.Sentinel.Requests[0].ComputeProvenance,
+            owner.Id.ToString(), agent.Id.ToString(), $"{h.Binding.BindingId}:1",
+            $"sentinel-outbound:{h.Binding.BindingId}:1:reply-1");
+        AssertGatewayCanIssue(h.Sentinel.Requests[1].ComputeProvenance,
+            owner.Id.ToString(), agent.Id.ToString(), $"{h.Binding.BindingId}:1",
+            $"sentinel-outbound:outreach:{h.Binding.BindingId}:out-1");
+        Assert.Equal("Owner Example", h.Sentinel.Requests[0].ComputeProvenance!.OnBehalfOf.NameSnapshot);
+    }
+
+    [Fact]
+    public async Task A_review_with_an_unresolved_owner_uses_the_bounded_system_fallback()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Reply(1, "reply-1", "Here is the fix.");
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        var provenance = Assert.Single(h.Sentinel.Requests).ComputeProvenance;
+        Assert.NotNull(provenance);
+        Assert.Equal("nova", provenance!.Actor.Id);
+        Assert.Equal("system", provenance.OnBehalfOf.Kind);
+        Assert.Null(provenance.OnBehalfOf.Id);
+        Assert.Contains("no longer resolvable", provenance.OnBehalfOf.Reason);
+    }
+
+    [Fact]
+    public async Task Background_review_runner_does_not_flow_an_unrelated_execution_context()
+    {
+        var ambient = new AsyncLocal<string?> { Value = "unrelated-request" };
+        string? observed = "not-run";
+
+        await DiscordBotRuntime.RunDetached(async () =>
+        {
+            await Task.Yield();
+            observed = ambient.Value;
+        });
+
+        Assert.Null(observed);
+    }
+
     private sealed class Harness
     {
         public required MemoryEntityStore Entities { get; init; }

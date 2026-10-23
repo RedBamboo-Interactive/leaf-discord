@@ -137,20 +137,55 @@ public sealed class DiscordTransportTests
         Assert.DoesNotContain("/api/assets/", missing.Content, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task Reaction_targets_the_bound_channel_message_with_an_encoded_emoji()
+    [Theory]
+    [InlineData("❤️", "❤")]
+    [InlineData("👍", "👍")]
+    [InlineData("🎉", "🎉")]
+    [InlineData("👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦")]
+    [InlineData("👩‍❤️‍👩", "👩‍❤️‍👩")]
+    public void Reaction_parses_standard_emoji_and_preserves_semantic_sequences(
+        string emoji, string normalized)
     {
-        var handler = new QueueHandler(new HttpResponseMessage(HttpStatusCode.NoContent));
-        using var transport = new DiscordRestTransport(handler);
+        var parsed = DiscordReactionEmoji.Parse(emoji);
 
-        await transport.AddReactionAsync("secret", "123", "456", "👍");
+        var unicode = Assert.IsType<Discord.Emoji>(parsed);
+        Assert.Equal(normalized, unicode.Name);
+    }
 
-        var put = Assert.Single(handler.Requests);
-        Assert.Equal(HttpMethod.Put, put.Method);
-        Assert.Equal(
-            "https://discord.com/api/v10/channels/123/messages/456/reactions/%F0%9F%91%8D/@me",
-            put.Uri);
-        Assert.Equal("Bot secret", put.Authorization);
+    [Theory]
+    [InlineData("party:123456789012345678")]
+    [InlineData("<a:party:123456789012345678>")]
+    public void Reaction_preserves_Discord_custom_emoji_identifiers(string emoji)
+    {
+        var parsed = DiscordReactionEmoji.Parse(emoji);
+
+        var custom = Assert.IsType<Discord.Emote>(parsed);
+        Assert.Equal("party", custom.Name);
+        Assert.Equal(123456789012345678UL, custom.Id);
+    }
+
+    [Theory]
+    [InlineData("not an emoji")]
+    [InlineData("ðŸ˜…")]
+    [InlineData("�")]
+    [InlineData("%F0%9F%91%8D")]
+    public void Reaction_rejects_malformed_or_pre_encoded_emoji_before_transport(string emoji)
+    {
+        var error = Assert.Throws<ArgumentException>(() => DiscordReactionEmoji.Normalize(emoji));
+
+        Assert.Contains("Discord reaction emoji", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Json_unicode_escape_reaches_the_reaction_parser_as_the_intended_emoji()
+    {
+        var parsed = JsonSerializer.Deserialize<DiscordReactionRequest>(
+            "{\"messageId\":\"456\",\"emoji\":\"\\uD83D\\uDC4D\"}",
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.Equal("456", parsed!.MessageId);
+        Assert.Equal("👍", Assert.IsType<Discord.Emoji>(
+            DiscordReactionEmoji.Parse(parsed.Emoji)).Name);
     }
 
     [Fact]

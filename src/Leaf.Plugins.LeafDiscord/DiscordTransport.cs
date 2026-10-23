@@ -512,19 +512,6 @@ public sealed class DiscordRestTransport : IDisposable
             $"attachments; {expectedAttachmentCount} were required");
     }
 
-    public async Task AddReactionAsync(
-        string botToken, string channelId, string messageId, string emoji,
-        CancellationToken ct = default)
-    {
-        var encodedEmoji = Uri.EscapeDataString(emoji);
-        using var request = Authorized(HttpMethod.Put,
-            $"channels/{channelId}/messages/{messageId}/reactions/{encodedEmoji}/@me", botToken);
-        using var response = await http.SendAsync(request, ct);
-        if (response.IsSuccessStatusCode) return;
-        var raw = await response.Content.ReadAsStringAsync(ct);
-        throw DiscordRestException.From(response, raw);
-    }
-
     public async Task PinMessageAsync(
         string botToken, string channelId, string messageId,
         CancellationToken ct = default)

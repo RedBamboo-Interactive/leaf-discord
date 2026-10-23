@@ -154,6 +154,21 @@ inside the source binding's guild and are limited to history visible to the same
 other applications, and other guilds cannot use this path. Returned Discord structure and
 content are explicitly untrusted.
 
+The same signed session can react to the current turn's admitted inbound message:
+
+```http
+POST /api/apps/leaf-discord/reactions
+Content-Type: application/json
+
+{"messageId":"<current envelope messageId>","emoji":"\u2764\uFE0F"}
+```
+
+Literal UTF-8 emoji are accepted. In shell commands, JSON Unicode escapes avoid console or
+argument-encoding corruption. Standard emoji are validated and converted to Discord's
+canonical URL-encoded reaction identifier; custom emoji use `name:id` (the displayed
+`<:name:id>` and `<a:name:id>` forms are accepted too). Malformed, replacement, mojibake, and
+already-percent-encoded values are rejected with `400 invalid_reaction` before Discord is called.
+
 Discord forum posts are Discord thread channels. The first inbound message in a human-created
 post therefore creates or reuses a normal `thread` binding with the forum as its parent. That
 post gets its own persistent Agent session and durable delivery stream, and replies use the
