@@ -485,6 +485,11 @@ public sealed class DiscordConversationCoordinator(
         // before Discord saw it; everything queued here is reviewed now, outside the gate.
         JsonObject? review = null;
         if (deliveredDiscordMessageId is null)
+            // An exact retry of outreach that already passed (queued or sent) replays its
+            // recorded verdict, so it returns its original result even while the Sentinel is down.
+            review = await deliveries.FindOutboundReviewAsync(binding, OutreachMessageUid(binding, requestId), ct)
+                is { } recorded && JsonRead.String(recorded, "outcome") == "delivered" ? recorded : null;
+        if (deliveredDiscordMessageId is null && review is null)
         {
             var toReview = PrepareOutreach(content, deliveryContent, outputAssets);
             review = await ReviewOutgoingOrThrowAsync(
@@ -512,8 +517,7 @@ public sealed class DiscordConversationCoordinator(
 
             var (_, handle, attached) = await EnsureConversationAsync(binding, ct);
             binding = attached;
-            var messageUid =
-                $"discord-outreach-{DiscordBindingStore.Hash($"{binding.BindingId}:{binding.Generation}:{requestId}")}";
+            var messageUid = OutreachMessageUid(binding, requestId);
             using var inject = new HttpRequestMessage(
                 HttpMethod.Post, $"/ai-session/sessions/{handle.SessionId}/inject")
             {
@@ -579,6 +583,9 @@ public sealed class DiscordConversationCoordinator(
             gate.Release();
         }
     }
+
+    private static string OutreachMessageUid(DiscordBinding binding, string requestId)
+        => $"discord-outreach-{DiscordBindingStore.Hash($"{binding.BindingId}:{binding.Generation}:{requestId}")}";
 
     /// <summary>
     /// Applies the outreach egress contract without side effects, so a caller that must

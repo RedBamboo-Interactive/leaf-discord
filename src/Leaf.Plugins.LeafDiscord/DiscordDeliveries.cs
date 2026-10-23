@@ -331,12 +331,15 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
         }, ct)).Select(Map)
             .Where(item => item.Generation == binding.Generation && item.Kind == MessageKind)
             .ToList();
-        foreach (var row in rows.Where(item => item.State is "queued" or "retry"
-                     && item.OutboundReview is null && item.ReviewExempt is null))
+        // Only the chunks still to send are reviewed and released together; chunks Discord
+        // already has are not part of the unit, or the reply would never be complete.
+        var unsent = rows.Where(item => item.State is "queued" or "retry"
+            && item.OutboundReview is null && item.ReviewExempt is null).ToList();
+        foreach (var row in unsent)
             _ = await store.PatchAsync(row.EntityId, new JsonObject
             {
                 ["state"] = ReviewingState,
-                ["chunk_count"] = rows.Count,
+                ["chunk_count"] = unsent.Count,
             }, ct: ct);
     }
 

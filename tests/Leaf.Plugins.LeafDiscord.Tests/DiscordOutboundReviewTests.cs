@@ -744,6 +744,43 @@ public sealed class DiscordOutboundReviewTests
         Assert.Equal(["name: showcase", "topic: Share projects", "available_tags[0].name: bug"], text);
     }
 
+    [Fact]
+    public async Task A_pre_upgrade_reply_with_a_chunk_already_sent_reviews_and_releases_the_rest()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        var legacy = new ExternalConversationMessage(
+            new ExternalConversationCursor("epoch-1", 1), "legacy-1", "assistant", "text", "x",
+            DateTimeOffset.UtcNow);
+        var first = await h.Deliveries.EnqueueOutboundAsync(h.Binding, legacy, 0, "sent before the upgrade", []);
+        await h.Deliveries.EnqueueOutboundAsync(h.Binding, legacy, 1, "still queued", []);
+        await h.Deliveries.MarkSentAsync(first, "900000000000000001");
+
+        await h.Deliveries.MarkUnreviewedForReviewAsync(h.Binding, "legacy-1");
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+
+        Assert.Equal("still queued", Assert.Single(h.Sentinel.Requests).Content);
+        var queued = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        Assert.Equal(1, queued.ChunkIndex);
+        Assert.Equal("queued", queued.State);
+    }
+
+    [Fact]
+    public async Task A_replayed_outreach_returns_its_original_result_while_the_sentinel_is_down()
+    {
+        var h = await Harness.CreateAsync(_ => Clean, acceptInjection: true);
+        var first = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "out-1", "Hello there.");
+
+        h.Sentinel.Decide = _ => UntrustedContentVerdict.Unavailable();
+        var replay = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "out-1", "Hello there.");
+
+        Assert.Equal(first.MessageUid, replay.MessageUid);
+        Assert.Single(h.Sentinel.Requests);
+        Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        // A different request is still reviewed, and refused while the Sentinel is down.
+        Assert.True((await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            h.Coordinator.SendExistingProactiveAsync(h.Binding, "out-2", "Hello again."))).Unavailable);
+    }
+
     private sealed class Harness
     {
         public required MemoryEntityStore Entities { get; init; }
@@ -761,7 +798,8 @@ public sealed class DiscordOutboundReviewTests
             MemoryEntityStore? entities = null,
             string kind = "guild_channel",
             string ownerId = "owner-1",
-            string? counterparty = null)
+            string? counterparty = null,
+            bool acceptInjection = false)
         {
             entities ??= new MemoryEntityStore();
             _ = await entities.UpsertBySlugAsync("quality-mode", "deep-codex", "Deep (Codex)", new JsonObject
@@ -776,7 +814,8 @@ public sealed class DiscordOutboundReviewTests
                 "100000000000000001", kind == "dm" ? "323456789012345678" : "123456789012345678", kind,
                 kind == "dm" ? null : "223456789012345678", null, "nova", ownerId,
                 "nova-discord-external", "participate", CounterpartyUserId: counterparty));
-            var harness = Build(entities, bindings, binding, decide, new ScriptedProvider(), new ManualClock());
+            var harness = Build(entities, bindings, binding, decide, new ScriptedProvider(), new ManualClock(),
+                acceptInjection ? new AcceptingComputeGateway() : new NoComputeGateway());
             harness.Binding = await harness.Coordinator.EnsureReadyAsync(binding);
             return harness;
         }
@@ -789,13 +828,13 @@ public sealed class DiscordOutboundReviewTests
             var binding = await Bindings.GetAsync(Binding.EntityId) ?? throw new InvalidOperationException();
             if (resetCursor)
                 binding = await Bindings.AdvanceCursorAsync(binding, new ExternalConversationCursor("epoch-1", 0));
-            return Build(Entities, Bindings, binding, decide, provider, Clock);
+            return Build(Entities, Bindings, binding, decide, provider, Clock, new NoComputeGateway());
         }
 
         private static Harness Build(
             MemoryEntityStore entities, DiscordBindingStore bindings, DiscordBinding binding,
             Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide, ScriptedProvider provider,
-            ManualClock clock)
+            ManualClock clock, IComputeGateway compute)
         {
             var deliveries = new DiscordDeliveryStore(entities);
             var sentinel = new FakeSentinel(decide ?? (_ => Clean));
@@ -804,7 +843,7 @@ public sealed class DiscordOutboundReviewTests
                 bindings, deliveries, configurations, new DiscordBehaviorStore(entities),
                 new DiscordRuntimeOptionsResolver(entities),
                 new DiscordUserIdentityResolver(entities, NullLogger<DiscordUserIdentityResolver>.Instance),
-                new NoComputeGateway(), [provider], new PromptInjectionDetector(),
+                compute, [provider], new PromptInjectionDetector(),
                 new DiscordEgressGuard(), new DiscordTypingLeases(),
                 NullLogger<DiscordConversationCoordinator>.Instance,
                 decide is null ? null : sentinel, clock);
@@ -867,6 +906,7 @@ public sealed class DiscordOutboundReviewTests
         : IUntrustedContentReview
     {
         public List<UntrustedContentReviewRequest> Requests { get; } = [];
+        public Func<UntrustedContentReviewRequest, UntrustedContentVerdict> Decide { get; set; } = decide;
         /// <summary>False acts like a cap-sentinel that predates outbound reviews.</summary>
         public bool EchoDirection { get; set; } = true;
 
@@ -875,7 +915,7 @@ public sealed class DiscordOutboundReviewTests
         {
             Requests.Add(request);
             return Task.FromResult(new UntrustedContentReviewResult(
-                decide(request), null, [], new UntrustedContentScreening(0, [], [], request.Content, []),
+                Decide(request), null, [], new UntrustedContentScreening(0, [], [], request.Content, []),
                 "job-1", "trace-1") { Direction = EchoDirection ? request.Direction : UntrustedContentDirection.Inbound });
         }
 
@@ -935,6 +975,24 @@ public sealed class DiscordOutboundReviewTests
         private DateTimeOffset now = DateTimeOffset.UtcNow;
         public override DateTimeOffset GetUtcNow() => now;
         public void Advance(TimeSpan by) => now += by;
+    }
+
+    /// <summary>Accepts transcript injections the way RedCompute confirms them.</summary>
+    private sealed class AcceptingComputeGateway : IComputeGateway
+    {
+        public async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, ComputeProvenance? provenance = null, CancellationToken ct = default)
+        {
+            var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct))!;
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(new JsonObject
+                {
+                    ["injected"] = true,
+                    ["messageUid"] = body["messageUid"]?.GetValue<string>(),
+                }.ToJsonString()),
+            };
+        }
     }
 
     private sealed class NoComputeGateway : IComputeGateway
