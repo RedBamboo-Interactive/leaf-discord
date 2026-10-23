@@ -125,7 +125,7 @@ export function validateInput(input, manifest, packageJson) {
   if (input.component.id !== "leaf-discord" || input.component.kind !== "extension"
       || input.component.version !== manifest.version) fail("Producer component identity must match plugin.json.")
   if (manifest.id !== "leaf-discord" || manifest.name !== "Discord"
-      || manifest.kernelApi !== "^0.1.0" || manifest.backend?.assembly !== "Leaf.Plugins.LeafDiscord"
+      || manifest.kernelApi !== "^0.1.3" || manifest.backend?.assembly !== "Leaf.Plugins.LeafDiscord"
       || !manifest.frontend) fail("plugin.json must describe the Discord backend-plus-frontend extension.")
   if (manifest.frontend.package !== packageJson.name || packageJson.name !== "leaf-discord-web"
       || packageJson.version !== manifest.version) fail("Discord frontend identity does not match plugin.json.")
