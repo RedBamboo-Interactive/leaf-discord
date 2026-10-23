@@ -49,9 +49,7 @@ type BotConfig = {
   hasBotToken: boolean
   enabled: boolean
   agentId: string
-  sentinelAgentId: string
   sessionQualityMode: string
-  sentinelQualityMode: string
   audienceProfile: string
   dmAllowlist: string[]
   clearAllowlist: string[]
@@ -143,9 +141,7 @@ export function DiscordSettingsPanel() {
     clearBotToken: false,
     enabled: key === "enabled" ? value : config.enabled,
     agentId: key === "default_agent" ? value : config.agentId,
-    sentinelAgentId: key === "default_agent" ? value : config.sentinelAgentId,
     sessionQualityMode: key === "session_quality_mode" ? value : config.sessionQualityMode,
-    sentinelQualityMode: key === "sentinel_quality_mode" ? value : config.sentinelQualityMode,
     dmAllowlist: key === "dm_allowlist" ? value : config.dmAllowlist,
     clearAllowlist: key === "clear_allowlist" ? value : config.clearAllowlist,
     maxAttachmentBytes: key === "max_attachment_bytes" ? value : config.maxAttachmentBytes,
@@ -192,7 +188,6 @@ export function DiscordSettingsPanel() {
   const status = selected?.status
   const agentField = optionField("default_agent")
   const sessionField = optionField("session_quality_mode")
-  const sentinelField = optionField("sentinel_quality_mode")
   const presenceField = optionField("presence_context_mode")
   return <div>
     <div className="flex items-center justify-between gap-3">
@@ -294,9 +289,6 @@ export function DiscordSettingsPanel() {
         {sessionField && <FieldControl section="access" field={{
           ...sessionField, value: selected.config.sessionQualityMode,
         }} onSave={save} />}
-        {sentinelField && <FieldControl section="access" field={{
-          ...sentinelField, value: selected.config.sentinelQualityMode,
-        }} onSave={save} />}
       </section>
       <section>
         <SectionHeader>Access and attachments</SectionHeader>
@@ -347,7 +339,6 @@ export function DiscordSettingsPanel() {
       onOpenChange={setAdding}
       agentField={agentField}
       sessionField={sessionField}
-      sentinelField={sentinelField}
       onCreated={async () => {
         setNotice("Discord bot added.")
         await reload()
@@ -379,7 +370,6 @@ function AddBotDialog({
   onOpenChange,
   agentField,
   sessionField,
-  sentinelField,
   onCreated,
   onError,
 }: {
@@ -387,7 +377,6 @@ function AddBotDialog({
   onOpenChange: (open: boolean) => void
   agentField?: Field
   sessionField?: Field
-  sentinelField?: Field
   onCreated: () => Promise<void>
   onError: (message: string) => void
 }) {
@@ -396,7 +385,6 @@ function AddBotDialog({
   const [token, setToken] = useState("")
   const [agentId, setAgentId] = useState("")
   const [sessionMode, setSessionMode] = useState("")
-  const [sentinelMode, setSentinelMode] = useState("")
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -408,10 +396,7 @@ function AddBotDialog({
     setSessionMode(sessionField?.value == null
       ? sessionField?.options?.[0]?.value ?? ""
       : String(sessionField.value))
-    setSentinelMode(sentinelField?.value == null
-      ? sentinelField?.options?.[0]?.value ?? ""
-      : String(sentinelField.value))
-  }, [agentField, open, sentinelField, sessionField])
+  }, [agentField, open, sessionField])
 
   const create = async () => {
     setSaving(true)
@@ -426,9 +411,7 @@ function AddBotDialog({
           clearBotToken: false,
           enabled: false,
           agentId,
-          sentinelAgentId: agentId,
           sessionQualityMode: sessionMode,
-          sentinelQualityMode: sentinelMode,
           dmAllowlist: [],
           clearAllowlist: [],
           maxAttachmentBytes: 10 * 1024 * 1024,
@@ -475,16 +458,11 @@ function AddBotDialog({
           field={{ ...sessionField, value: sessionMode }}
           onSave={async (value) => setSessionMode(value)}
         />}
-        {sentinelField && <EntityReferenceControl
-          label="Sentinel quality mode"
-          field={{ ...sentinelField, value: sentinelMode }}
-          onSave={async (value) => setSentinelMode(value)}
-        />}
       </div>
       <div className="flex justify-end gap-2">
         <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
         <Button
-          disabled={saving || !applicationId || publicKey.length !== 64 || !agentId || !sessionMode || !sentinelMode}
+          disabled={saving || !applicationId || publicKey.length !== 64 || !agentId || !sessionMode}
           onClick={() => void create()}
         >
           {saving && <i className="ph-bold ph-spinner animate-spin text-xs" />}

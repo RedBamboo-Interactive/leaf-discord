@@ -96,7 +96,10 @@ public sealed class DiscordCoordinatorTests
         Assert.Empty(await deliveries.PendingInboundAsync(binding.BindingId));
         Assert.Empty(await deliveries.PendingOutboundAsync(binding.BindingId));
         Assert.Equal(2, provider.SendAttempts);
-        Assert.Equal("nova", provider.LastInput?.Metadata?["sentinel_agent_id"]?.GetValue<string>());
+        // The bridge no longer chooses anything about the Sentinel: no sentinel_* metadata at all.
+        Assert.Equal("nova", provider.LastInput?.Metadata?["agent_id"]?.GetValue<string>());
+        Assert.DoesNotContain(provider.LastInput!.Metadata!,
+            pair => pair.Key.StartsWith("sentinel_", StringComparison.Ordinal));
         Assert.Equal(attachment, Assert.Single(provider.LastInput!.Attachments));
         Assert.Equal("active",
             provider.LastInput.Metadata?["discord_guild_context"]?["mode"]?.GetValue<string>());
@@ -556,8 +559,8 @@ public sealed class DiscordCoordinatorTests
         var config = (await configurations.ListAsync()).Single();
         await configurations.SaveAsync(config.EntityId, new LeafDiscordConfigUpdate(
             config.ApplicationId, config.InteractionPublicKey, null, false, false,
-            config.SentinelAgentId, [], [], config.MaxAttachmentBytes, config.AgentId,
-            config.SessionQualityMode, config.SentinelQualityMode, ShowToolActivity: false));
+            [], [], config.MaxAttachmentBytes, config.AgentId,
+            config.SessionQualityMode, ShowToolActivity: false));
         var bindings = new DiscordBindingStore(entities);
         var deliveries = new DiscordDeliveryStore(entities);
         var binding = await bindings.CreateAsync(new CreateDiscordBinding(
@@ -988,12 +991,10 @@ public sealed class DiscordCoordinatorTests
             null,
             false,
             false,
-            "nova",
             [],
             [],
             10 * 1024 * 1024,
             "nova",
-            "deep-codex",
             "deep-codex"), ownerUserId: "owner-1");
         return configurations;
     }

@@ -74,8 +74,11 @@ Each Leaf Agent needs its own Discord application.
   troubleshooting. Discord participants do not become Leaf users, operators, or
   delegates for the installation owner.
 - Messages, attachments, web pages, logs, and tool results remain untrusted data.
-- Primary and Sentinel quality modes are independently configurable; their provider,
-  model and effort may use Codex, Claude, OpenCode, or another compatible RedCompute provider.
+- The primary session's quality mode is configurable per bot; its provider, model and effort may
+  use Codex, Claude, OpenCode, or another compatible RedCompute provider. The bridge does not choose
+  the Sentinel's compute: cap-sentinel always runs on its configured abstract quality tier (fast by
+  default) on the installation's default provider, changed only through its sentinel-configuration
+  entity. Stored sentinel_quality_mode and sentinel_agent values from earlier versions are ignored.
 - The Sentinel is isolated, read-only, requests no network, and has no Leaf execution
   credential or writable private workspace. Provider-native tool availability is not the
   security boundary. Its verdict is advisory; the selected Agent remains responsible for every action.

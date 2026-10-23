@@ -285,7 +285,7 @@ public sealed class DiscordChannelGapTests
         using var ingestor = new DiscordAttachmentIngestor(assets, new BytesHandler(bytes));
         var config = new LeafDiscordConfig(
             ApplicationId, new string('a', 64), "token", true,
-            "nova", "nova", "deep-codex", "deep-codex",
+            "nova", "deep-codex",
             "nova-discord-external", "avatar", new HashSet<string>(),
             new HashSet<string>(), 1024);
         var source = new DiscordAttachmentSource(

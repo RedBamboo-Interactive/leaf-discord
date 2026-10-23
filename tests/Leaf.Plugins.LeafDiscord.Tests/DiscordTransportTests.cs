@@ -345,7 +345,7 @@ public sealed class DiscordTransportTests
 
     private static LeafDiscordConfig Config(long maxAttachmentBytes) => new(
         "100000000000000001", new string('a', 64), "token", true,
-        "nova", "nova", "deep-codex", "deep-codex",
+        "nova", "deep-codex",
         "nova-discord-external", "avatar", new HashSet<string>(),
         new HashSet<string>(), maxAttachmentBytes);
 

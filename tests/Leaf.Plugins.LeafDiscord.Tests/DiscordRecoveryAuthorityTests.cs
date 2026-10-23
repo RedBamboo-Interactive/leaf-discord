@@ -78,7 +78,7 @@ public sealed class DiscordRecoveryAuthorityTests
             var configurations = new DiscordBotConfigurationStore(
                 entities, new LeafDiscordConfigStore(entities));
             await configurations.CreateAsync(new LeafDiscordConfigUpdate(
-                ApplicationId, new string('a', 64), "token", false, botEnabled, "nova",
+                ApplicationId, new string('a', 64), "token", false, botEnabled,
                 allowlisted ? [Counterparty] : [], [], AgentId: "nova"));
             var bindings = new DiscordBindingStore(entities);
             var created = await bindings.GetOrCreateAsync(new CreateDiscordBinding(

@@ -44,9 +44,10 @@ public sealed class DiscordConfigStoreTests
     }
 
     [Fact]
-    public async Task Agent_and_compute_profiles_are_persisted_independently()
+    public async Task Agent_and_session_compute_are_persisted_and_no_sentinel_setting_is_written()
     {
-        var config = new LeafDiscordConfigStore(new MemoryEntityStore());
+        var store = new MemoryEntityStore();
+        var config = new LeafDiscordConfigStore(store);
         var current = await config.GetAsync();
 
         await config.SaveAsync(new LeafDiscordConfigUpdate(
@@ -55,18 +56,45 @@ public sealed class DiscordConfigStoreTests
             null,
             false,
             false,
-            current.SentinelAgentId,
             [],
             [],
             current.MaxAttachmentBytes,
             "agent-alpha",
-            "standard-opencode",
-            "fast-codex"));
+            "standard-opencode"));
 
         var persisted = await config.GetAsync();
         Assert.Equal("agent-alpha", persisted.AgentId);
         Assert.Equal("standard-opencode", persisted.SessionQualityMode);
-        Assert.Equal("fast-codex", persisted.SentinelQualityMode);
+        var data = (await store.GetBySlugAsync(LeafDiscordConfigStore.TypeSlug, LeafDiscordConfigStore.Slug))!.Data;
+        Assert.False(data.ContainsKey("sentinel_agent"));
+        Assert.False(data.ContainsKey("sentinel_quality_mode"));
+    }
+
+    [Fact]
+    public async Task Stored_sentinel_settings_from_earlier_versions_are_ignored()
+    {
+        var store = new MemoryEntityStore();
+        await store.UpsertBySlugAsync(LeafDiscordConfigStore.TypeSlug, LeafDiscordConfigStore.Slug, "Discord",
+            new System.Text.Json.Nodes.JsonObject
+            {
+                ["application_id"] = ApplicationId,
+                ["interaction_public_key"] = PublicKey,
+                ["default_agent"] = "agent-alpha",
+                ["sentinel_agent"] = "retired-sentinel-agent",
+                ["session_quality_mode"] = "standard-opencode",
+                ["sentinel_quality_mode"] = "deep-claude",
+            });
+        var config = new LeafDiscordConfigStore(store);
+
+        var current = await config.GetAsync();
+        Assert.Equal("agent-alpha", current.AgentId);
+        Assert.Equal("standard-opencode", current.SessionQualityMode);
+
+        // Saving after an upgrade keeps working; the retired keys are simply never read.
+        await config.SaveAsync(new LeafDiscordConfigUpdate(
+            ApplicationId, PublicKey, null, false, false, [], [], current.MaxAttachmentBytes,
+            current.AgentId, current.SessionQualityMode));
+        Assert.Equal("agent-alpha", (await config.GetAsync()).AgentId);
     }
 
     [Fact]
@@ -82,13 +110,11 @@ public sealed class DiscordConfigStoreTests
             null,
             false,
             false,
-            current.SentinelAgentId,
             [],
             [],
             current.MaxAttachmentBytes,
             current.AgentId,
             current.SessionQualityMode,
-            current.SentinelQualityMode,
             "roster"));
 
         Assert.Equal("roster", (await config.GetAsync()).PresenceContextMode);
@@ -98,13 +124,11 @@ public sealed class DiscordConfigStoreTests
             null,
             false,
             false,
-            current.SentinelAgentId,
             [],
             [],
             current.MaxAttachmentBytes,
             current.AgentId,
             current.SessionQualityMode,
-            current.SentinelQualityMode,
             "active",
             true));
         Assert.True((await config.GetAsync()).PresenceExtensionFeedEnabled);
@@ -116,13 +140,11 @@ public sealed class DiscordConfigStoreTests
                 null,
                 false,
                 false,
-                current.SentinelAgentId,
                 [],
                 [],
                 current.MaxAttachmentBytes,
                 current.AgentId,
                 current.SessionQualityMode,
-                current.SentinelQualityMode,
                 "everyone")));
     }
 }

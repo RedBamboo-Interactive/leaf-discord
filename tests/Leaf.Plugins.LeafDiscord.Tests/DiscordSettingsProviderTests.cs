@@ -9,7 +9,7 @@ public sealed class DiscordSettingsProviderTests
     {
         var config = new LeafDiscordConfig(
             "application", "public-key", "secret", true,
-            "nova", "nova", "deep-codex", "research-codex",
+            "nova", "deep-codex",
             "external", "avatar", new HashSet<string>(), new HashSet<string>(), 1024);
         var status = new DiscordBotStatus(
             "connected", true, true, "Nova", 1, DateTimeOffset.UtcNow, null);
@@ -37,7 +37,8 @@ public sealed class DiscordSettingsProviderTests
             .Select(node => node!.AsObject())
             .ToDictionary(field => field["key"]!.GetValue<string>());
         var primary = fields["session_quality_mode"]["options"]!.AsArray();
-        var sentinel = fields["sentinel_quality_mode"]["options"]!.AsArray();
+        // The Sentinel's compute is not a bridge setting any more.
+        Assert.False(fields.ContainsKey("sentinel_quality_mode"));
 
         Assert.Equal("entity_ref", fields["default_agent"]["type"]!.GetValue<string>());
         Assert.Equal("agent", fields["default_agent"]["targetType"]!.GetValue<string>());
@@ -47,13 +48,10 @@ public sealed class DiscordSettingsProviderTests
         Assert.Equal("quality-mode",
             fields["session_quality_mode"]["targetType"]!.GetValue<string>());
         Assert.Equal(2, primary.Count);
-        Assert.Equal(2, sentinel.Count);
-        Assert.NotSame(primary, sentinel);
         Assert.Equal("deep-codex", primary[0]!["value"]!.GetValue<string>());
         Assert.Equal("deep-entity", primary[0]!["entity"]!["id"]!.GetValue<string>());
         Assert.Equal("quality-mode",
             primary[0]!["entity"]!["typeSlug"]!.GetValue<string>());
-        Assert.Equal("research-codex", sentinel[1]!["value"]!.GetValue<string>());
         var presence = descriptor["sections"]!.AsArray()
             .Select(node => node!.AsObject())
             .Single(section => section["id"]!.GetValue<string>() == "presence");

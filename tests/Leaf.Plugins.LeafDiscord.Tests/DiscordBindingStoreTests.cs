@@ -85,7 +85,7 @@ public sealed class DiscordBindingStoreTests
     }
 
     [Fact]
-    public async Task Binding_pins_agent_and_both_compute_profiles()
+    public async Task Binding_pins_agent_and_session_compute_and_no_sentinel_compute()
     {
         var store = new MemoryEntityStore();
         var bindings = new DiscordBindingStore(store);
@@ -94,13 +94,15 @@ public sealed class DiscordBindingStoreTests
             "100000000000000001", "423456789012345678", "guild_channel",
             "223456789012345678", null, "agent-alpha", "owner-1",
             "discord-external", "participate", "ideas", "Dogfooders", null,
-            "standard-opencode", "fast-codex"));
+            "standard-opencode"));
 
         var persisted = await bindings.GetAsync(binding.EntityId);
         Assert.NotNull(persisted);
         Assert.Equal("agent-alpha", persisted.AgentId);
         Assert.Equal("standard-opencode", persisted.SessionQualityMode);
-        Assert.Equal("fast-codex", persisted.SentinelQualityMode);
+        // The Sentinel chooses its own compute; bindings no longer store one.
+        var data = (await store.GetAsync(binding.EntityId))!.Data;
+        Assert.False(data.ContainsKey("sentinel_quality_mode"));
     }
 
     [Fact]

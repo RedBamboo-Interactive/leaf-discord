@@ -14,9 +14,7 @@ public sealed record LeafDiscordConfig(
     string? BotToken,
     bool Enabled,
     string AgentId,
-    string SentinelAgentId,
     string SessionQualityMode,
-    string SentinelQualityMode,
     string AudienceProfile,
     string AvatarAssetId,
     IReadOnlySet<string> DmAllowlist,
@@ -58,9 +56,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             ["interaction_public_key"] = "",
             ["enabled"] = false,
             ["default_agent"] = "nova",
-            ["sentinel_agent"] = "nova",
             ["session_quality_mode"] = "deep-codex",
-            ["sentinel_quality_mode"] = "deep-codex",
             ["audience_profile"] = "nova-discord-external",
             ["avatar_asset_id"] = "",
             ["dm_allowlist"] = new JsonArray(),
@@ -96,9 +92,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             JsonRead.String(data, "bot_token"),
             JsonRead.Bool(data, "enabled"),
             JsonRead.String(data, "default_agent") ?? "nova",
-            JsonRead.String(data, "sentinel_agent") ?? "nova",
             JsonRead.String(data, "session_quality_mode") ?? "deep-codex",
-            JsonRead.String(data, "sentinel_quality_mode") ?? "deep-codex",
             JsonRead.String(data, "audience_profile") ?? "nova-discord-external",
             JsonRead.String(data, "avatar_asset_id") ?? "",
             JsonRead.StringSet(data, "dm_allowlist"),
@@ -135,9 +129,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             ["bot_token"] = normalized.BotToken,
             ["enabled"] = normalized.Enabled,
             ["default_agent"] = normalized.AgentId,
-            ["sentinel_agent"] = normalized.SentinelAgentId,
             ["session_quality_mode"] = normalized.SessionQualityMode,
-            ["sentinel_quality_mode"] = normalized.SentinelQualityMode,
             ["dm_allowlist"] = new JsonArray(normalized.DmAllowlist
                 .Select(value => (JsonNode?)JsonValue.Create(value)).ToArray()),
             ["clear_allowlist"] = new JsonArray(normalized.ClearAllowlist
@@ -159,9 +151,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             JsonRead.String(saved.Data, "bot_token"),
             JsonRead.Bool(saved.Data, "enabled"),
             JsonRead.String(saved.Data, "default_agent") ?? normalized.AgentId,
-            JsonRead.String(saved.Data, "sentinel_agent") ?? normalized.SentinelAgentId,
             JsonRead.String(saved.Data, "session_quality_mode") ?? normalized.SessionQualityMode,
-            JsonRead.String(saved.Data, "sentinel_quality_mode") ?? normalized.SentinelQualityMode,
             JsonRead.String(saved.Data, "audience_profile") ?? normalized.AudienceProfile,
             JsonRead.String(saved.Data, "avatar_asset_id") ?? "",
             JsonRead.StringSet(saved.Data, "dm_allowlist"),
@@ -207,12 +197,8 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
             Enabled = update.Enabled,
             AgentId = string.IsNullOrWhiteSpace(update.AgentId)
                 ? existing.AgentId : update.AgentId.Trim(),
-            SentinelAgentId = string.IsNullOrWhiteSpace(update.SentinelAgentId)
-                ? existing.SentinelAgentId : update.SentinelAgentId.Trim(),
             SessionQualityMode = string.IsNullOrWhiteSpace(update.SessionQualityMode)
                 ? existing.SessionQualityMode : update.SessionQualityMode.Trim(),
-            SentinelQualityMode = string.IsNullOrWhiteSpace(update.SentinelQualityMode)
-                ? existing.SentinelQualityMode : update.SentinelQualityMode.Trim(),
             DmAllowlist = dmAllowlist.ToHashSet(StringComparer.Ordinal),
             ClearAllowlist = clearAllowlist.ToHashSet(StringComparer.Ordinal),
             MaxAttachmentBytes = Math.Clamp(update.MaxAttachmentBytes, 1, 25 * 1024 * 1024),
@@ -231,9 +217,7 @@ public sealed class LeafDiscordConfigStore(IEntityStore store)
         !string.IsNullOrWhiteSpace(config.BotToken),
         config.Enabled,
         config.AgentId,
-        config.SentinelAgentId,
         config.SessionQualityMode,
-        config.SentinelQualityMode,
         config.AudienceProfile,
         config.AvatarAssetId,
         config.GuildAvatarAssetIds,
@@ -266,9 +250,7 @@ public sealed record LeafDiscordConfigView(
     bool HasBotToken,
     bool Enabled,
     string AgentId,
-    string SentinelAgentId,
     string SessionQualityMode,
-    string SentinelQualityMode,
     string AudienceProfile,
     string AvatarAssetId,
     IReadOnlyDictionary<string, string> GuildAvatarAssetIds,
@@ -290,13 +272,11 @@ public sealed record LeafDiscordConfigUpdate(
     string? BotToken,
     bool ClearBotToken,
     bool Enabled,
-    string? SentinelAgentId,
     IReadOnlyList<string>? DmAllowlist,
     IReadOnlyList<string>? ClearAllowlist,
     long MaxAttachmentBytes = 10 * 1024 * 1024,
     string? AgentId = null,
     string? SessionQualityMode = null,
-    string? SentinelQualityMode = null,
     string? PresenceContextMode = null,
     bool? PresenceExtensionFeedEnabled = null,
     bool? ShowToolActivity = null);
@@ -345,7 +325,6 @@ public sealed record DiscordBinding(
     public string? CounterpartyUserId { get; init; }
     public string? IconUrl { get; init; }
     public string SessionQualityMode { get; init; } = "deep-codex";
-    public string SentinelQualityMode { get; init; } = "deep-codex";
     public string? ChannelAvatarAssetId { get; init; }
     public string DeliveryMode { get; init; } = "bot";
     public string? WebhookId { get; init; }
@@ -376,8 +355,7 @@ public sealed record CreateDiscordBinding(
     string? ConversationName = null,
     string? GuildName = null,
     string? CounterpartyUserId = null,
-    string SessionQualityMode = "deep-codex",
-    string SentinelQualityMode = "deep-codex");
+    string SessionQualityMode = "deep-codex");
 
 public sealed class DiscordBindingStore(IEntityStore store)
 {
@@ -429,7 +407,6 @@ public sealed class DiscordBindingStore(IEntityStore store)
                 ["parent_conversation_id"] = request.ParentConversationId,
                 ["agent"] = request.AgentId,
                 ["session_quality_mode"] = request.SessionQualityMode,
-                ["sentinel_quality_mode"] = request.SentinelQualityMode,
                 ["owner_id"] = request.OwnerId,
                 ["audience_profile"] = request.AudienceProfile,
                 ["response_mode"] = request.ResponseMode,
@@ -545,8 +522,7 @@ public sealed class DiscordBindingStore(IEntityStore store)
     public async Task<DiscordBinding> AdvanceGenerationAndAttachAsync(
         DiscordBinding binding, ExternalConversationHandle handle, string requestId,
         CancellationToken ct = default,
-        string? agentId = null, string? sessionQualityMode = null,
-        string? sentinelQualityMode = null)
+        string? agentId = null, string? sessionQualityMode = null)
     {
         if (handle.Generation != checked(binding.Generation + 1)
             || handle.BindingId != binding.BindingId)
@@ -562,7 +538,6 @@ public sealed class DiscordBindingStore(IEntityStore store)
             ["last_clear_request_id"] = requestId,
             ["agent"] = agentId ?? binding.AgentId,
             ["session_quality_mode"] = sessionQualityMode ?? binding.SessionQualityMode,
-            ["sentinel_quality_mode"] = sentinelQualityMode ?? binding.SentinelQualityMode,
         }, ct: ct));
     }
 
@@ -715,7 +690,6 @@ public sealed class DiscordBindingStore(IEntityStore store)
         {
             CounterpartyUserId = JsonRead.String(data, "counterparty_user_id"),
             SessionQualityMode = JsonRead.String(data, "session_quality_mode") ?? "deep-codex",
-            SentinelQualityMode = JsonRead.String(data, "sentinel_quality_mode") ?? "deep-codex",
             ChannelAvatarAssetId = JsonRead.String(data, "channel_avatar_asset_id"),
             DeliveryMode = JsonRead.String(data, "delivery_mode") ?? "bot",
             WebhookId = JsonRead.String(data, "webhook_id"),

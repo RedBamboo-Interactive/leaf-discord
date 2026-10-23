@@ -480,7 +480,7 @@ public sealed class DiscordBotService(
             config.ApplicationId, channel.ChannelId, "guild_channel", channel.GuildId, null,
             config.AgentId, ownerUserId, config.AudienceProfile, behavior.ResponseMode,
             channel.ChannelName, channel.GuildName, null,
-            config.SessionQualityMode, config.SentinelQualityMode), ct);
+            config.SessionQualityMode), ct);
         return await conversations.EnsureReadyAsync(binding, ct);
     }
 
@@ -823,7 +823,7 @@ internal sealed class DiscordBotRuntime(
                     "The recorded Discord forum post is no longer visible to this bot.");
             if (thread is null)
                 await conversations.ReviewOutgoingOrThrowAsync(
-                    new DiscordOutgoingContext(ownerUserId, config.AgentId, config.SentinelQualityMode,
+                    new DiscordOutgoingContext(ownerUserId, config.AgentId,
                         $"{config.ApplicationId}:{guildId}:{forumId}",
                         "a new post in a Discord server forum, readable by every member who can see it"),
                     $"{title}\n\n{content}", 0, hiddenInPost,
@@ -850,8 +850,7 @@ internal sealed class DiscordBotRuntime(
                 title,
                 forum.Guild.Name,
                 null,
-                config.SessionQualityMode,
-                config.SentinelQualityMode), ct);
+                config.SessionQualityMode), ct);
             binding = await conversations.EnsureReadyAsync(binding, ct);
             var recorded = await conversations.RecordDeliveredProactiveAsync(
                 binding, idempotencyKey, content, thread.Id.ToString(), ct);
@@ -1898,8 +1897,7 @@ internal sealed class DiscordBotRuntime(
             recipient.GlobalName ?? recipient.Username,
             null,
             recipientUserId,
-            config.SessionQualityMode,
-            config.SentinelQualityMode), ct);
+            config.SessionQualityMode), ct);
         var sent = await conversations.SendProactiveAsync(
             binding, idempotencyKey.Trim(), content.Trim(), ct);
         await DrainBindingAsync(sent.Binding, ct);
@@ -3185,8 +3183,7 @@ internal sealed class DiscordBotRuntime(
             conversationName,
             guildName,
             counterpartyUserId,
-            config.SessionQualityMode,
-            config.SentinelQualityMode));
+            config.SessionQualityMode));
     }
 
     /// <summary>
@@ -3290,8 +3287,7 @@ internal sealed class DiscordBotRuntime(
             authenticatedAuthorName,
             existing.GuildName,
             authenticatedAuthorId,
-            existing.SessionQualityMode,
-            existing.SentinelQualityMode);
+            existing.SessionQualityMode);
     }
 
     private async Task BackfillBindingsAsync()
@@ -4242,7 +4238,7 @@ internal sealed class DiscordBotRuntime(
         var text = string.Join("\n", ChannelSettingsText(settings, ""));
         if (text.Length == 0) return;
         await conversations.ReviewOutgoingOrThrowAsync(
-            new DiscordOutgoingContext(config.OwnerUserId, config.AgentId, config.SentinelQualityMode,
+            new DiscordOutgoingContext(config.OwnerUserId, config.AgentId,
                 $"{config.ApplicationId}:{guildId}",
                 "the name, topic and settings of a channel in a Discord server, visible to every member who can see it"),
             text, 0, !ReferenceEquals(DiscordEgressGuard.StripHiddenCharacters(text), text),

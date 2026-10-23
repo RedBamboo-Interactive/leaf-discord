@@ -16,6 +16,8 @@ public sealed class DiscordSettingsProvider(
         {
             ["connection"] =
                 ["application_id", "interaction_public_key", "bot_token", "clear_bot_token", "enabled", "restart_bridge"],
+            // sentinel_quality_mode is retired (the Sentinel chooses its own compute). It is still
+            // accepted from a stale form and ignored, so an old page saves instead of failing.
             ["access"] =
                 ["default_agent", "session_quality_mode", "sentinel_quality_mode",
                  "dm_allowlist", "clear_allowlist"],
@@ -78,9 +80,6 @@ public sealed class DiscordSettingsProvider(
                         "agent", AgentOptions()),
                     EntityField("session_quality_mode", config.SessionQualityMode,
                         "Provider, model, and reasoning effort for new Agent sessions.",
-                        "quality-mode", QualityOptions()),
-                    EntityField("sentinel_quality_mode", config.SentinelQualityMode,
-                        "Provider, model, and reasoning effort for isolated prompt-injection review.",
                         "quality-mode", QualityOptions()),
                     Field("dm_allowlist", "string_list", null,
                         "Discord user IDs allowed to talk to the selected Agent in direct messages.",
@@ -157,13 +156,11 @@ public sealed class DiscordSettingsProvider(
             ReadString(values, "bot_token"),
             ReadBool(values, "clear_bot_token") ?? false,
             ReadBool(values, "enabled") ?? current.Enabled,
-            ReadString(values, "sentinel_agent") ?? current.SentinelAgentId,
             ReadStringList(values, "dm_allowlist") ?? current.DmAllowlist.ToArray(),
             ReadStringList(values, "clear_allowlist") ?? current.ClearAllowlist.ToArray(),
             ReadLong(values, "max_attachment_bytes") ?? current.MaxAttachmentBytes,
             ReadString(values, "default_agent") ?? current.AgentId,
             ReadString(values, "session_quality_mode") ?? current.SessionQualityMode,
-            ReadString(values, "sentinel_quality_mode") ?? current.SentinelQualityMode,
             ReadString(values, "presence_context_mode") ?? current.PresenceContextMode,
             ReadBool(values, "presence_extension_feed_enabled")
                 ?? current.PresenceExtensionFeedEnabled,
@@ -175,9 +172,6 @@ public sealed class DiscordSettingsProvider(
         if (await runtimeOptions.ResolveQualityModeAsync(normalized.SessionQualityMode, ct) is null)
             throw new ArgumentException(
                 $"Session quality mode '{normalized.SessionQualityMode}' was not found");
-        if (await runtimeOptions.ResolveQualityModeAsync(normalized.SentinelQualityMode, ct) is null)
-            throw new ArgumentException(
-                $"Sentinel quality mode '{normalized.SentinelQualityMode}' was not found");
 
         if (!validateOnly)
         {

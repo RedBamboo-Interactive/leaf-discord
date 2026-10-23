@@ -23,7 +23,6 @@ internal sealed record DiscordPreparedCorrection(
 internal sealed record DiscordOutgoingContext(
     string? OwnerUserId,
     string AgentId,
-    string SentinelQualityMode,
     string SourceRef,
     string Audience);
 
@@ -204,7 +203,6 @@ public sealed class DiscordConversationCoordinator(
             // whatever the session actually holds; only the session-bound turn is compacted.
             var serverMap = DiscordServerMapDisclosure.Plan(binding, guildContext);
             var sessionGuildContext = serverMap.GuildContext;
-            var sentinelCompute = await ResolveComputeAsync(binding.SentinelQualityMode);
             var admission = await provider.SendAsync(handle, new ExternalConversationInput(
                 discordMessageId,
                 requestor,
@@ -217,13 +215,7 @@ public sealed class DiscordConversationCoordinator(
                     ["generation"] = binding.Generation,
                     ["owner_user_id"] = binding.OwnerId,
                     ["agent_id"] = binding.AgentId,
-                    ["sentinel_agent_id"] = binding.AgentId,
                     ["session_quality_mode"] = binding.SessionQualityMode,
-                    ["sentinel_quality_mode"] = binding.SentinelQualityMode,
-                    ["sentinel_provider"] = sentinelCompute.Provider,
-                    ["sentinel_quality_tier"] = sentinelCompute.QualityTier,
-                    ["sentinel_model"] = sentinelCompute.Model,
-                    ["sentinel_effort"] = sentinelCompute.Effort,
                     ["injection_risk_score"] = assessment.Score,
                     ["untrusted"] = true,
                     ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
@@ -650,13 +642,12 @@ public sealed class DiscordConversationCoordinator(
             {
                 AgentId = config.AgentId,
                 SessionQualityMode = config.SessionQualityMode,
-                SentinelQualityMode = config.SentinelQualityMode,
             };
             var handle = await provider.OpenAsync(await OpenRequestAsync(nextBinding, nextGeneration,
                 $"discord-clear:{binding.BindingId}:{nextGeneration}:{requestId}"), ct);
             return await bindings.AdvanceGenerationAndAttachAsync(
                 binding, handle, requestId, ct, config.AgentId,
-                config.SessionQualityMode, config.SentinelQualityMode);
+                config.SessionQualityMode);
         }
         finally
         {
@@ -873,7 +864,7 @@ public sealed class DiscordConversationCoordinator(
         var verdict = deterministic.Count > 0
             ? DeterministicHold(deterministic)
             : EffectiveVerdict(result = await RunOutboundReviewAsync(
-                binding.OwnerId, binding.AgentId, binding.SentinelQualityMode,
+                binding.OwnerId, binding.AgentId,
                 $"{binding.BindingId}:{binding.Generation}", await AudienceAsync(binding, ct),
                 $"sentinel-outbound:{binding.BindingId}:{binding.Generation}:{messageUid}", content, ct));
         watch.Stop();
@@ -940,7 +931,7 @@ public sealed class DiscordConversationCoordinator(
 
     internal async Task<DiscordOutgoingContext> OutgoingContextAsync(
         DiscordBinding binding, CancellationToken ct)
-        => new(binding.OwnerId, binding.AgentId, binding.SentinelQualityMode,
+        => new(binding.OwnerId, binding.AgentId,
             $"{binding.BindingId}:{binding.Generation}", await AudienceAsync(binding, ct));
 
     /// <summary>
@@ -959,7 +950,7 @@ public sealed class DiscordConversationCoordinator(
         var verdict = deterministic.Count > 0
             ? DeterministicHold(deterministic)
             : EffectiveVerdict(result = await RunOutboundReviewAsync(
-                context.OwnerUserId, context.AgentId, context.SentinelQualityMode, context.SourceRef,
+                context.OwnerUserId, context.AgentId, context.SourceRef,
                 context.Audience, $"sentinel-outbound:{key}", content, ct));
         watch.Stop();
         var hold = IsHold(verdict);
@@ -975,27 +966,19 @@ public sealed class DiscordConversationCoordinator(
     }
 
     private async Task<UntrustedContentReviewResult?> RunOutboundReviewAsync(
-        string? ownerUserId, string agentId, string sentinelQualityMode, string sourceRef,
+        string? ownerUserId, string agentId, string sourceRef,
         string audience, string idempotencyKey, string content, CancellationToken ct)
     {
         if (sentinel is null) return null;
         try
         {
-            UntrustedContentCompute? compute = null;
-            if (await runtimeOptions.ResolveQualityModeAsync(sentinelQualityMode, ct) is { } mode)
-                compute = new UntrustedContentCompute
-                {
-                    Provider = string.IsNullOrWhiteSpace(mode.Provider) ? null : mode.Provider,
-                    QualityTier = string.IsNullOrWhiteSpace(mode.QualityTier) ? null : mode.QualityTier,
-                    Model = mode.Model,
-                    Effort = mode.Effort,
-                };
+            // No compute: the Sentinel always runs on its configured tier (fast by default) on
+            // the installation's default provider.
             return await sentinel.ReviewAsync(new UntrustedContentReviewRequest
             {
                 Content = content,
                 Origin = new UntrustedContentOrigin(
                     UntrustedContentSources.Discord, sourceRef, ownerUserId, LeafDiscordPlugin.PluginId),
-                Compute = compute,
                 AgentRef = agentId,
                 Direction = UntrustedContentDirection.Outbound,
                 Audience = audience,
@@ -1186,7 +1169,6 @@ public sealed class DiscordConversationCoordinator(
         DiscordBinding binding, long generation, string idempotencyKey)
     {
         var session = await ResolveComputeAsync(binding.SessionQualityMode);
-        var sentinel = await ResolveComputeAsync(binding.SentinelQualityMode);
         return new(
             binding.BindingId,
             generation,
@@ -1197,8 +1179,8 @@ public sealed class DiscordConversationCoordinator(
                 "discord", binding.ApplicationId, binding.ConversationId, binding.Kind,
                 binding.GuildId, binding.ParentConversationId),
             idempotencyKey,
-            session,
-            sentinel);
+            // The Sentinel chooses its own compute (its configured tier on the default provider).
+            session);
     }
 
     private async Task<ExternalConversationComputeSelection> ResolveComputeAsync(string modeId)

@@ -101,14 +101,11 @@ public static class DiscordEndpoints
                     });
                 var sessionMode = string.IsNullOrWhiteSpace(update.SessionQualityMode)
                     ? current.SessionQualityMode : update.SessionQualityMode.Trim();
-                var sentinelMode = string.IsNullOrWhiteSpace(update.SentinelQualityMode)
-                    ? current.SentinelQualityMode : update.SentinelQualityMode.Trim();
-                if (await runtimeOptions.ResolveQualityModeAsync(sessionMode, ct) is null
-                    || await runtimeOptions.ResolveQualityModeAsync(sentinelMode, ct) is null)
+                if (await runtimeOptions.ResolveQualityModeAsync(sessionMode, ct) is null)
                     return Results.BadRequest(new
                     {
                         error = "invalid_quality_mode",
-                        message = "The selected session or Sentinel quality mode was not found",
+                        message = "The selected session quality mode was not found",
                     });
                 return Results.Ok(await configurations.SaveAsync(
                     current.EntityId, update, ct));
@@ -164,7 +161,6 @@ public static class DiscordEndpoints
                 await ValidateConfigurationAsync(
                     update.AgentId,
                     update.SessionQualityMode,
-                    update.SentinelQualityMode,
                     agents,
                     runtimeOptions,
                     ct);
@@ -204,8 +200,6 @@ public static class DiscordEndpoints
                     string.IsNullOrWhiteSpace(update.AgentId) ? current.AgentId : update.AgentId,
                     string.IsNullOrWhiteSpace(update.SessionQualityMode)
                         ? current.SessionQualityMode : update.SessionQualityMode,
-                    string.IsNullOrWhiteSpace(update.SentinelQualityMode)
-                        ? current.SentinelQualityMode : update.SentinelQualityMode,
                     agents,
                     runtimeOptions,
                     ct);
@@ -2115,7 +2109,6 @@ public static class DiscordEndpoints
     private static async Task ValidateConfigurationAsync(
         string? agentId,
         string? sessionMode,
-        string? sentinelMode,
         DiscordAgentResolver agents,
         DiscordRuntimeOptionsResolver runtimeOptions,
         CancellationToken ct)
@@ -2125,9 +2118,6 @@ public static class DiscordEndpoints
         if (await runtimeOptions.ResolveQualityModeAsync(sessionMode, ct) is null)
             throw new ArgumentException(
                 $"Session quality mode '{sessionMode}' was not found");
-        if (await runtimeOptions.ResolveQualityModeAsync(sentinelMode, ct) is null)
-            throw new ArgumentException(
-                $"Sentinel quality mode '{sentinelMode}' was not found");
     }
 
     internal static DiscordAgentCaller? ReadDiscordAgentCaller(HttpContext http)

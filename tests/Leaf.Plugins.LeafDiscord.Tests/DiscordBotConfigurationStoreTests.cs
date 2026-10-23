@@ -143,11 +143,9 @@ public sealed class DiscordBotConfigurationStoreTests
         token,
         false,
         enabled,
-        agentId,
         [],
         [],
         10 * 1024 * 1024,
         agentId,
-        "deep-codex",
         "deep-codex");
 }

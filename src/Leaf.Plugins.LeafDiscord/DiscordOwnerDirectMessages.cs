@@ -126,7 +126,7 @@ internal sealed class DiscordOwnerDirectMessenger(
 
             // Reviewed before Discord sees it; a replay of a delivered DM returned above.
             await conversations.ReviewOutgoingOrThrowAsync(
-                new DiscordOutgoingContext(ownerUserId, config.AgentId, config.SentinelQualityMode,
+                new DiscordOutgoingContext(ownerUserId, config.AgentId,
                     $"{config.ApplicationId}:dm:{recipientUserId}",
                     await conversations.DirectMessageAudienceAsync(recipientUserId, ownerUserId, ct)),
                 prepared.DeliveryContent, prepared.OutputAssets.Count, prepared.HiddenCharacters,
@@ -189,8 +189,7 @@ internal sealed class DiscordOwnerDirectMessenger(
                 channel.RecipientName,
                 null,
                 recipientUserId,
-                config.SessionQualityMode,
-                config.SentinelQualityMode), ct);
+                config.SessionQualityMode), ct);
             binding = await conversations.EnsureReadyAsync(binding, ct);
             var recorded = await conversations.RecordDeliveredProactiveAsync(
                 binding,

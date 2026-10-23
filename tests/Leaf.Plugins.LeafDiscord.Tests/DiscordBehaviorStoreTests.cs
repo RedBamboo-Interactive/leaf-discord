@@ -176,8 +176,8 @@ public sealed class DiscordBehaviorStoreTests
     }
 
     private static LeafDiscordConfig Config(Guid id) => new(
-        "10", new string('a', 64), "token", true, "nova", "nova",
-        "deep-codex", "deep-codex", "leaf-discord-external", "",
+        "10", new string('a', 64), "token", true, "nova",
+        "deep-codex", "leaf-discord-external", "",
         new HashSet<string>(), new HashSet<string>(), 10 * 1024 * 1024)
     {
         EntityId = id,

@@ -247,8 +247,8 @@ public sealed class DiscordBotStartupTests
         var legacy = Binding("dm") with { OwnerId = "local-user" };
         var canonical = legacy with { OwnerId = owner };
         var config = new LeafDiscordConfig(
-            "app", "key", "token", true, "nova", "nova",
-            "deep-codex", "deep-codex", "leaf-discord-external", "",
+            "app", "key", "token", true, "nova",
+            "deep-codex", "leaf-discord-external", "",
             new HashSet<string>(), new HashSet<string>(), 10 * 1024 * 1024);
 
         Assert.True(DiscordBotRuntime.ShouldDeferLegacyOwnerMaintenance(config, legacy));

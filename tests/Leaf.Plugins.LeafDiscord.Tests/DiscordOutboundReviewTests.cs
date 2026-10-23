@@ -47,8 +47,8 @@ public sealed class DiscordOutboundReviewTests
         Assert.Equal("owner-1", request.Origin.OwnerUserId);
         Assert.Equal("nova", request.AgentRef);
         Assert.Equal("a channel in a Discord server, readable by every member who can see it", request.Audience);
-        Assert.Equal("codex-default", request.Compute?.Provider);
-        Assert.Equal("deep", request.Compute?.QualityTier);
+        // The Sentinel runs on its own configured tier; the bridge passes no compute.
+        Assert.Null(request.Compute);
         Assert.Equal($"sentinel-outbound:{h.Binding.BindingId}:1:reply-1", request.IdempotencyKey);
         Assert.Empty(h.Provider.Inputs);
 
@@ -898,7 +898,7 @@ public sealed class DiscordOutboundReviewTests
         public async Task SeedBotConfigurationAsync()
             => await new DiscordBotConfigurationStore(new LeafDiscordConfigStore(Entities)).CreateAsync(
                 new LeafDiscordConfigUpdate("100000000000000001", new string('a', 64), null, false, false,
-                    "nova", [], [], 10 * 1024 * 1024, "nova", "deep-codex", "deep-codex"),
+                    [], [], 10 * 1024 * 1024, "nova", "deep-codex"),
                 ownerUserId: "owner-1");
     }
 

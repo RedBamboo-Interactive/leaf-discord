@@ -287,8 +287,8 @@ public sealed class DiscordOwnerDirectMessageTests
             var agent = entities.Seed("agent", "nova", "Nova", Owner);
             var configurations = new DiscordBotConfigurationStore(new LeafDiscordConfigStore(entities));
             var config = await configurations.CreateAsync(new LeafDiscordConfigUpdate(
-                ApplicationId, new string('a', 64), "test-bot-token", false, enabled, "nova",
-                [Recipient], [], 10 * 1024 * 1024, "nova", "deep-codex", "deep-codex"),
+                ApplicationId, new string('a', 64), "test-bot-token", false, enabled,
+                [Recipient], [], 10 * 1024 * 1024, "nova", "deep-codex"),
                 ownerUserId: Owner);
             var bindings = new DiscordBindingStore(entities);
             var deliveries = new DiscordDeliveryStore(entities);

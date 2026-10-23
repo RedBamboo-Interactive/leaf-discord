@@ -238,8 +238,6 @@ public sealed class DiscordBotConfigurationStore(
         null,
         false,
         "",
-        "",
-        "deep-codex",
         "deep-codex",
         "leaf-discord-external",
         "",
@@ -254,9 +252,7 @@ public sealed class DiscordBotConfigurationStore(
         ["bot_token"] = config.BotToken,
         ["enabled"] = config.Enabled,
         ["default_agent"] = config.AgentId,
-        ["sentinel_agent"] = config.SentinelAgentId,
         ["session_quality_mode"] = config.SessionQualityMode,
-        ["sentinel_quality_mode"] = config.SentinelQualityMode,
         ["audience_profile"] = string.IsNullOrWhiteSpace(config.AudienceProfile)
             ? "leaf-discord-external" : config.AudienceProfile,
         ["avatar_asset_id"] = config.AvatarAssetId,
@@ -285,10 +281,9 @@ public sealed class DiscordBotConfigurationStore(
             JsonRead.String(data, "bot_token"),
             JsonRead.Bool(data, "enabled"),
             JsonRead.String(data, "default_agent") ?? "",
-            JsonRead.String(data, "sentinel_agent")
-                ?? JsonRead.String(data, "default_agent") ?? "",
+            // Stored sentinel_agent and sentinel_quality_mode keys from earlier versions are
+            // ignored: the Sentinel chooses its own compute and names the bound Agent.
             JsonRead.String(data, "session_quality_mode") ?? "deep-codex",
-            JsonRead.String(data, "sentinel_quality_mode") ?? "deep-codex",
             JsonRead.String(data, "audience_profile") ?? "leaf-discord-external",
             JsonRead.String(data, "avatar_asset_id") ?? "",
             JsonRead.StringSet(data, "dm_allowlist"),
