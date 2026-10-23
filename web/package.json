@@ -1,6 +1,7 @@
 {
   "name": "leaf-discord-web",
   "version": "0.1.0",
+  "packageManager": "pnpm@11.0.9",
   "description": "Discord plugin frontend",
   "type": "module",
   "private": true,
