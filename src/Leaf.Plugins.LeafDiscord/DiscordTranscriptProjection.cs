@@ -11,7 +11,8 @@ namespace Leaf.Plugins.LeafDiscord;
 /// hold only the raw Discord text; their <c>attachmentsJson</c> still carries the Discord
 /// message IDs and Sentinel review, and authorship comes from the bridge's inbound store.
 /// A leading channel-gap block (earlier unseen channel messages the session received ahead
-/// of the turn) is removed, so each turn shows only what its author wrote.
+/// of the turn) is removed, so each turn shows only what its author wrote. An assistant reply
+/// carries its outbound Sentinel review as <c>metadata.discord.outboundSentinel</c>.
 /// </summary>
 internal static class DiscordTranscriptProjection
 {
@@ -25,7 +26,8 @@ internal static class DiscordTranscriptProjection
         IReadOnlyList<ExternalConversationMessage> messages,
         Func<string, CancellationToken, Task<DiscordUserProfile?>> resolveProfile,
         Func<string, CancellationToken, Task<DiscordInboundAttribution?>>? resolveInbound = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<string, CancellationToken, Task<JsonObject?>>? resolveOutboundReview = null)
     {
         var projected = new List<ExternalConversationMessage>(messages.Count);
         var profiles = new Dictionary<string, DiscordUserProfile?>(StringComparer.Ordinal);
@@ -57,6 +59,26 @@ internal static class DiscordTranscriptProjection
             if (message.Role == "assistant"
                 && DiscordControlMessages.IsNoReply(message.Content))
                 continue;
+
+            if (message.Role == "assistant" && message.Kind == "text"
+                && resolveOutboundReview is not null
+                && await resolveOutboundReview(message.MessageUid, ct) is { } outbound)
+            {
+                var metadata = message.Metadata?.DeepClone() as JsonObject ?? new JsonObject();
+                metadata["discord"] = new JsonObject
+                {
+                    ["outboundSentinel"] = new JsonObject
+                    {
+                        ["outcome"] = outbound["outcome"]?.DeepClone(),
+                        ["risk"] = outbound["risk"]?.DeepClone(),
+                        ["signals"] = outbound["signals"]?.DeepClone(),
+                        ["handling"] = outbound["handling"]?.DeepClone(),
+                        ["available"] = outbound["available"]?.DeepClone(),
+                    },
+                };
+                projected.Add(message with { Metadata = metadata });
+                continue;
+            }
 
             var parsed = TryParseEnvelope(message);
             if (parsed?.ExternalId is { } envelopeAuthor)

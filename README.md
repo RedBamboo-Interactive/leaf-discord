@@ -12,9 +12,9 @@ stores the token as an encrypted secret and never returns it through the plugin 
 
 The extension appears in the existing **Discord** tab, where each Agent's server,
 thread, and direct-message conversations remain separate. Discord participants are
-external requestors, not owner delegates. A Sentinel review checks inbound messages,
-and the Agent still applies its normal privacy and authority rules before replying or
-using tools.
+external requestors, not owner delegates. A Sentinel review checks inbound messages
+and, before delivery, each reply for disclosure of the owner's private information; the
+Agent still applies its normal privacy and authority rules before replying or using tools.
 
 ## Install the extension
 
@@ -81,6 +81,14 @@ Each Leaf Agent needs its own Discord application.
   security boundary. Its verdict is advisory; the selected Agent remains responsible for every action.
 - The selected Agent must not disclose its owner's personal information or private context, and
   consequential actions on the owner's behalf require confirmation on a private Leaf surface.
+- Each final reply passes the deterministic egress guard (credentials, tokens, private paths),
+  then one outbound Sentinel review before it leaves the durable outbox. The reply waits in
+  review; a reply after it never overtakes it. A held reply is not posted: the session is told
+  why and may rewrite once per participant message, and a rewrite held again is replaced by a
+  short notice in Discord. When the Sentinel is unavailable the reply is delivered and the
+  session is told it was unreviewed. Every verdict is recorded on the reply's outbox rows and
+  shown as `metadata.discord.outboundSentinel` in the transcript. Commentary and tool progress
+  are not reviewed.
 - The bot token is a RedLeaf secret field and is never returned by plugin APIs.
 
 ## Optional guild context

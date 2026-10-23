@@ -1152,6 +1152,8 @@ public static class DiscordEndpoints
                     var retained = await deliveries.FindInboundAttributionAsync(
                         binding, discordMessageId, token);
                     if (retained is not null) return retained;
+                    // Bridge notices (an outbound Sentinel hold) carry no Discord message.
+                    if (!ulong.TryParse(discordMessageId, out _)) return null;
                     // Turns admitted before attribution was retained: ask Discord, bounded
                     // per page so a long legacy gap cannot hammer the REST rate limit.
                     if (++discordLookups > MaxTranscriptDiscordLookups) return null;
@@ -1166,7 +1168,8 @@ public static class DiscordEndpoints
                         IsConversationOwner = verified.IsConversationOwner,
                     };
                 },
-                ct);
+                ct,
+                (messageUid, token) => deliveries.FindOutboundReviewAsync(binding, messageUid, token));
             return Results.Ok(new { binding, messages, nextCursor = page.NextCursor });
         });
 

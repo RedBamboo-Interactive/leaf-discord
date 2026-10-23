@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -28,7 +29,8 @@ public sealed class DiscordConversationCoordinator(
     PromptInjectionDetector injection,
     DiscordEgressGuard egress,
     DiscordTypingLeases typing,
-    ILogger<DiscordConversationCoordinator> logger) : IDisposable
+    ILogger<DiscordConversationCoordinator> logger,
+    IUntrustedContentReview? sentinel = null) : IDisposable
 {
     internal DiscordConversationCoordinator(
         DiscordBindingStore bindings,
@@ -177,6 +179,7 @@ public sealed class DiscordConversationCoordinator(
                     ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
                     ["discord_behavior"] = behaviorContext.DeepClone(),
                     ["leaf_community_peer"] = relayContext?.DeepClone(),
+                    ["outbound_sentinel_reviews"] = await OutboundReviewsForSessionAsync(binding, ct),
                 }), ct);
             if (serverMap.NextState is { } disclosed)
                 binding = await bindings.RecordServerMapDisclosureAsync(binding, disclosed, ct);
@@ -617,17 +620,32 @@ public sealed class DiscordConversationCoordinator(
                     continue;
                 }
 
+                // A reply reaches Discord only after its outbound Sentinel review. The review is
+                // durable in the outbox (see ReviewPendingOutboundAsync); without an installed
+                // Sentinel the reply is queued at once and the session hears it was unreviewed.
+                var reviewed = !message.MessageUid.StartsWith(
+                    "discord-outreach-", StringComparison.Ordinal);
                 var chunks = DiscordMessageChunker.Split(inspected.Content);
                 var assetGroups = outputAssets.Chunk(10).ToArray();
                 var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
+                var enqueued = new List<DiscordDelivery>(deliveryCount);
                 for (var i = 0; i < deliveryCount; i++)
-                    await deliveries.EnqueueOutboundAsync(
-                        binding,
-                        message,
-                        i,
-                        i < chunks.Count ? chunks[i] : "",
-                        i < assetGroups.Length ? assetGroups[i] : [],
-                        ct);
+                {
+                    var chunk = i < chunks.Count ? chunks[i] : "";
+                    IReadOnlyList<ExternalConversationOutputAsset> assets =
+                        i < assetGroups.Length ? assetGroups[i] : [];
+                    enqueued.Add(reviewed && sentinel is not null
+                        ? await deliveries.EnqueueOutboundForReviewAsync(
+                            binding, message, i, chunk, assets, ct)
+                        : await deliveries.EnqueueOutboundAsync(
+                            binding, message, i, chunk, assets, ct));
+                }
+                if (reviewed && sentinel is null && enqueued.Count > 0
+                    && enqueued[0].OutboundReview is null)
+                    await deliveries.RecordOutboundReviewAsync(enqueued,
+                        OutboundReviewRecord(UntrustedContentVerdict.Unavailable(),
+                            "delivered", TurnKey(binding), null, null, 0),
+                        TurnKey(binding), ct);
             }
 
             if (page.NextCursor is not null)
@@ -653,6 +671,244 @@ public sealed class DiscordConversationCoordinator(
             return page.IsQuiescent;
         }
     }
+
+    internal const string WithheldReplyNotice =
+        "I wrote a reply here but withheld it because it could have shared private information. " +
+        "Ask again and I'll answer without it.";
+
+    /// <summary>
+    /// Runs the outbound Sentinel review for every reply chunk of the binding's current generation
+    /// that is waiting in <see cref="DiscordDeliveryStore.ReviewingState"/>, one reply at a time in
+    /// delivery order. The model call runs outside the binding gate. The verdict and the chosen
+    /// action are written to the rows before the action, so after a restart the same action is
+    /// replayed (each one is idempotent) instead of reviewing again. Returns whether any reply
+    /// left review, so the caller can drain the outbox.
+    /// </summary>
+    public async Task<bool> ReviewPendingOutboundAsync(
+        DiscordBinding binding, CancellationToken ct = default)
+    {
+        var progressed = false;
+        while (true)
+        {
+            var current = await bindings.GetAsync(binding.EntityId, ct);
+            if (current is null || !current.Enabled) return progressed;
+            var pending = await deliveries.PendingReviewAsync(
+                current.BindingId, current.Generation, ct);
+            if (pending.Count == 0) return progressed;
+            var messageUid = pending[0].MessageUid;
+            var chunks = pending
+                .Where(item => string.Equals(item.MessageUid, messageUid, StringComparison.Ordinal))
+                .ToList();
+            var review = chunks.Select(item => item.OutboundReview).FirstOrDefault(item => item is not null)
+                ?? await ReviewOutboundAsync(current, chunks, ct);
+            if (!await ApplyOutboundReviewAsync(current, chunks, review, ct)) return progressed;
+            progressed = true;
+        }
+    }
+
+    private async Task<JsonObject> ReviewOutboundAsync(
+        DiscordBinding binding, IReadOnlyList<DiscordDelivery> chunks, CancellationToken ct)
+    {
+        var messageUid = chunks[0].MessageUid ?? "";
+        var content = string.Join("\n", chunks.Select(chunk =>
+        {
+            var text = chunk.Payload?["content"]?.GetValue<string>() ?? "";
+            var assets = (chunk.Payload?["assets"] as JsonArray)?.OfType<JsonObject>()
+                .Select(asset => JsonRead.String(asset, "description"))
+                .Where(description => !string.IsNullOrWhiteSpace(description))
+                .Select(description => $"[image: {description}]") ?? [];
+            return string.Join("\n", new[] { text }.Concat(assets)
+                .Where(part => !string.IsNullOrEmpty(part)));
+        }));
+        var turn = TurnKey(binding);
+        var watch = Stopwatch.StartNew();
+        var result = await RunOutboundReviewAsync(binding, messageUid, content, ct);
+        watch.Stop();
+        var verdict = result?.Verdict ?? UntrustedContentVerdict.Unavailable();
+        var hold = verdict.Available
+                   && (verdict.Risk == "high" || verdict.Handling == "require_private_approval");
+        // One rewrite per inbound turn: a held rewrite, or any later held reply before the next
+        // participant message, is withheld for good and Discord sees a short notice instead.
+        var outcome = !hold ? "delivered"
+            : (await deliveries.ReviewedDuringTurnAsync(binding.BindingId, turn, ct))
+                .Any(item => JsonRead.String(item.OutboundReview!, "outcome") == "held")
+                ? "withheld"
+                : "held";
+        logger.LogInformation(
+            "Discord outbound review of {MessageUid} on {BindingId}: {Outcome} (available {Available}, risk {Risk}, {ElapsedMs} ms)",
+            messageUid, binding.BindingId, outcome, verdict.Available, verdict.Risk, watch.ElapsedMilliseconds);
+        return OutboundReviewRecord(verdict, outcome, turn, result?.JobId, result?.TraceId,
+            watch.ElapsedMilliseconds);
+    }
+
+    private async Task<UntrustedContentReviewResult?> RunOutboundReviewAsync(
+        DiscordBinding binding, string messageUid, string content, CancellationToken ct)
+    {
+        if (sentinel is null) return null;
+        try
+        {
+            UntrustedContentCompute? compute = null;
+            if (await runtimeOptions.ResolveQualityModeAsync(binding.SentinelQualityMode, ct) is { } mode)
+                compute = new UntrustedContentCompute
+                {
+                    Provider = string.IsNullOrWhiteSpace(mode.Provider) ? null : mode.Provider,
+                    QualityTier = string.IsNullOrWhiteSpace(mode.QualityTier) ? null : mode.QualityTier,
+                    Model = mode.Model,
+                    Effort = mode.Effort,
+                };
+            return await sentinel.ReviewAsync(new UntrustedContentReviewRequest
+            {
+                Content = content,
+                Origin = new UntrustedContentOrigin(
+                    UntrustedContentSources.Discord, $"{binding.BindingId}:{binding.Generation}",
+                    binding.OwnerId, LeafDiscordPlugin.PluginId),
+                Compute = compute,
+                AgentRef = binding.AgentId,
+                Direction = UntrustedContentDirection.Outbound,
+                Audience = await AudienceAsync(binding, ct),
+                IdempotencyKey = $"sentinel-outbound:{binding.BindingId}:{binding.Generation}:{messageUid}",
+                JobName = "Discord outbound review",
+            }, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // The Sentinel never throws for runtime failures; anything else is still advisory.
+            logger.LogWarning(ex, "Discord outbound review of {MessageUid} failed", messageUid);
+            return null;
+        }
+    }
+
+    /// <summary>Who will read the reply, from the bridge's own binding data only.</summary>
+    private async Task<string> AudienceAsync(DiscordBinding binding, CancellationToken ct)
+    {
+        if (binding.Kind == "dm")
+        {
+            var counterpart = binding.CounterpartyUserId is null
+                ? null
+                : await userIdentities.ResolveAsync(binding.CounterpartyUserId, binding.OwnerId, ct);
+            return counterpart?.IsConversationOwner == true
+                ? "a Discord direct message with the verified owner (Discord is still an external service)"
+                : "a Discord direct message with a participant who is not the owner";
+        }
+        return binding.Kind is "thread" or "forum_post"
+            ? "a thread in a Discord server, readable by every member who can see it"
+            : "a channel in a Discord server, readable by every member who can see it";
+    }
+
+    private async Task<bool> ApplyOutboundReviewAsync(
+        DiscordBinding binding, IReadOnlyList<DiscordDelivery> chunks, JsonObject review,
+        CancellationToken ct)
+    {
+        var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var current = await bindings.GetAsync(binding.EntityId, ct);
+            // After /clear the old generation's rows stay inert; the drain never sends them.
+            if (current is null || current.Generation != binding.Generation) return false;
+            if (chunks.All(chunk => chunk.OutboundReview is null))
+                chunks = await deliveries.RecordOutboundReviewAsync(
+                    chunks, review, JsonRead.String(review, "turn") ?? TurnKey(current), ct);
+            var messageUid = chunks[0].MessageUid ?? "";
+            switch (JsonRead.String(review, "outcome"))
+            {
+                case "held":
+                    await SendOutboundNoticeAsync(current, messageUid, review, ct);
+                    break;
+                case "withheld":
+                    await EnqueueNoticeAsync(current, $"sentinel-withheld:{messageUid}",
+                        WithheldReplyNotice, ct);
+                    break;
+            }
+            await deliveries.ResolveReviewAsync(
+                chunks, JsonRead.String(review, "outcome") == "delivered", ct);
+            return true;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Tells the session its reply was held and asks for one rewrite, as a bridge turn. The
+    /// request ID is stable per held reply, so a replay after a restart is one turn, not two.
+    /// </summary>
+    private async Task SendOutboundNoticeAsync(
+        DiscordBinding binding, string messageUid, JsonObject review, CancellationToken ct)
+    {
+        var (provider, handle, attached) = await EnsureConversationAsync(binding, ct);
+        var signals = (review["signals"] as JsonArray)?
+            .Select(signal => signal?.GetValue<string>()).OfType<string>().ToArray() ?? [];
+        await provider.SendAsync(handle, new ExternalConversationInput(
+            $"sentinel-outbound-{DiscordBindingStore.Hash(messageUid)}",
+            new ExternalRequestor("leaf-discord", "Discord bridge"),
+            "Sentinel held the previous reply before it reached Discord"
+            + (signals.Length == 0 ? "" : $" ({string.Join(", ", signals)})")
+            + ". A rewrite was requested.",
+            [],
+            new JsonObject
+            {
+                ["transport"] = "discord",
+                ["binding_id"] = attached.BindingId,
+                ["generation"] = attached.Generation,
+                ["owner_user_id"] = attached.OwnerId,
+                ["agent_id"] = attached.AgentId,
+                ["untrusted"] = false,
+                ["outbound_sentinel_notice"] = SessionReview(review, messageUid),
+            }), ct);
+    }
+
+    /// <summary>Outbound reviews recorded during the previous inbound turn, for the next one.</summary>
+    private async Task<JsonArray?> OutboundReviewsForSessionAsync(
+        DiscordBinding binding, CancellationToken ct)
+    {
+        var reviewed = await deliveries.ReviewedDuringTurnAsync(
+            binding.BindingId, TurnKey(binding), ct);
+        return reviewed.Count == 0
+            ? null
+            : new JsonArray(reviewed.Select(item =>
+                (JsonNode?)SessionReview(item.OutboundReview!, item.MessageUid ?? "")).ToArray());
+    }
+
+    /// <summary>
+    /// The current inbound turn: the binding generation and the newest admitted Discord message.
+    /// Bridge notices never advance it, so a rewrite belongs to the turn it rewrites.
+    /// </summary>
+    internal static string TurnKey(DiscordBinding binding)
+        => $"{binding.Generation}:{(binding.LastDeliveredGeneration == binding.Generation
+            ? binding.LastDeliveredSnowflake ?? "-"
+            : "-")}";
+
+    internal static JsonObject OutboundReviewRecord(
+        UntrustedContentVerdict verdict, string outcome, string turn, string? jobId, string? traceId,
+        long elapsedMs)
+        => new()
+        {
+            ["direction"] = "outbound",
+            ["outcome"] = outcome,
+            ["risk"] = verdict.Risk,
+            ["signals"] = new JsonArray(verdict.Signals.Select(signal => (JsonNode?)signal).ToArray()),
+            ["handling"] = verdict.Handling,
+            ["available"] = verdict.Available,
+            ["isolation"] = verdict.Isolation,
+            ["turn"] = turn,
+            ["job_id"] = jobId,
+            ["trace_id"] = traceId,
+            ["elapsed_ms"] = elapsedMs,
+            ["reviewed_at"] = DateTimeOffset.UtcNow.ToString("O"),
+        };
+
+    private static JsonObject SessionReview(JsonObject review, string messageUid)
+        => new()
+        {
+            ["message_uid"] = messageUid,
+            ["outcome"] = JsonRead.String(review, "outcome"),
+            ["risk"] = JsonRead.String(review, "risk"),
+            ["signals"] = review["signals"]?.DeepClone() ?? new JsonArray(),
+            ["handling"] = JsonRead.String(review, "handling"),
+            ["available"] = review["available"]?.DeepClone(),
+        };
 
     public async Task EnqueueNoticeAsync(
         DiscordBinding binding, string requestId, string content, CancellationToken ct = default)

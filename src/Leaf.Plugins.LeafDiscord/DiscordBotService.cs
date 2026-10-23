@@ -666,6 +666,10 @@ internal sealed class DiscordBotRuntime(
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelEditGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelCreateGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> settledPeerTurns = new(StringComparer.Ordinal);
+    // One outbound review runner per binding. A request while it runs makes it loop once more,
+    // and the runner leaves only after seeing no request under the same lock, so none is lost.
+    private readonly Dictionary<string, Task> outboundReviewRunners = new(StringComparer.Ordinal);
+    private readonly HashSet<string> outboundReviewRequests = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<ulong, CachedUserProfile> userProfiles = new();
     private readonly DiscordOwnerDirectMessenger ownerDirectMessages =
         new(bindings, behaviors, deliveries, conversations, rest, assets);
@@ -3990,6 +3994,13 @@ internal sealed class DiscordBotRuntime(
             {
                 var delivery = pending[index];
                 if (delivery.Generation != binding.Generation) continue;
+                if (delivery.State == DiscordDeliveryStore.ReviewingState)
+                {
+                    // Nothing after a reply under review may overtake it. The review runs off
+                    // this loop and requests another drain when the reply leaves review.
+                    RequestOutboundReview(binding, ct);
+                    break;
+                }
                 if (delivery.Kind == DiscordDeliveryStore.ProgressKind
                     && await commonsHostTurns.GetPendingAsync(binding, ct) is not null)
                 {
@@ -4161,6 +4172,54 @@ internal sealed class DiscordBotRuntime(
         finally
         {
             gate.Release();
+        }
+    }
+
+    private void RequestOutboundReview(DiscordBinding binding, CancellationToken ct)
+    {
+        lock (outboundReviewRunners)
+        {
+            outboundReviewRequests.Add(binding.BindingId);
+            if (outboundReviewRunners.ContainsKey(binding.BindingId)) return;
+            outboundReviewRunners[binding.BindingId] = Task.Run(
+                () => RunOutboundReviewsAsync(binding, ct), CancellationToken.None);
+        }
+    }
+
+    private async Task RunOutboundReviewsAsync(DiscordBinding binding, CancellationToken ct)
+    {
+        while (true)
+        {
+            lock (outboundReviewRunners)
+            {
+                if (!outboundReviewRequests.Remove(binding.BindingId))
+                {
+                    outboundReviewRunners.Remove(binding.BindingId);
+                    return;
+                }
+            }
+            try
+            {
+                if (await conversations.ReviewPendingOutboundAsync(binding, ct))
+                    maintenance.RequestDrain(binding.BindingId);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                lock (outboundReviewRunners) outboundReviewRunners.Remove(binding.BindingId);
+                return;
+            }
+            catch (Exception ex)
+            {
+                // The rows stay in review; the recovery sweep drains the binding and asks again.
+                logger.LogError(ex, "Discord outbound review failed for {BindingId}", binding.BindingId);
+                maintenance.RetryDrain(binding.BindingId);
+                lock (outboundReviewRunners)
+                {
+                    outboundReviewRequests.Remove(binding.BindingId);
+                    outboundReviewRunners.Remove(binding.BindingId);
+                }
+                return;
+            }
         }
     }
 

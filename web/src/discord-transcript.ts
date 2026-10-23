@@ -28,6 +28,14 @@ export type DiscordTranscriptMessage = {
         authority?: string
       }
       attachmentCount?: number
+      /** The outbound Sentinel review of an assistant reply (not rendered yet). */
+      outboundSentinel?: {
+        outcome?: "delivered" | "held" | "withheld"
+        risk?: string
+        signals?: string[]
+        handling?: string
+        available?: boolean
+      }
     }
   }
   toolName?: string
