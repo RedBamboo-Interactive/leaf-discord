@@ -30,8 +30,11 @@ public sealed class DiscordConversationCoordinator(
     DiscordEgressGuard egress,
     DiscordTypingLeases typing,
     ILogger<DiscordConversationCoordinator> logger,
-    IUntrustedContentReview? sentinel = null) : IDisposable
+    IUntrustedContentReview? sentinel = null,
+    TimeProvider? time = null) : IDisposable
 {
+    private readonly TimeProvider clock = time ?? TimeProvider.System;
+
     internal DiscordConversationCoordinator(
         DiscordBindingStore bindings,
         DiscordDeliveryStore deliveries,
@@ -55,6 +58,12 @@ public sealed class DiscordConversationCoordinator(
     private readonly List<IDisposable> subscriptions = [];
 
     public event Action<DiscordBinding>? Reconciled;
+
+    /// <summary>
+    /// Raised when Sentinel-blocked work (a refused inbound message or an unavailable outbound
+    /// review) should be retried at the given time, so the host can wake the binding then.
+    /// </summary>
+    public event Action<DiscordBinding, DateTimeOffset>? RetryDue;
 
     public void Start()
     {
@@ -147,6 +156,23 @@ public sealed class DiscordConversationCoordinator(
             var (delivery, isNew) = await deliveries.ReceiveAsync(binding, discordMessageId, payload, ct);
             if (!isNew || delivery.State != "received") return null;
 
+            // Fail closed: a message waits while the Sentinel is unavailable, and every later
+            // message of the binding waits behind it, so the session never sees them out of order.
+            var now = clock.GetUtcNow();
+            if (delivery.SentinelRefused && now - delivery.CreatedAt > InboundRefusalWindow)
+            {
+                await deliveries.RefuseInboundAsync(delivery, ct);
+                logger.LogWarning(
+                    "Discord message {MessageId} on {BindingId} was refused for good: the Sentinel stayed unavailable",
+                    discordMessageId, binding.BindingId);
+                return null;
+            }
+            if (await deliveries.HasEarlierRefusedInboundAsync(binding, delivery, ct))
+            {
+                delivery = await deliveries.DeferInboundAsync(delivery, delivery.Attempts, now, ct);
+                return RefusedAdmission(delivery);
+            }
+
             var (provider, handle, attached) = await EnsureConversationAsync(binding, ct);
             binding = attached;
             // The delivery payload keeps the full captured map so a retry re-plans against
@@ -181,6 +207,23 @@ public sealed class DiscordConversationCoordinator(
                     ["leaf_community_peer"] = relayContext?.DeepClone(),
                     ["outbound_sentinel_reviews"] = await OutboundReviewsForSessionAsync(binding, ct),
                 }), ct);
+            if (admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
+            {
+                var attempts = delivery.Attempts + 1;
+                var retryAt = now + InboundRetryDelay(attempts);
+                var firstRefusal = !delivery.SentinelRefused;
+                delivery = await deliveries.DeferInboundAsync(delivery, attempts, retryAt, ct);
+                // One static notice per binding per quarter hour, not one per message.
+                if (firstRefusal)
+                    await EnqueueNoticeAsync(binding,
+                        $"sentinel-unavailable-in:{now.ToUnixTimeSeconds() / 900}",
+                        InboundUnavailableNotice, ct);
+                logger.LogWarning(
+                    "Discord message {MessageId} on {BindingId} is waiting: the Sentinel is unavailable (attempt {Attempts})",
+                    discordMessageId, binding.BindingId, attempts);
+                RetryDue?.Invoke(binding, retryAt);
+                return admission;
+            }
             if (serverMap.NextState is { } disclosed)
                 binding = await bindings.RecordServerMapDisclosureAsync(binding, disclosed, ct);
             await deliveries.MarkAdmittedAsync(delivery, admission, ct);
@@ -226,11 +269,14 @@ public sealed class DiscordConversationCoordinator(
 
     public async Task RetryPendingAsync(DiscordBinding binding, CancellationToken ct = default)
     {
+        var now = clock.GetUtcNow();
         foreach (var delivery in await deliveries.PendingInboundAsync(binding.BindingId, ct))
         {
             if (delivery.Generation != binding.Generation || delivery.DiscordId is null
                 || delivery.Payload is not JsonObject payload)
                 continue;
+            // A message waiting on the Sentinel holds every later one until it is due.
+            if (delivery.SentinelRefused && delivery.NextAttemptAt > now) break;
             var requestorNode = payload["requestor"] as JsonObject;
             var externalId = JsonRead.String(requestorNode ?? [], "id");
             var displayName = JsonRead.String(requestorNode ?? [], "display_name");
@@ -245,13 +291,40 @@ public sealed class DiscordConversationCoordinator(
                     JsonRead.String(item, "sha256") ?? "",
                     JsonRead.String(item, "scope_token") ?? ""))
                 .ToArray() ?? [];
-            await SubmitAsync(binding, delivery.DiscordId,
+            var admission = await SubmitAsync(binding, delivery.DiscordId,
                 new ExternalRequestor(externalId, displayName,
                     JsonRead.String(requestorNode ?? [], "username")), content, recovered, ct,
                 payload["guild_context"]?.DeepClone() as JsonObject,
-                payload["behavior_context"]?.DeepClone() as JsonObject);
+                payload["behavior_context"]?.DeepClone() as JsonObject,
+                payload["relay_context"]?.DeepClone() as JsonObject);
+            if (admission?.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
+                break;
         }
     }
+
+    internal const string InboundUnavailableNotice =
+        "I can't read messages right now, my safety check is unavailable. " +
+        "I'll read yours once it's back; if I don't answer, try again in a bit.";
+
+    internal const string OutboundUnavailableNotice =
+        "I wrote a reply but couldn't send it, my safety check is unavailable. Try again in a bit.";
+
+    /// <summary>How long a refused message keeps waiting for the Sentinel before it is dropped
+    /// from the session (it stays stored as <c>refused</c>).</summary>
+    internal static readonly TimeSpan InboundRefusalWindow = TimeSpan.FromMinutes(30);
+
+    /// <summary>Unavailable outbound reviews are asked this many times before the reply is withheld.</summary>
+    internal const int MaxOutboundReviewAttempts = 4;
+
+    internal static TimeSpan InboundRetryDelay(int attempts)
+        => TimeSpan.FromSeconds(Math.Min(480, 30 * Math.Pow(2, Math.Max(0, attempts - 1))));
+
+    internal static TimeSpan OutboundRetryDelay(int attempts)
+        => TimeSpan.FromSeconds(30 * Math.Pow(2, Math.Max(0, attempts - 1)));
+
+    private static ExternalConversationAdmission RefusedAdmission(DiscordDelivery delivery)
+        => new($"discord-refused-{delivery.DiscordId}",
+            ExternalConversationDispositions.RefusedSentinelUnavailable);
 
     public Task<(DiscordBinding Binding, string MessageUid)> SendProactiveAsync(
         DiscordBinding binding,
@@ -621,31 +694,24 @@ public sealed class DiscordConversationCoordinator(
                 }
 
                 // A reply reaches Discord only after its outbound Sentinel review. The review is
-                // durable in the outbox (see ReviewPendingOutboundAsync); without an installed
-                // Sentinel the reply is queued at once and the session hears it was unreviewed.
+                // durable in the outbox (see ReviewPendingOutboundAsync). Without a verdict the
+                // reply is not delivered.
                 var reviewed = !message.MessageUid.StartsWith(
                     "discord-outreach-", StringComparison.Ordinal);
                 var chunks = DiscordMessageChunker.Split(inspected.Content);
                 var assetGroups = outputAssets.Chunk(10).ToArray();
                 var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
-                var enqueued = new List<DiscordDelivery>(deliveryCount);
                 for (var i = 0; i < deliveryCount; i++)
                 {
                     var chunk = i < chunks.Count ? chunks[i] : "";
                     IReadOnlyList<ExternalConversationOutputAsset> assets =
                         i < assetGroups.Length ? assetGroups[i] : [];
-                    enqueued.Add(reviewed && sentinel is not null
+                    _ = reviewed
                         ? await deliveries.EnqueueOutboundForReviewAsync(
                             binding, message, i, chunk, assets, ct)
                         : await deliveries.EnqueueOutboundAsync(
-                            binding, message, i, chunk, assets, ct));
+                            binding, message, i, chunk, assets, ct);
                 }
-                if (reviewed && sentinel is null && enqueued.Count > 0
-                    && enqueued[0].OutboundReview is null)
-                    await deliveries.RecordOutboundReviewAsync(enqueued,
-                        OutboundReviewRecord(UntrustedContentVerdict.Unavailable(),
-                            "delivered", TurnKey(binding), null, null, 0),
-                        TurnKey(binding), ct);
             }
 
             if (page.NextCursor is not null)
@@ -699,14 +765,19 @@ public sealed class DiscordConversationCoordinator(
             var chunks = pending
                 .Where(item => string.Equals(item.MessageUid, messageUid, StringComparison.Ordinal))
                 .ToList();
+            // A reply waiting to ask the Sentinel again also holds every later reply.
+            if (chunks.Any(item => item.ReviewNextAt > clock.GetUtcNow())) return progressed;
             var review = chunks.Select(item => item.OutboundReview).FirstOrDefault(item => item is not null)
                 ?? await ReviewOutboundAsync(current, chunks, ct);
+            if (review is null) return progressed;
             if (!await ApplyOutboundReviewAsync(current, chunks, review, ct)) return progressed;
             progressed = true;
         }
     }
 
-    private async Task<JsonObject> ReviewOutboundAsync(
+    /// <summary>The recorded decision, or null when the Sentinel was unavailable and the reply
+    /// stays in review to be asked again later.</summary>
+    private async Task<JsonObject?> ReviewOutboundAsync(
         DiscordBinding binding, IReadOnlyList<DiscordDelivery> chunks, CancellationToken ct)
     {
         var messageUid = chunks[0].MessageUid ?? "";
@@ -725,11 +796,28 @@ public sealed class DiscordConversationCoordinator(
         var result = await RunOutboundReviewAsync(binding, messageUid, content, ct);
         watch.Stop();
         var verdict = result?.Verdict ?? UntrustedContentVerdict.Unavailable();
+        if (!verdict.Available)
+        {
+            // Fail closed: no verdict, no delivery. Ask again a bounded number of times while
+            // the reply (and everything after it) waits; then withhold it.
+            var attempts = chunks.Max(chunk => chunk.ReviewAttempts) + 1;
+            if (sentinel is not null && attempts < MaxOutboundReviewAttempts)
+            {
+                var retryAt = clock.GetUtcNow() + OutboundRetryDelay(attempts);
+                await deliveries.DeferReviewAsync(chunks, attempts, retryAt, ct);
+                logger.LogWarning(
+                    "Discord outbound review of {MessageUid} on {BindingId} is unavailable (attempt {Attempts}); retrying",
+                    messageUid, binding.BindingId, attempts);
+                RetryDue?.Invoke(binding, retryAt);
+                return null;
+            }
+        }
         var hold = verdict.Available
                    && (verdict.Risk == "high" || verdict.Handling == "require_private_approval");
         // One rewrite per inbound turn: a held rewrite, or any later held reply before the next
         // participant message, is withheld for good and Discord sees a short notice instead.
-        var outcome = !hold ? "delivered"
+        var outcome = !verdict.Available ? "withheld"
+            : !hold ? "delivered"
             : (await deliveries.ReviewedDuringTurnAsync(binding.BindingId, turn, ct))
                 .Any(item => JsonRead.String(item.OutboundReview!, "outcome") == "held")
                 ? "withheld"
@@ -816,8 +904,10 @@ public sealed class DiscordConversationCoordinator(
                     await SendOutboundNoticeAsync(current, messageUid, review, ct);
                     break;
                 case "withheld":
+                    var available = review["available"] is JsonValue value
+                                    && value.TryGetValue<bool>(out var isAvailable) && isAvailable;
                     await EnqueueNoticeAsync(current, $"sentinel-withheld:{messageUid}",
-                        WithheldReplyNotice, ct);
+                        available ? WithheldReplyNotice : OutboundUnavailableNotice, ct);
                     break;
             }
             await deliveries.ResolveReviewAsync(

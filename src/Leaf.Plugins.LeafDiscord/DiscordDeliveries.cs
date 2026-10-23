@@ -27,6 +27,14 @@ public sealed record DiscordDelivery(
 {
     /// <summary>The outbound Sentinel verdict and the action taken on it, once recorded.</summary>
     public JsonObject? OutboundReview { get; init; }
+
+    /// <summary>Outbound reviews that came back unavailable, and when to ask again.</summary>
+    public int ReviewAttempts { get; init; }
+    public DateTimeOffset? ReviewNextAt { get; init; }
+
+    /// <summary>An inbound message the session refused because the Sentinel was unavailable.
+    /// It stays <c>received</c> and is retried in order at <see cref="NextAttemptAt"/>.</summary>
+    public bool SentinelRefused { get; init; }
 }
 
 public sealed record DiscordOwnerDirectMessageOperation(
@@ -175,12 +183,59 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             {
                 ["direction"] = "inbound",
                 ["binding_id"] = bindingId,
+                ["state"] = "received",
             },
             Limit = 500,
         }, ct)).Select(Map)
             .Where(item => item.State == "received" && item.Payload is not null)
             .OrderBy(item => item.CreatedAt)
+            .ThenBy(item => Snowflake(item.DiscordId))
             .ToList();
+
+    /// <summary>
+    /// Keeps a message the session refused (Sentinel unavailable) durable and retryable: it
+    /// stays <c>received</c>, and later messages of the binding wait behind it.
+    /// </summary>
+    public async Task<DiscordDelivery> DeferInboundAsync(
+        DiscordDelivery delivery, int attempts, DateTimeOffset nextAttemptAt,
+        CancellationToken ct = default)
+        => Map(await store.PatchAsync(delivery.EntityId, new JsonObject
+        {
+            ["sentinel_refused"] = true,
+            ["attempts"] = attempts,
+            ["next_attempt_at"] = nextAttemptAt.ToString("O"),
+            ["last_error"] = "sentinel_unavailable",
+        }, ct: ct));
+
+    /// <summary>Gives up on a refused message that waited too long. It stays stored.</summary>
+    public async Task RefuseInboundAsync(DiscordDelivery delivery, CancellationToken ct = default)
+        => _ = await store.PatchAsync(delivery.EntityId, new JsonObject
+        {
+            ["state"] = "refused",
+            ["last_error"] = "sentinel_unavailable",
+        }, ct: ct);
+
+    /// <summary>Whether an earlier message of this generation is still waiting on the Sentinel.</summary>
+    public async Task<bool> HasEarlierRefusedInboundAsync(
+        DiscordBinding binding, DiscordDelivery delivery, CancellationToken ct = default)
+        => (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "inbound",
+                ["binding_id"] = binding.BindingId,
+                ["state"] = "received",
+                ["sentinel_refused"] = true,
+            },
+            Limit = 500,
+        }, ct)).Select(Map).Any(item =>
+            item.Generation == binding.Generation
+            && item.EntityId != delivery.EntityId
+            && (item.CreatedAt, Snowflake(item.DiscordId)).CompareTo(
+                (delivery.CreatedAt, Snowflake(delivery.DiscordId))) < 0);
+
+    private static ulong Snowflake(string? value) => ulong.TryParse(value, out var parsed) ? parsed : 0;
 
     public async Task<bool> ContainsAdmittedInboundAsync(
         string bindingId, long generation, string discordMessageId,
@@ -261,6 +316,19 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
                 ["review_turn"] = turnKey,
             }, ct: ct)));
         return recorded;
+    }
+
+    /// <summary>An unavailable outbound review: the reply stays in review until it is due again.</summary>
+    public async Task DeferReviewAsync(
+        IReadOnlyList<DiscordDelivery> chunks, int attempts, DateTimeOffset nextAt,
+        CancellationToken ct = default)
+    {
+        foreach (var chunk in chunks)
+            _ = await store.PatchAsync(chunk.EntityId, new JsonObject
+            {
+                ["review_attempts"] = attempts,
+                ["review_next_at"] = nextAt.ToString("O"),
+            }, ct: ct);
     }
 
     /// <summary>Moves reviewed chunks out of review: to queued (deliver) or held.</summary>
@@ -827,6 +895,12 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             entity.CreatedAt)
         {
             OutboundReview = data["outbound_review"]?.DeepClone() as JsonObject,
+            ReviewAttempts = checked((int)JsonRead.Long(data, "review_attempts", 0)),
+            ReviewNextAt = DateTimeOffset.TryParse(JsonRead.String(data, "review_next_at"), out var reviewNextAt)
+                ? reviewNextAt
+                : null,
+            SentinelRefused = data["sentinel_refused"] is JsonValue refused
+                && refused.TryGetValue<bool>(out var isRefused) && isRefused,
         };
     }
 

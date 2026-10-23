@@ -680,6 +680,7 @@ internal sealed class DiscordBotRuntime(
     private Func<SocketUser, SocketPresence, SocketPresence, Task>? clientPresenceHandler;
     private Func<SocketUser, SocketVoiceState, SocketVoiceState, Task>? clientVoiceHandler;
     private Action<DiscordBinding>? conversationReconciledHandler;
+    private Action<DiscordBinding, DateTimeOffset>? conversationRetryHandler;
     private string? maintenanceApplicationId;
     private CancellationTokenSource? runCts;
     private Task? outboxLoop;
@@ -1790,6 +1791,22 @@ internal sealed class DiscordBotRuntime(
                 }
             };
             conversations.Reconciled += conversationReconciledHandler;
+            // Sentinel-blocked work retries at its due time even when the maintenance loop is
+            // too busy to reach its idle recovery sweep.
+            conversationRetryHandler = (binding, dueAt) =>
+            {
+                if (!string.Equals(binding.ApplicationId, maintenanceApplicationId,
+                        StringComparison.Ordinal))
+                    return;
+                var token = runCts?.Token ?? CancellationToken.None;
+                var delay = dueAt - DateTimeOffset.UtcNow;
+                _ = Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.Zero, token)
+                    .ContinueWith(task =>
+                    {
+                        if (!task.IsCanceled) maintenance.RequestFull(binding.BindingId);
+                    }, TaskScheduler.Default);
+            };
+            conversations.RetryDue += conversationRetryHandler;
             runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
             outboxLoop = RunOutboxLoopAsync(runCts.Token);
             gatewayInboxLoop = Task.Run(
@@ -2400,6 +2417,12 @@ internal sealed class DiscordBotRuntime(
             LogSlowMessageStep(message.Id, "Agent session admission", submitStarted);
             if (admission is null)
                 typing.Cancel(typingAdmission);
+            else if (admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
+            {
+                // Kept for a later retry; the static notice (if any) goes out now.
+                typing.Cancel(typingAdmission);
+                maintenance.RequestDrain(binding.BindingId);
+            }
             else
             {
                 await commonsHostTurns.CompletePendingAsync(
@@ -2505,9 +2528,11 @@ internal sealed class DiscordBotRuntime(
             behaviorContext: behavior.ToTrustedMetadata(),
             relayContext: relayContext,
             channelGap: ChannelGapSource(message, config));
-        if (admission is null)
+        if (admission is null
+            || admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
         {
             await commonsHostTurns.CompleteAsync(hostTurn, "not-admitted");
+            if (admission is not null) maintenance.RequestDrain(binding.BindingId);
             return;
         }
         typing.MarkAdmitted(
@@ -3625,6 +3650,9 @@ internal sealed class DiscordBotRuntime(
         if (conversationReconciledHandler is not null)
             conversations.Reconciled -= conversationReconciledHandler;
         conversationReconciledHandler = null;
+        if (conversationRetryHandler is not null)
+            conversations.RetryDue -= conversationRetryHandler;
+        conversationRetryHandler = null;
         maintenanceApplicationId = null;
     }
 

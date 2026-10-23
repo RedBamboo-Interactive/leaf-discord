@@ -85,10 +85,16 @@ Each Leaf Agent needs its own Discord application.
   then one outbound Sentinel review before it leaves the durable outbox. The reply waits in
   review; a reply after it never overtakes it. A held reply is not posted: the session is told
   why and may rewrite once per participant message, and a rewrite held again is replaced by a
-  short notice in Discord. When the Sentinel is unavailable the reply is delivered and the
-  session is told it was unreviewed. Every verdict is recorded on the reply's outbox rows and
-  shown as `metadata.discord.outboundSentinel` in the transcript. Commentary and tool progress
-  are not reviewed.
+  short notice in Discord. Every verdict is recorded on the reply's outbox rows and shown as
+  `metadata.discord.outboundSentinel` in the transcript. Commentary and tool progress are not
+  reviewed.
+- The bridge fails closed when the Sentinel is unavailable (not installed or disabled, model
+  call failed, unparseable verdict). An inbound message is not admitted: it stays stored, a
+  short fixed notice is posted (at most once per quarter hour per conversation), later messages
+  wait behind it, and it is retried with backoff and admitted once the Sentinel answers. After
+  30 minutes it is dropped from the session and kept as `refused`. A reply whose review is
+  unavailable is asked again up to four times over about three and a half minutes, then
+  withheld with a fixed notice; the session hears about it on its next admitted message.
 - The bot token is a RedLeaf secret field and is never returned by plugin APIs.
 
 ## Optional guild context

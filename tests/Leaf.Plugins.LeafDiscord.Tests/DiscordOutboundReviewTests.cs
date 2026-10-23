@@ -167,57 +167,211 @@ public sealed class DiscordOutboundReviewTests
     }
 
     [Fact]
-    public async Task An_unavailable_review_delivers_and_the_next_turn_says_it_was_unreviewed()
+    public async Task An_unavailable_review_is_retried_a_bounded_number_of_times_then_withheld()
     {
         var h = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable());
         h.Reply(1, "reply-1", "Here is the fix.");
         await h.ReconcileAsync();
-        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
 
-        var queued = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
-        Assert.Equal("queued", queued.State);
-        Assert.False(queued.OutboundReview?["available"]?.GetValue<bool>());
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        var waiting = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, waiting.State);
+        Assert.Equal(1, waiting.ReviewAttempts);
+        Assert.Null(waiting.OutboundReview);
+        Assert.Equal(h.Clock.GetUtcNow().AddSeconds(30), Assert.Single(h.RetryDue));
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId),
+            item => item.State == "queued");
+
+        // Not due yet: nothing is asked.
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        Assert.Single(h.Sentinel.Requests);
+
+        foreach (var wait in new[] { 30, 60, 120 })
+        {
+            h.Clock.Advance(TimeSpan.FromSeconds(wait + 1));
+            await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        }
+
+        Assert.Equal(DiscordConversationCoordinator.MaxOutboundReviewAttempts, h.Sentinel.Requests.Count);
+        var withheld = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.HeldState, withheld.State);
+        Assert.Equal("withheld", withheld.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.False(withheld.OutboundReview?["available"]?.GetValue<bool>());
+        var notice = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        Assert.Equal(DiscordConversationCoordinator.OutboundUnavailableNotice,
+            notice.Payload?["content"]?.GetValue<string>());
         Assert.Empty(h.Provider.Inputs);
 
+        // The session hears it on the next admitted participant message.
         await h.Coordinator.SubmitAsync(h.Binding, "300000000000000003",
             new ExternalRequestor("400000000000000004", "Participant"), "Thanks!");
-
         var reported = Assert.IsType<JsonArray>(Assert.Single(h.Provider.Inputs).Metadata?["outbound_sentinel_reviews"]);
         var review = Assert.IsType<JsonObject>(Assert.Single(reported));
         Assert.Equal("reply-1", review["message_uid"]?.GetValue<string>());
-        Assert.Equal("delivered", review["outcome"]?.GetValue<string>());
+        Assert.Equal("withheld", review["outcome"]?.GetValue<string>());
         Assert.False(review["available"]?.GetValue<bool>());
         Assert.Equal(["verifier-unavailable"], review["signals"]!.AsArray().Select(node => node!.GetValue<string>()));
     }
 
     [Fact]
-    public async Task A_throwing_sentinel_fails_open_like_an_unavailable_review()
+    public async Task An_unavailable_review_that_recovers_delivers_the_reply()
+    {
+        var calls = 0;
+        var h = await Harness.CreateAsync(_ => ++calls == 1 ? UntrustedContentVerdict.Unavailable() : Clean);
+        h.Reply(1, "reply-1", "Here is the fix.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        h.Clock.Advance(TimeSpan.FromSeconds(31));
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+
+        var queued = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        Assert.Equal("reply-1", queued.MessageUid);
+        Assert.Equal("delivered", queued.OutboundReview?["outcome"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_reply_waiting_on_an_unavailable_review_holds_every_later_reply()
+    {
+        var h = await Harness.CreateAsync(request =>
+            request.Content == "First." ? UntrustedContentVerdict.Unavailable() : Clean);
+        h.Reply(1, "reply-1", "First.");
+        h.Reply(2, "reply-2", "Second.");
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal(["First."], h.Sentinel.Requests.Select(request => request.Content));
+        Assert.All(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId),
+            item => Assert.Equal(DiscordDeliveryStore.ReviewingState, item.State));
+    }
+
+    [Fact]
+    public async Task A_throwing_sentinel_fails_closed_like_an_unavailable_review()
     {
         var h = await Harness.CreateAsync(_ => throw new InvalidOperationException("compute down"));
         h.Reply(1, "reply-1", "Here is the fix.");
         await h.ReconcileAsync();
         await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
 
-        var queued = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
-        Assert.Equal("queued", queued.State);
-        Assert.Equal("unknown", queued.OutboundReview?["risk"]?.GetValue<string>());
+        var waiting = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, waiting.State);
+        Assert.Equal(1, waiting.ReviewAttempts);
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId),
+            item => item.State == "queued");
     }
 
     [Fact]
-    public async Task Without_an_installed_sentinel_replies_queue_at_once_marked_unreviewed()
+    public async Task Without_an_installed_sentinel_a_reply_is_withheld_at_once_with_a_notice()
     {
         var h = await Harness.CreateAsync(null);
         h.Reply(1, "reply-1", "Here is the fix.");
         await h.ReconcileAsync();
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, Assert.Single(await h.Rows("reply-1")).State);
 
-        var queued = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
-        Assert.Equal("queued", queued.State);
-        Assert.False(queued.OutboundReview?["available"]?.GetValue<bool>());
-        Assert.False(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
 
+        var withheld = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.HeldState, withheld.State);
+        Assert.Equal("withheld", withheld.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.Equal(DiscordConversationCoordinator.OutboundUnavailableNotice,
+            Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId))
+                .Payload?["content"]?.GetValue<string>());
+        Assert.Empty(h.RetryDue);
+    }
+
+    [Fact]
+    public async Task A_refused_message_stays_durable_and_is_admitted_when_the_sentinel_recovers()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Provider.Refuse = true;
+
+        var refused = await h.Coordinator.SubmitAsync(h.Binding, "300000000000000003",
+            new ExternalRequestor("400000000000000004", "Participant"), "Hello?");
+
+        Assert.Equal(ExternalConversationDispositions.RefusedSentinelUnavailable, refused?.Disposition);
+        var inbound = Assert.Single(await h.Deliveries.PendingInboundAsync(h.Binding.BindingId));
+        Assert.True(inbound.SentinelRefused);
+        Assert.Equal(1, inbound.Attempts);
+        Assert.Equal("sentinel_unavailable", inbound.LastError);
+        Assert.Equal(h.Clock.GetUtcNow().AddSeconds(30), inbound.NextAttemptAt);
+        Assert.Equal(inbound.NextAttemptAt, Assert.Single(h.RetryDue));
+        await h.RefreshAsync();
+        Assert.Null(h.Binding.LastDeliveredSnowflake);
+        var notice = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        Assert.Equal(DiscordConversationCoordinator.InboundUnavailableNotice,
+            notice.Payload?["content"]?.GetValue<string>());
+
+        // Not due: the session is not asked again.
+        await h.Coordinator.RetryPendingAsync(h.Binding);
+        Assert.Single(h.Provider.Inputs);
+
+        // Still down when due: it waits longer, and no second notice is posted.
+        h.Clock.Advance(TimeSpan.FromSeconds(31));
+        await h.Coordinator.RetryPendingAsync(h.Binding);
+        Assert.Equal(2, h.Provider.Inputs.Count);
+        Assert.Equal(2, Assert.Single(await h.Deliveries.PendingInboundAsync(h.Binding.BindingId)).Attempts);
+        Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+
+        // Recovered, after a restart: the stored message is admitted once.
+        h.Clock.Advance(TimeSpan.FromSeconds(61));
+        var restarted = await h.RestartAsync(_ => Clean);
+        await restarted.Coordinator.RetryPendingAsync(restarted.Binding);
+
+        Assert.Equal("Hello?", Assert.Single(restarted.Provider.Inputs).Content);
+        Assert.Empty(await restarted.Deliveries.PendingInboundAsync(restarted.Binding.BindingId));
+        await restarted.RefreshAsync();
+        Assert.Equal("300000000000000003", restarted.Binding.LastDeliveredSnowflake);
+        await restarted.Coordinator.RetryPendingAsync(restarted.Binding);
+        Assert.Single(restarted.Provider.Inputs);
+    }
+
+    [Fact]
+    public async Task Later_messages_wait_behind_a_refused_one_and_are_admitted_in_order()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Provider.Refuse = true;
         await h.Coordinator.SubmitAsync(h.Binding, "300000000000000003",
-            new ExternalRequestor("400000000000000004", "Participant"), "Thanks!");
-        Assert.IsType<JsonArray>(Assert.Single(h.Provider.Inputs).Metadata?["outbound_sentinel_reviews"]);
+            new ExternalRequestor("400000000000000004", "Participant"), "First");
+        h.Provider.Refuse = false;
+
+        var second = await h.Coordinator.SubmitAsync(h.Binding, "300000000000000005",
+            new ExternalRequestor("400000000000000004", "Participant"), "Second");
+
+        Assert.Equal(ExternalConversationDispositions.RefusedSentinelUnavailable, second?.Disposition);
+        Assert.Single(h.Provider.Inputs);
+        Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+
+        h.Clock.Advance(TimeSpan.FromSeconds(31));
+        await h.Coordinator.RetryPendingAsync(h.Binding);
+
+        Assert.Equal(["First", "First", "Second"], h.Provider.Inputs.Select(input => input.Content));
+        Assert.Empty(await h.Deliveries.PendingInboundAsync(h.Binding.BindingId));
+    }
+
+    [Fact]
+    public async Task A_message_refused_for_too_long_is_dropped_and_no_longer_holds_the_binding()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Provider.Refuse = true;
+        await h.Coordinator.SubmitAsync(h.Binding, "300000000000000003",
+            new ExternalRequestor("400000000000000004", "Participant"), "Old");
+        h.Provider.Refuse = false;
+        h.Clock.Advance(DiscordConversationCoordinator.InboundRefusalWindow + TimeSpan.FromMinutes(1));
+
+        await h.Coordinator.RetryPendingAsync(h.Binding);
+        var admitted = await h.Coordinator.SubmitAsync(h.Binding, "300000000000000005",
+            new ExternalRequestor("400000000000000004", "Participant"), "New");
+
+        Assert.Equal(["Old", "New"], h.Provider.Inputs.Select(input => input.Content));
+        Assert.Equal("delivered", admitted?.Disposition);
+        Assert.Empty(await h.Deliveries.PendingInboundAsync(h.Binding.BindingId));
+        var stored = Assert.Single(await h.Entities.QueryAsync(new Leaf.Sdk.EntityQuery
+        {
+            TypeSlug = DiscordDeliveryStore.TypeSlug,
+            DataEquals = new Dictionary<string, object?> { ["discord_id"] = "300000000000000003" },
+        }));
+        Assert.Equal("refused", JsonRead.String(stored.Data, "state"));
     }
 
     [Fact]
@@ -403,6 +557,8 @@ public sealed class DiscordOutboundReviewTests
         public required FakeSentinel Sentinel { get; init; }
         public required DiscordConversationCoordinator Coordinator { get; init; }
         public required DiscordBinding Binding { get; set; }
+        public required ManualClock Clock { get; init; }
+        public List<DateTimeOffset> RetryDue { get; } = [];
 
         public static async Task<Harness> CreateAsync(
             Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide,
@@ -424,7 +580,7 @@ public sealed class DiscordOutboundReviewTests
                 "100000000000000001", kind == "dm" ? "323456789012345678" : "123456789012345678", kind,
                 kind == "dm" ? null : "223456789012345678", null, "nova", ownerId,
                 "nova-discord-external", "participate", CounterpartyUserId: counterparty));
-            var harness = Build(entities, bindings, binding, decide, new ScriptedProvider());
+            var harness = Build(entities, bindings, binding, decide, new ScriptedProvider(), new ManualClock());
             harness.Binding = await harness.Coordinator.EnsureReadyAsync(binding);
             return harness;
         }
@@ -437,12 +593,13 @@ public sealed class DiscordOutboundReviewTests
             var binding = await Bindings.GetAsync(Binding.EntityId) ?? throw new InvalidOperationException();
             if (resetCursor)
                 binding = await Bindings.AdvanceCursorAsync(binding, new ExternalConversationCursor("epoch-1", 0));
-            return Build(Entities, Bindings, binding, decide, provider);
+            return Build(Entities, Bindings, binding, decide, provider, Clock);
         }
 
         private static Harness Build(
             MemoryEntityStore entities, DiscordBindingStore bindings, DiscordBinding binding,
-            Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide, ScriptedProvider provider)
+            Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide, ScriptedProvider provider,
+            ManualClock clock)
         {
             var deliveries = new DiscordDeliveryStore(entities);
             var sentinel = new FakeSentinel(decide ?? (_ => Clean));
@@ -454,8 +611,8 @@ public sealed class DiscordOutboundReviewTests
                 new NoComputeGateway(), [provider], new PromptInjectionDetector(),
                 new DiscordEgressGuard(), new DiscordTypingLeases(),
                 NullLogger<DiscordConversationCoordinator>.Instance,
-                decide is null ? null : sentinel);
-            return new Harness
+                decide is null ? null : sentinel, clock);
+            var harness = new Harness
             {
                 Entities = entities,
                 Bindings = bindings,
@@ -464,7 +621,10 @@ public sealed class DiscordOutboundReviewTests
                 Sentinel = sentinel,
                 Coordinator = coordinator,
                 Binding = binding,
+                Clock = clock,
             };
+            coordinator.RetryDue += (_, dueAt) => harness.RetryDue.Add(dueAt);
+            return harness;
         }
 
         public void Reply(long sequence, string messageUid, string text)
@@ -497,6 +657,7 @@ public sealed class DiscordOutboundReviewTests
                 (int)JsonRead.Long(entity.Data, "chunk_index", 0), null, null, 0, null, null, entity.CreatedAt)
             {
                 OutboundReview = entity.Data["outbound_review"] as JsonObject,
+                ReviewAttempts = (int)JsonRead.Long(entity.Data, "review_attempts", 0),
             }).OrderBy(item => item.ChunkIndex).ToList();
 
         public async Task SeedBotConfigurationAsync()
@@ -531,6 +692,8 @@ public sealed class DiscordOutboundReviewTests
         public List<ExternalConversationMessage> Messages { get; } = [];
         public List<ExternalConversationInput> Inputs { get; } = [];
         public bool FailAfterSend { get; set; }
+        /// <summary>Answers like Nova when its inbound Sentinel review is unavailable.</summary>
+        public bool Refuse { get; set; }
         public string ProviderId => "test";
         public bool CanHandle(string agentSlugOrId) => agentSlugOrId == "nova";
 
@@ -545,6 +708,9 @@ public sealed class DiscordOutboundReviewTests
         {
             Inputs.Add(input);
             if (FailAfterSend) throw new IOException("process stopped");
+            if (Refuse && input.Metadata?["outbound_sentinel_notice"] is null)
+                return Task.FromResult(new ExternalConversationAdmission(
+                    $"uid-{input.RequestId}", ExternalConversationDispositions.RefusedSentinelUnavailable));
             return Task.FromResult(new ExternalConversationAdmission($"uid-{input.RequestId}", "delivered"));
         }
 
@@ -564,6 +730,13 @@ public sealed class DiscordOutboundReviewTests
             => new Noop();
 
         private sealed class Noop : IDisposable { public void Dispose() { } }
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        private DateTimeOffset now = DateTimeOffset.UtcNow;
+        public override DateTimeOffset GetUtcNow() => now;
+        public void Advance(TimeSpan by) => now += by;
     }
 
     private sealed class NoComputeGateway : IComputeGateway
