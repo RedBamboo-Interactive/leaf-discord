@@ -104,6 +104,15 @@ public sealed class PluginPackagingContractTests
                 && field.GetProperty("slug").GetString() == slug);
             Assert.Equal("secret", commonsSecret.GetProperty("fieldType").GetString());
         }
+
+        var webhookToken = seeds.RootElement.EnumerateArray().Single(field =>
+            field.GetProperty("parentType").GetString() == DiscordBindingStore.TypeSlug
+            && field.GetProperty("slug").GetString() == "webhook_token");
+        Assert.Equal("secret", webhookToken.GetProperty("fieldType").GetString());
+        // Seed export and the vault key a field by its "{parent}--{slug}" row slug, taking the
+        // part after "--" with hyphens as underscores: that must be the key the binding writes.
+        var rowSlug = $"{DiscordBindingStore.TypeSlug}--{webhookToken.GetProperty("slug").GetString()}";
+        Assert.Equal("webhook_token", rowSlug[(rowSlug.IndexOf("--") + 2)..].Replace("-", "_"));
     }
 
     [Fact]
@@ -176,7 +185,7 @@ public sealed class PluginPackagingContractTests
         Assert.Equal("string", counterparty.GetProperty("fieldType").GetString());
     }
 
-    private static string FindRepositoryRoot([System.Runtime.CompilerServices.CallerFilePath] string sourceFile = "")
+    internal static string FindRepositoryRoot([System.Runtime.CompilerServices.CallerFilePath] string sourceFile = "")
     {
         // Deterministic release builds map source paths to "/_/...", so the caller path
         // only works in local builds; the test binary's own location works in both.

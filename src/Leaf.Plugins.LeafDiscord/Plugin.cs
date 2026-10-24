@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Leaf.Plugins.LeafDiscord;
 
@@ -110,7 +111,14 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         await host.GetRequiredService<DiscordBotConfigurationStore>()
             .EnsureLegacyMigratedAsync(ct);
         var configurations = host.GetRequiredService<DiscordBotConfigurationStore>();
-        var bindings = await host.GetRequiredService<DiscordBindingStore>().ListAsync(ct);
+        var bindingStore = host.GetRequiredService<DiscordBindingStore>();
+        // Before the Gateway starts, so no live delivery races the rewrite.
+        var protection = await bindingStore.ProtectStoredWebhookTokensAsync(ct);
+        if (protection.Failed.Count > 0)
+            host.GetRequiredService<ILogger<LeafDiscordPlugin>>().LogWarning(
+                "Could not move {Count} Discord webhook tokens into the vault: {Bindings}",
+                protection.Failed.Count, string.Join(", ", protection.Failed));
+        var bindings = await bindingStore.ListAsync(ct);
         var behaviors = host.GetRequiredService<DiscordBehaviorStore>();
         foreach (var config in await configurations.ListAsync(ct))
             await behaviors.EnsureDefaultsAsync(config, bindings, ct);

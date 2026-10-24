@@ -109,6 +109,7 @@
   { "parentType": "leaf-discord-binding", "slug": "counterparty_user_id", "name": "DM Counterparty User ID", "fieldType": "string", "sortOrder": 19 },
   { "parentType": "leaf-discord-binding", "slug": "session_quality_mode", "name": "Session Quality Mode", "fieldType": "string", "sortOrder": 20 },
   { "parentType": "leaf-discord-binding", "slug": "authorized_automation_ids", "name": "Authorized Automations", "fieldType": "json", "sortOrder": 22, "description": "Exact Automation entity IDs authorized to send through this existing binding" },
+  { "parentType": "leaf-discord-binding", "slug": "webhook_token", "name": "Webhook Token", "fieldType": "secret", "sortOrder": 23, "description": "Channel avatar webhook token; encrypted by RedLeaf and never returned by plugin APIs" },
 
   { "parentType": "leaf-discord-delivery", "slug": "direction", "name": "Direction", "fieldType": "select", "sortOrder": 0, "constraints": "{\u0022options\u0022:[\u0022inbound\u0022,\u0022outbound\u0022,\u0022progress_state\u0022]}" },
   { "parentType": "leaf-discord-delivery", "slug": "kind", "name": "Kind", "fieldType": "select", "sortOrder": 1, "constraints": "{\u0022options\u0022:[\u0022message\u0022,\u0022progress\u0022,\u0022forum_post\u0022]}" },

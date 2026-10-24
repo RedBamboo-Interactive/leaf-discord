@@ -357,6 +357,9 @@ public sealed record CreateDiscordBinding(
     string? CounterpartyUserId = null,
     string SessionQualityMode = "deep-codex");
 
+public sealed record WebhookTokenProtectionResult(
+    int Rewritten, IReadOnlyList<Guid> Failed);
+
 public sealed class DiscordBindingStore(IEntityStore store)
 {
     public const string TypeSlug = "leaf-discord-binding";
@@ -632,6 +635,52 @@ public sealed class DiscordBindingStore(IEntityStore store)
             ["webhook_id"] = null,
             ["webhook_token"] = null,
         }, ct: ct));
+
+    /// <summary>
+    /// Moves webhook tokens stored before <c>webhook_token</c> was a declared secret field into
+    /// the RedLeaf vault. Reads hydrate vaulted and plaintext tokens alike, so the plugin cannot
+    /// tell them apart: every webhook binding is rewritten with its unchanged <c>webhook_id</c>.
+    /// The kernel write boundary vaults any declared secret still in the stored document, and an
+    /// unchanged value records no version, so this is safe to run on every start.
+    /// </summary>
+    public async Task<WebhookTokenProtectionResult> ProtectStoredWebhookTokensAsync(
+        CancellationToken ct = default)
+    {
+        const int pageSize = 500;
+        var candidates = new Dictionary<Guid, string>();
+        for (var offset = 0; ; offset += pageSize)
+        {
+            var page = await store.QueryAsync(new EntityQuery
+            {
+                TypeSlug = TypeSlug,
+                DataEquals = new Dictionary<string, object?> { ["delivery_mode"] = "webhook" },
+                Offset = offset,
+                Limit = pageSize,
+            }, ct);
+            foreach (var binding in page.Select(Map))
+                if (!string.IsNullOrWhiteSpace(binding.WebhookToken)
+                    && !string.IsNullOrWhiteSpace(binding.WebhookId))
+                    candidates[binding.EntityId] = binding.WebhookId;
+            if (page.Count < pageSize) break;
+        }
+
+        var failed = new List<Guid>();
+        foreach (var (entityId, webhookId) in candidates)
+        {
+            try
+            {
+                await store.PatchAsync(entityId, new JsonObject
+                {
+                    ["webhook_id"] = webhookId,
+                }, ct: ct);
+            }
+            catch (Exception) when (!ct.IsCancellationRequested)
+            {
+                failed.Add(entityId);
+            }
+        }
+        return new WebhookTokenProtectionResult(candidates.Count - failed.Count, failed);
+    }
 
     public static string BindingKey(string applicationId, string conversationId)
         => $"discord:{applicationId}:{conversationId}";

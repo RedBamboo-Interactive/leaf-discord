@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Leaf.Plugins.LeafDiscord;
 using Leaf.Sdk;
@@ -434,9 +435,37 @@ public sealed class DiscordDeliveryStoreTests
             "nova-discord-external", "participate"));
 }
 
-internal sealed class MemoryEntityStore : IEntityStore
+/// <summary>
+/// In-memory <see cref="IEntityStore"/>. Given declared secret fields it also models RedLeaf's
+/// vault: every write moves those top-level keys out of the stored document (an explicit null
+/// or empty value clears the vaulted one, an absent key keeps it), reads hydrate them back, and
+/// <see cref="Redacted"/> is what the entity HTTP API returns.
+/// </summary>
+internal sealed class MemoryEntityStore(
+    IReadOnlyDictionary<string, IReadOnlySet<string>>? secretFields = null) : IEntityStore
 {
+    public const string RedactedSentinel = "__redacted__";
+
     private readonly List<LeafEntity> items = [];
+    private readonly Dictionary<(Guid EntityId, string Key), string> vault = [];
+
+    /// <summary>Secret fields exactly as the plugin seeds declare them.</summary>
+    public static MemoryEntityStore WithSeedSecretFields()
+    {
+        var root = PluginPackagingContractTests.FindRepositoryRoot();
+        using var seeds = JsonDocument.Parse(File.ReadAllText(
+            Path.Combine(root, "seeds", "field-definitions.json")));
+        var fields = seeds.RootElement.EnumerateArray()
+            .Where(field => field.GetProperty("fieldType").GetString() == "secret")
+            .GroupBy(field => field.GetProperty("parentType").GetString()!)
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlySet<string>)group
+                    // RedLeaf keys a field by its slug with hyphens as underscores.
+                    .Select(field => field.GetProperty("slug").GetString()!.Replace('-', '_'))
+                    .ToHashSet(StringComparer.Ordinal));
+        return new MemoryEntityStore(fields);
+    }
 
     public LeafEntity Seed(string typeSlug, string slug, string name, string? createdBy)
     {
@@ -447,16 +476,46 @@ internal sealed class MemoryEntityStore : IEntityStore
         return entity;
     }
 
+    /// <summary>A row written before its secret fields were declared: stored verbatim.</summary>
+    public LeafEntity SeedStored(string typeSlug, string slug, string name, JsonObject data)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var entity = new LeafEntity(
+            Guid.NewGuid(), typeSlug, slug, name, Clone(data), now, now, "test");
+        items.Add(entity);
+        return entity;
+    }
+
+    /// <summary>The document at rest, as RedLeaf stores it in the entity row.</summary>
+    public JsonObject StoredData(Guid id) => Clone(items.Single(item => item.Id == id).Data);
+
+    public string? VaultValue(Guid id, string key)
+        => vault.TryGetValue((id, key), out var value) ? value : null;
+
+    /// <summary>The document as the entity HTTP API returns it.</summary>
+    public JsonObject Redacted(Guid id)
+    {
+        var entity = items.Single(item => item.Id == id);
+        var data = Clone(entity.Data);
+        foreach (var key in SecretKeys(entity.TypeSlug))
+        {
+            var stored = data[key] is JsonValue value && value.TryGetValue<string>(out var text)
+                && text.Length > 0;
+            if (stored || vault.ContainsKey((id, key))) data[key] = RedactedSentinel;
+        }
+        return data;
+    }
+
     public Task<LeafEntity?> GetAsync(Guid id, CancellationToken ct = default)
-        => Task.FromResult(items.FirstOrDefault(item => item.Id == id));
+        => Task.FromResult(Hydrate(items.FirstOrDefault(item => item.Id == id)));
 
     public Task<LeafEntity?> GetBySlugAsync(string slug, CancellationToken ct = default)
-        => Task.FromResult(items.FirstOrDefault(item => item.Slug == slug));
+        => Task.FromResult(Hydrate(items.FirstOrDefault(item => item.Slug == slug)));
 
     public Task<LeafEntity?> GetBySlugAsync(
         string typeSlug, string slug, CancellationToken ct = default)
-        => Task.FromResult(items.FirstOrDefault(item =>
-            item.TypeSlug == typeSlug && item.Slug == slug));
+        => Task.FromResult(Hydrate(items.FirstOrDefault(item =>
+            item.TypeSlug == typeSlug && item.Slug == slug)));
 
     public Task<IReadOnlyList<LeafEntity>> QueryAsync(
         EntityQuery query, CancellationToken ct = default)
@@ -465,7 +524,7 @@ internal sealed class MemoryEntityStore : IEntityStore
         if (query.DataEquals is not null)
             result = result.Where(item => query.DataEquals.All(pair => Equal(item.Data[pair.Key], pair.Value)));
         return Task.FromResult<IReadOnlyList<LeafEntity>>(
-            result.Skip(query.Offset).Take(query.Limit).ToArray());
+            result.Skip(query.Offset).Take(query.Limit).Select(item => Hydrate(item)!).ToArray());
     }
 
     public Task<LeafEntity> CreateAsync(
@@ -480,15 +539,19 @@ internal sealed class MemoryEntityStore : IEntityStore
         if (existing is null)
         {
             var now = DateTimeOffset.UtcNow;
-            existing = new LeafEntity(Guid.NewGuid(), typeSlug, slug, name, Clone(data), now, now, "test");
+            existing = Protect(new LeafEntity(
+                Guid.NewGuid(), typeSlug, slug, name, Clone(data), now, now, "test"));
             items.Add(existing);
         }
         else
         {
-            existing = existing with { Name = name, Data = Clone(data), UpdatedAt = DateTimeOffset.UtcNow };
+            existing = Protect(existing with
+            {
+                Name = name, Data = Clone(data), UpdatedAt = DateTimeOffset.UtcNow,
+            });
             Replace(existing);
         }
-        return Task.FromResult(existing);
+        return Task.FromResult(Hydrate(existing)!);
     }
 
     public Task<LeafEntity> PatchAsync(
@@ -497,34 +560,67 @@ internal sealed class MemoryEntityStore : IEntityStore
         var existing = items.Single(item => item.Id == id);
         var data = Clone(existing.Data);
         foreach (var (key, value) in dataPatch) data[key] = value?.DeepClone();
-        var updated = existing with
+        var updated = Protect(existing with
         {
             Name = name ?? existing.Name,
             Data = data,
             UpdatedAt = DateTimeOffset.UtcNow,
-        };
+        });
         Replace(updated);
-        return Task.FromResult(updated);
+        return Task.FromResult(Hydrate(updated)!);
     }
 
     public Task<LeafEntity> ReplaceDataAsync(
         Guid id, JsonObject data, string? name = null, CancellationToken ct = default)
     {
         var existing = items.Single(item => item.Id == id);
-        var updated = existing with
+        var updated = Protect(existing with
         {
             Name = name ?? existing.Name,
             Data = Clone(data),
             UpdatedAt = DateTimeOffset.UtcNow,
-        };
+        });
         Replace(updated);
-        return Task.FromResult(updated);
+        return Task.FromResult(Hydrate(updated)!);
     }
 
     public Task DeleteAsync(Guid id, CancellationToken ct = default)
     {
         items.RemoveAll(item => item.Id == id);
+        foreach (var key in vault.Keys.Where(key => key.EntityId == id).ToArray())
+            vault.Remove(key);
         return Task.CompletedTask;
+    }
+
+    private IReadOnlySet<string> SecretKeys(string typeSlug)
+        => secretFields?.GetValueOrDefault(typeSlug) ?? new HashSet<string>();
+
+    /// <summary>The kernel write boundary: it scans the whole stored document, not the patch.</summary>
+    private LeafEntity Protect(LeafEntity entity)
+    {
+        foreach (var key in SecretKeys(entity.TypeSlug))
+        {
+            if (!entity.Data.TryGetPropertyValue(key, out var node)) continue;
+            var text = node is JsonValue value && value.TryGetValue<string>(out var s) ? s : null;
+            if (text != RedactedSentinel)
+            {
+                if (string.IsNullOrEmpty(text)) vault.Remove((entity.Id, key));
+                else vault[(entity.Id, key)] = text;
+            }
+            entity.Data.Remove(key);
+        }
+        return entity;
+    }
+
+    private LeafEntity? Hydrate(LeafEntity? entity)
+    {
+        if (entity is null) return null;
+        var keys = SecretKeys(entity.TypeSlug);
+        if (keys.Count == 0) return entity;
+        var data = Clone(entity.Data);
+        foreach (var key in keys)
+            if (vault.TryGetValue((entity.Id, key), out var value)) data[key] = value;
+        return entity with { Data = data };
     }
 
     private void Replace(LeafEntity entity)
