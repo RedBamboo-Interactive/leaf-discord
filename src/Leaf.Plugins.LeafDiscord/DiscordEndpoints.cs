@@ -669,6 +669,18 @@ public static class DiscordEndpoints
                 id, request, http, configurations, agents, assets,
                 bot.ListApplicationEmojisAsync, bot.CreateApplicationEmojiAsync, ct));
 
+        group.MapDelete("/bots/{id:guid}/application-emojis/{emojiId}", async (
+            Guid id,
+            string emojiId,
+            HttpContext http,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+            await DeleteApplicationEmojiAsync(
+                id, emojiId, http, configurations, agents,
+                bot.ListApplicationEmojisAsync, bot.DeleteApplicationEmojiAsync, ct));
+
         group.MapGet("/bots/{id:guid}/commons", async (
             Guid id,
             IAuthContext auth,
@@ -2178,6 +2190,57 @@ public static class DiscordEndpoints
         catch (Exception ex)
         {
             return ApplicationEmojiDiscordError(ex, "created");
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Deletes one of the application's own emojis so it can be replaced. The emoji must be
+    /// in this application's list; the create gate is held so a delete cannot race a create.
+    /// </summary>
+    internal static async Task<IResult> DeleteApplicationEmojiAsync(
+        Guid id,
+        string emojiId,
+        HttpContext http,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        Func<Guid, CancellationToken, Task<IReadOnlyList<DiscordApplicationEmoji>>> list,
+        Func<Guid, ulong, CancellationToken, Task> delete,
+        CancellationToken ct)
+    {
+        if (await AuthorizeBotAgentAsync(id, http, configurations, agents, ct) is { } denied)
+            return denied;
+        if (!ulong.TryParse(emojiId, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsedId)
+            || parsedId == 0)
+            return Results.BadRequest(new
+            {
+                error = "invalid_application_emoji",
+                message = "Emoji ID must be a Discord snowflake.",
+            });
+
+        var gate = DiscordApplicationEmojis.CreateGate(id);
+        await gate.WaitAsync(ct);
+        try
+        {
+            var canonicalId = parsedId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (!(await list(id, ct)).Any(emoji =>
+                    string.Equals(emoji.Id, canonicalId, StringComparison.Ordinal)))
+                return Results.NotFound(new
+                {
+                    error = "application_emoji_not_found",
+                    message = "No application emoji with that ID belongs to this bot.",
+                });
+            await delete(id, parsedId, ct);
+            return Results.NoContent();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return ApplicationEmojiDiscordError(ex, "deleted");
         }
         finally
         {

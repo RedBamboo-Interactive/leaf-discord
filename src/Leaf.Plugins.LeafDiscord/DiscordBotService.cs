@@ -334,6 +334,17 @@ public sealed class DiscordBotService(
         return await runtime.CreateApplicationEmojiAsync(config, name, image, ct);
     }
 
+    internal async Task DeleteApplicationEmojiAsync(
+        Guid botId, ulong emojiId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(botId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        await runtime.DeleteApplicationEmojiAsync(config, emojiId, ct);
+    }
+
     public async Task<IReadOnlyList<DiscordGuildChannel>> ListGuildChannelsAsync(
         Guid botId, CancellationToken ct = default)
     {
@@ -754,6 +765,14 @@ internal sealed class DiscordBotRuntime(
         var created = await current.CreateApplicationEmoteAsync(
             name, upload, new RequestOptions { CancelToken = ct });
         return DiscordApplicationEmojis.Project(created);
+    }
+
+    public async Task DeleteApplicationEmojiAsync(
+        LeafDiscordConfig config, ulong emojiId, CancellationToken ct)
+    {
+        var current = ConnectedApplicationClient(config);
+        await current.DeleteApplicationEmoteAsync(
+            emojiId, new RequestOptions { CancelToken = ct });
     }
 
     // Application emojis belong to the connected application, so its identity must

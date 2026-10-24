@@ -279,6 +279,112 @@ public sealed class DiscordApplicationEmojiTests
         Assert.DoesNotContain("secret", body.GetRawText());
     }
 
+    [Theory]
+    [MemberData(nameof(Rejected))]
+    public async Task Only_the_bots_own_private_nova_agent_and_owner_can_delete(
+        string callerKind, string agent, string owner, bool enabled)
+    {
+        var harness = await Harness.CreateAsync(enabled);
+        harness.Discord.Emojis.Add(DiscordApplicationEmojis.Project("111", "leaf", false));
+        var http = Caller(callerKind, agent == "match" ? harness.AgentId : Guid.NewGuid().ToString(), owner);
+
+        var (status, body) = await harness.DeleteAsync("111", http);
+
+        Assert.Equal(StatusCodes.Status403Forbidden, status);
+        Assert.Equal("forbidden", body.GetProperty("error").GetString());
+        Assert.Equal(0, harness.Discord.ListCalls);
+        Assert.Empty(harness.Discord.Deletes);
+        Assert.Single(harness.Discord.Emojis);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("0")]
+    [InlineData("leaf")]
+    [InlineData("-111")]
+    [InlineData("+111")]
+    [InlineData(" 111")]
+    [InlineData("1.5")]
+    [InlineData("18446744073709551616")] // ulong.MaxValue + 1
+    public async Task A_non_snowflake_emoji_id_is_rejected_before_discord_is_called(string emojiId)
+    {
+        var harness = await Harness.CreateAsync();
+
+        var (status, body) = await harness.DeleteAsync(emojiId);
+
+        Assert.Equal(StatusCodes.Status400BadRequest, status);
+        Assert.Equal("invalid_application_emoji", body.GetProperty("error").GetString());
+        Assert.Equal(0, harness.Discord.ListCalls);
+        Assert.Empty(harness.Discord.Deletes);
+    }
+
+    [Fact]
+    public async Task Deleting_an_emoji_outside_this_application_is_not_found()
+    {
+        var harness = await Harness.CreateAsync();
+        harness.Discord.Emojis.Add(DiscordApplicationEmojis.Project("111", "leaf", false));
+
+        var (status, body) = await harness.DeleteAsync("222");
+
+        Assert.Equal(StatusCodes.Status404NotFound, status);
+        Assert.Equal("application_emoji_not_found", body.GetProperty("error").GetString());
+        Assert.Empty(harness.Discord.Deletes);
+        Assert.Single(harness.Discord.Emojis);
+    }
+
+    [Fact]
+    public async Task Deleting_an_owned_emoji_returns_204_and_frees_its_name()
+    {
+        var harness = await Harness.CreateAsync();
+        harness.Assets.Add("leaf-logo.png", "image/png", Png);
+        harness.Discord.Emojis.Add(DiscordApplicationEmojis.Project("1546583557567287399", "leaf", false));
+
+        var (status, _) = await harness.DeleteAsync("1546583557567287399");
+        var (createStatus, created) = await harness.CreateAsync(new("leaf", "leaf-logo.png"));
+
+        Assert.Equal(StatusCodes.Status204NoContent, status);
+        Assert.Equal(1546583557567287399UL, Assert.Single(harness.Discord.Deletes));
+        Assert.Equal(StatusCodes.Status200OK, createStatus);
+        AssertEmoji(created, "900", "leaf", false, "<:leaf:900>");
+    }
+
+    [Fact]
+    public async Task A_create_waits_for_an_in_flight_delete_of_the_same_name()
+    {
+        var harness = await Harness.CreateAsync();
+        harness.Assets.Add("leaf-logo.png", "image/png", Png);
+        harness.Discord.Emojis.Add(DiscordApplicationEmojis.Project("111", "leaf", false));
+        harness.Discord.DeleteDelay = TimeSpan.FromMilliseconds(50);
+
+        var delete = harness.DeleteAsync("111");
+        var create = harness.CreateAsync(new("leaf", "leaf-logo.png"));
+        await Task.WhenAll(delete, create);
+
+        Assert.Equal(StatusCodes.Status204NoContent, delete.Result.Status);
+        Assert.Equal(StatusCodes.Status200OK, create.Result.Status);
+        Assert.Equal("900", Assert.Single(harness.Discord.Emojis).Id);
+    }
+
+    [Fact]
+    public async Task Discord_delete_failures_are_bounded_502_and_503()
+    {
+        var harness = await Harness.CreateAsync();
+        harness.Discord.Emojis.Add(DiscordApplicationEmojis.Project("111", "leaf", false));
+
+        harness.Discord.DeleteFailure = new HttpRequestException("Authorization: Bot secret-token");
+        var (failedStatus, failed) = await harness.DeleteAsync("111");
+        harness.Discord.DeleteFailure = new InvalidOperationException("Discord bot is not connected. token=secret");
+        var (unavailableStatus, unavailable) = await harness.DeleteAsync("111");
+
+        Assert.Equal(StatusCodes.Status502BadGateway, failedStatus);
+        Assert.Equal("discord_application_emoji_failed", failed.GetProperty("error").GetString());
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, unavailableStatus);
+        Assert.Equal("discord_bot_unavailable", unavailable.GetProperty("error").GetString());
+        Assert.DoesNotContain("secret", failed.GetRawText());
+        Assert.DoesNotContain("secret", unavailable.GetRawText());
+        Assert.Single(harness.Discord.Emojis);
+    }
+
     private static void AssertEmoji(
         JsonElement emoji, string id, string name, bool animated, string markdown)
     {
@@ -372,6 +478,13 @@ public sealed class DiscordApplicationEmojiTests
                 new DiscordAgentResolver(Entities), Assets,
                 Discord.ListAsync, Discord.CreateAsync, CancellationToken.None));
 
+        public async Task<(int Status, JsonElement Body)> DeleteAsync(
+            string emojiId, HttpContext? http = null)
+            => Read(await DiscordEndpoints.DeleteApplicationEmojiAsync(
+                BotId, emojiId, http ?? OwnCaller(), Configurations,
+                new DiscordAgentResolver(Entities),
+                Discord.ListAsync, Discord.DeleteAsync, CancellationToken.None));
+
         private static (int Status, JsonElement Body) Read(IResult result)
         {
             var status = Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode
@@ -392,6 +505,20 @@ public sealed class DiscordApplicationEmojiTests
         public Exception? Failure { get; set; }
         public Exception? CreateFailure { get; set; }
         public TimeSpan CreateDelay { get; set; }
+        public List<ulong> Deletes { get; } = [];
+        public Exception? DeleteFailure { get; set; }
+        public TimeSpan DeleteDelay { get; set; }
+
+        public async Task DeleteAsync(Guid botId, ulong emojiId, CancellationToken ct)
+        {
+            if (DeleteDelay > TimeSpan.Zero) await Task.Delay(DeleteDelay, ct);
+            lock (gate)
+            {
+                if (DeleteFailure is not null) throw DeleteFailure;
+                Deletes.Add(emojiId);
+                Emojis.RemoveAll(emoji => emoji.Id == emojiId.ToString());
+            }
+        }
 
         public Task<IReadOnlyList<DiscordApplicationEmoji>> ListAsync(Guid botId, CancellationToken ct)
         {

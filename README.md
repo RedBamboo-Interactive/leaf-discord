@@ -487,26 +487,31 @@ have the native path's crash-recovery deduplication guarantee.
 
 Discord application emojis belong to the bot's application rather than a server, so the
 bot can use them in messages and reactions in every guild and DM. A signed private Nova
-Agent discussion can list and upload them, with the same exact-Agent, owner, and enabled
+Agent discussion can list, upload, and delete them, with the same exact-Agent, owner, and enabled
 checks as forum-post and channel creation. Discord external-conversation callers,
 automations, browser sessions, and unsigned callers are refused:
 
 ```text
-GET  /api/apps/leaf-discord/bots/{botEntityId}/application-emojis
-POST /api/apps/leaf-discord/bots/{botEntityId}/application-emojis
+GET    /api/apps/leaf-discord/bots/{botEntityId}/application-emojis
+POST   /api/apps/leaf-discord/bots/{botEntityId}/application-emojis
+DELETE /api/apps/leaf-discord/bots/{botEntityId}/application-emojis/{emojiId}
 
 { "name": "leaf", "assetId": "<RedLeaf Asset ID or /api/assets/... path>" }
 ```
 
-Both return emojis as `{ id, name, animated, markdown }`, where `markdown` is the
+GET and POST return emojis as `{ id, name, animated, markdown }`, where `markdown` is the
 `<:name:id>` (or animated `<a:name:id>`) text to place in a message; GET wraps them in
 `{ items: [...] }`. The name must be 2-32 letters, digits, or underscores. The image is
 read only from the RedLeaf Asset store, never a URL or filesystem path, and must be a PNG,
 JPEG, GIF, or WebP of at most 256 KiB whose bytes match its declared type. If an emoji of
 that exact name already exists, POST returns `409 application_emoji_exists` with the
-existing emoji instead of uploading a duplicate. A disconnected bot, or one whose
-connected application differs from its configuration, returns `503 discord_bot_unavailable`.
-Both calls go through the connected Discord.Net client, so the bot token never leaves it.
+existing emoji instead of uploading a duplicate. To replace an emoji, DELETE it by its
+snowflake `id` and upload again: a non-snowflake ID returns 400, an ID that is not in
+this application's list returns `404 application_emoji_not_found`, and success returns
+204. Deletes and uploads for one bot run one at a time, so a delete cannot race an
+upload of the same name. A disconnected bot, or one whose connected application
+differs from its configuration, returns `503 discord_bot_unavailable`.
+All three calls go through the connected Discord.Net client, so the bot token never leaves it.
 
 
 ## Agent delivery
