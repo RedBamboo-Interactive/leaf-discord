@@ -680,12 +680,14 @@ public sealed class DiscordOutboundReviewTests
         Assert.Equal(DiscordDeliveryStore.HeldState, Assert.Single(await h.Rows("reply-1")).State);
     }
 
-    [Fact]
-    public async Task A_reply_with_an_image_fails_closed_while_the_sentinel_is_unavailable()
+    [Theory]
+    [InlineData("vision-unavailable")] // cap-sentinel's answer to RedCompute 422 vision_unavailable
+    [InlineData("image-refused")]      // and to 422 invalid_images
+    public async Task A_reply_with_an_image_fails_closed_while_the_sentinel_is_unavailable(string signal)
     {
         var h = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable() with
         {
-            Signals = ["verifier-unavailable", "vision-unavailable"],
+            Signals = ["verifier-unavailable", signal],
         });
         ImageReply(h);
         await h.ReconcileAsync();
@@ -705,6 +707,9 @@ public sealed class DiscordOutboundReviewTests
         Assert.Equal(DiscordDeliveryStore.HeldState, withheld.State);
         Assert.Equal("withheld", withheld.OutboundReview?["outcome"]?.GetValue<string>());
         Assert.Equal(0, withheld.OutboundReview?["images_reviewed"]?.GetValue<int>());
+        // Every re-ask carried the image: the reply was never reviewed as text alone.
+        Assert.Equal(DiscordConversationCoordinator.MaxOutboundReviewAttempts, h.Sentinel.Requests.Count);
+        Assert.All(h.Sentinel.Requests, request => Assert.Equal("stable-cat.png", Assert.Single(request.Images!).AssetId));
         Assert.Equal(DiscordConversationCoordinator.OutboundUnavailableNotice,
             Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId)).Payload?["content"]?.GetValue<string>());
     }
