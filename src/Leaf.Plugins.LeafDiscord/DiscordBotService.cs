@@ -826,7 +826,7 @@ internal sealed class DiscordBotRuntime(
                     new DiscordOutgoingContext(ownerUserId, config.AgentId,
                         $"{config.ApplicationId}:{guildId}:{forumId}",
                         "a new post in a Discord server forum, readable by every member who can see it"),
-                    $"{title}\n\n{content}", 0, hiddenInPost,
+                    $"{title}\n\n{content}", [], hiddenInPost,
                     $"forum:{config.ApplicationId}:{idempotencyKey}", ct);
             thread ??= await forum.CreatePostAsync(
                 title,
@@ -2970,7 +2970,7 @@ internal sealed class DiscordBotRuntime(
         if (replacesContent || prepared.OutputAssets is { Count: > 0 })
             await conversations.ReviewOutgoingOrThrowAsync(
                 await conversations.OutgoingContextAsync(binding, ct),
-                prepared.DeliveryContent ?? "", prepared.OutputAssets?.Count ?? 0, prepared.HiddenCharacters,
+                prepared.DeliveryContent ?? "", prepared.OutputAssets ?? [], prepared.HiddenCharacters,
                 $"correction:{binding.BindingId}:{messageUid}:{DiscordBindingStore.Hash(prepared.DeliveryContent ?? "")}",
                 ct);
         var chunks = replacesContent
@@ -4255,7 +4255,7 @@ internal sealed class DiscordBotRuntime(
             new DiscordOutgoingContext(config.OwnerUserId, config.AgentId,
                 $"{config.ApplicationId}:{guildId}",
                 "the name, topic and settings of a channel in a Discord server, visible to every member who can see it"),
-            text, 0, !ReferenceEquals(DiscordEgressGuard.StripHiddenCharacters(text), text),
+            text, [], !ReferenceEquals(DiscordEgressGuard.StripHiddenCharacters(text), text),
             $"channel:{config.ApplicationId}:{guildId}:{DiscordBindingStore.Hash(text)}", ct);
     }
 

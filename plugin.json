@@ -2,7 +2,7 @@
   "id": "leaf-discord",
   "name": "Discord",
   "version": "0.1.0",
-  "kernelApi": "^0.1.3",
+  "kernelApi": "^0.1.4",
   "description": "Multi-Agent Discord bridge with one dedicated bot identity per Leaf Agent.",
   "icon": "ph-discord-logo",
   "color": "indigo",

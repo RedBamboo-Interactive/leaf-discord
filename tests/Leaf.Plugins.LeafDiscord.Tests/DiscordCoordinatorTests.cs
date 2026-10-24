@@ -341,7 +341,7 @@ public sealed class DiscordCoordinatorTests
     }
 
     [Fact]
-    public async Task Existing_binding_message_with_an_image_is_held_before_injection_or_delivery()
+    public async Task Existing_binding_message_with_an_innocuous_image_is_reviewed_with_it_then_injected_and_queued()
     {
         var entities = new MemoryEntityStore();
         await SeedQualityMode(entities);
@@ -356,30 +356,33 @@ public sealed class DiscordCoordinatorTests
             provider.ProviderId, binding.BindingId, binding.Generation,
             "existing-conversation", "existing-session"));
         var compute = new FakeComputeGateway();
+        var sentinel = new TestSentinel();
         using var coordinator = new DiscordConversationCoordinator(
             bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities), compute,
             [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+            new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, sentinel);
         const string canonical =
             "A casual image.\n\n![Quiet science-fiction reading nook](/api/assets/casual.png)";
 
-        // The tool-free Sentinel cannot see images, so an image is unreviewable and held
-        // (fail closed) until Laurent decides otherwise.
-        var refused = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
-            coordinator.SendExistingProactiveAsync(
-                binding,
-                "owner-image-request-1",
-                canonical,
-                "A casual image.",
-                [new ExternalConversationOutputAsset(
-                    "casual.png", "Quiet science-fiction reading nook")]));
+        // The Sentinel sees the image itself; an innocuous one passes like innocuous text.
+        await coordinator.SendExistingProactiveAsync(
+            binding,
+            "owner-image-request-1",
+            canonical,
+            "A casual image.",
+            [new ExternalConversationOutputAsset(
+                "casual.png", "Quiet science-fiction reading nook")]);
 
-        Assert.False(refused.Unavailable);
-        Assert.Contains("image-not-reviewable", refused.Review["signals"]!.AsArray()
-            .Select(signal => signal!.GetValue<string>()));
-        Assert.Empty(compute.Requests);
-        Assert.Empty(await deliveries.PendingOutboundAsync(binding.BindingId));
+        var review = Assert.Single(sentinel.Requests);
+        Assert.Equal("A casual image.", review.Content);
+        Assert.Equal(new UntrustedContentImage("casual.png", "image/png", "Quiet science-fiction reading nook"),
+            Assert.Single(review.Images!));
+        Assert.Single(compute.Requests);
+        var queued = Assert.Single(await deliveries.PendingOutboundAsync(binding.BindingId));
+        Assert.Equal("delivered", queued.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.Equal(1, queued.OutboundReview?["images_reviewed"]?.GetValue<int>());
+        Assert.Equal("casual.png", queued.Payload?["assets"]?[0]?["asset_id"]?.GetValue<string>());
     }
 
     [Fact]

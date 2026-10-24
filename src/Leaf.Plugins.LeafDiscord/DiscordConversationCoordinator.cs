@@ -486,7 +486,7 @@ public sealed class DiscordConversationCoordinator(
             var toReview = PrepareOutreach(content, deliveryContent, outputAssets);
             review = await ReviewOutgoingOrThrowAsync(
                 await OutgoingContextAsync(binding, ct), toReview.DeliveryContent,
-                toReview.OutputAssets.Count, toReview.HiddenCharacters,
+                toReview.OutputAssets, toReview.HiddenCharacters,
                 $"outreach:{binding.BindingId}:{requestId}", ct);
         }
         var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
@@ -855,18 +855,22 @@ public sealed class DiscordConversationCoordinator(
             return string.Join("\n", new[] { text }.Concat(assets)
                 .Where(part => !string.IsNullOrEmpty(part)));
         }));
+        var images = chunks
+            .SelectMany(chunk => (chunk.Payload?["assets"] as JsonArray)?.OfType<JsonObject>() ?? [])
+            .Select(asset => new ExternalConversationOutputAsset(
+                JsonRead.String(asset, "asset_id") ?? "", JsonRead.String(asset, "description") ?? ""))
+            .ToArray();
         var turn = chunks[0].ReplyTurn ?? TurnKey(binding);
         var watch = Stopwatch.StartNew();
-        var deterministic = DeterministicHoldSignals(
-            chunks.Any(chunk => chunk.HiddenCharacters),
-            chunks.Any(chunk => chunk.Payload?["assets"] is JsonArray { Count: > 0 }));
+        var deterministic = DeterministicHoldSignals(chunks.Any(chunk => chunk.HiddenCharacters));
         UntrustedContentReviewResult? result = null;
         var verdict = deterministic.Count > 0
             ? DeterministicHold(deterministic)
             : EffectiveVerdict(result = await RunOutboundReviewAsync(
                 binding.OwnerId, binding.AgentId,
                 $"{binding.BindingId}:{binding.Generation}", await AudienceAsync(binding, ct),
-                $"sentinel-outbound:{binding.BindingId}:{binding.Generation}:{messageUid}", content, ct));
+                $"sentinel-outbound:{binding.BindingId}:{binding.Generation}:{messageUid}", content, images, ct),
+                images.Length);
         watch.Stop();
         if (!verdict.Available)
         {
@@ -897,32 +901,26 @@ public sealed class DiscordConversationCoordinator(
             "Discord outbound review of {MessageUid} on {BindingId}: {Outcome} (available {Available}, risk {Risk}, {ElapsedMs} ms)",
             messageUid, binding.BindingId, outcome, verdict.Available, verdict.Risk, watch.ElapsedMilliseconds);
         return OutboundReviewRecord(verdict, outcome, turn, result?.JobId, result?.TraceId,
-            watch.ElapsedMilliseconds);
+            watch.ElapsedMilliseconds, images.Length, verdict.Available ? result?.ImagesReviewed ?? 0 : 0);
     }
-
-    internal const string ImageNotReviewableSignal = "image-not-reviewable";
 
     /// <summary>
-    /// Holds that need no model: hidden characters the egress guard removed (a covert channel),
-    /// and images, which the tool-free Sentinel cannot see, so their content is unreviewable.
+    /// The hold that needs no model: hidden characters the egress guard removed (a covert channel).
+    /// Images are not held here; the Sentinel reviews them with the text.
     /// </summary>
-    private static IReadOnlyList<string> DeterministicHoldSignals(bool hiddenCharacters, bool images)
-    {
-        var signals = new List<string>();
-        if (hiddenCharacters) signals.Add(DiscordEgressGuard.HiddenCharactersFinding);
-        if (images) signals.Add(ImageNotReviewableSignal);
-        return signals;
-    }
+    private static IReadOnlyList<string> DeterministicHoldSignals(bool hiddenCharacters)
+        => hiddenCharacters ? [DiscordEgressGuard.HiddenCharactersFinding] : [];
 
     private static UntrustedContentVerdict DeterministicHold(IReadOnlyList<string> signals)
         => new("high", signals, "require_private_approval", true, UntrustedContentIsolation.Unknown);
 
     /// <summary>
-    /// A verdict counts only when the Sentinel proves it applied the outbound rubric; an older
-    /// reviewer that ignored Direction is unavailable here, so the reply fails closed.
+    /// A verdict counts only when the Sentinel proves it applied the outbound rubric and reviewed
+    /// every image that was sent; an older reviewer that ignored Direction or Images is
+    /// unavailable here, so the content fails closed.
     /// </summary>
-    internal static UntrustedContentVerdict EffectiveVerdict(UntrustedContentReviewResult? result)
-        => result is { Direction: UntrustedContentDirection.Outbound }
+    internal static UntrustedContentVerdict EffectiveVerdict(UntrustedContentReviewResult? result, int imagesSent = 0)
+        => result is { Direction: UntrustedContentDirection.Outbound } && result.ImagesReviewed == imagesSent
             ? result.Verdict
             : UntrustedContentVerdict.Unavailable(result?.Verdict.Isolation ?? UntrustedContentIsolation.Unknown);
 
@@ -941,22 +939,24 @@ public sealed class DiscordConversationCoordinator(
     /// caller, the session that wrote the content, gets the verdict in the response.
     /// </summary>
     internal async Task<JsonObject> ReviewOutgoingOrThrowAsync(
-        DiscordOutgoingContext context, string content, int assetCount, bool hiddenCharacters,
+        DiscordOutgoingContext context, string content,
+        IReadOnlyList<ExternalConversationOutputAsset> images, bool hiddenCharacters,
         string key, CancellationToken ct)
     {
         var watch = Stopwatch.StartNew();
-        var deterministic = DeterministicHoldSignals(hiddenCharacters, assetCount > 0);
+        var deterministic = DeterministicHoldSignals(hiddenCharacters);
         UntrustedContentReviewResult? result = null;
         var verdict = deterministic.Count > 0
             ? DeterministicHold(deterministic)
             : EffectiveVerdict(result = await RunOutboundReviewAsync(
                 context.OwnerUserId, context.AgentId, context.SourceRef,
-                context.Audience, $"sentinel-outbound:{key}", content, ct));
+                context.Audience, $"sentinel-outbound:{key}", content, images, ct), images.Count);
         watch.Stop();
         var hold = IsHold(verdict);
         var review = OutboundReviewRecord(verdict,
             !verdict.Available ? "withheld" : hold ? "held" : "delivered", "-",
-            result?.JobId, result?.TraceId, watch.ElapsedMilliseconds);
+            result?.JobId, result?.TraceId, watch.ElapsedMilliseconds,
+            images.Count, verdict.Available ? result?.ImagesReviewed ?? 0 : 0);
         logger.LogInformation(
             "Discord outbound review of {Key}: {Outcome} (available {Available}, risk {Risk}, {ElapsedMs} ms)",
             key, JsonRead.String(review, "outcome"), verdict.Available, verdict.Risk, watch.ElapsedMilliseconds);
@@ -967,7 +967,8 @@ public sealed class DiscordConversationCoordinator(
 
     private async Task<UntrustedContentReviewResult?> RunOutboundReviewAsync(
         string? ownerUserId, string agentId, string sourceRef,
-        string audience, string idempotencyKey, string content, CancellationToken ct)
+        string audience, string idempotencyKey, string content,
+        IReadOnlyList<ExternalConversationOutputAsset> images, CancellationToken ct)
     {
         if (sentinel is null) return null;
         try
@@ -992,6 +993,9 @@ public sealed class DiscordConversationCoordinator(
                 Audience = audience,
                 IdempotencyKey = idempotencyKey.Length <= 200 ? idempotencyKey : idempotencyKey[..200],
                 JobName = "Discord outbound review",
+                // The Sentinel reads the Asset bytes and shows them to a vision model; an image it
+                // cannot review makes the verdict unavailable, never text-only.
+                Images = images.Count == 0 ? null : images.Select(ReviewImage).ToArray(),
             }, ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -1001,6 +1005,29 @@ public sealed class DiscordConversationCoordinator(
             return null;
         }
     }
+
+    /// <summary>
+    /// An outgoing Asset as the Sentinel reviews it. The media type follows the stored filename's
+    /// extension, as the kernel derives it when the bytes are read; the Sentinel checks it against
+    /// the stored Asset and refuses anything else as unreadable.
+    /// </summary>
+    internal static UntrustedContentImage ReviewImage(ExternalConversationOutputAsset asset)
+    {
+        var description = string.IsNullOrWhiteSpace(asset.Description) ? null : asset.Description.Trim();
+        if (description is { Length: > UntrustedContentImage.MaxDescriptionLength })
+            description = description[..UntrustedContentImage.MaxDescriptionLength];
+        return new UntrustedContentImage(asset.AssetId, AssetMediaType(asset.AssetId), description);
+    }
+
+    internal static string AssetMediaType(string assetId)
+        => Path.GetExtension(assetId.Trim()).ToLowerInvariant() switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".webp" => "image/webp",
+            ".gif" => "image/gif",
+            _ => "application/octet-stream",
+        };
 
     /// <summary>Who will read the reply, from the bridge's own binding data only.</summary>
     private async Task<string> AudienceAsync(DiscordBinding binding, CancellationToken ct)
@@ -1112,7 +1139,7 @@ public sealed class DiscordConversationCoordinator(
 
     internal static JsonObject OutboundReviewRecord(
         UntrustedContentVerdict verdict, string outcome, string turn, string? jobId, string? traceId,
-        long elapsedMs)
+        long elapsedMs, int images = 0, int imagesReviewed = 0)
         => new()
         {
             ["direction"] = "outbound",
@@ -1126,6 +1153,8 @@ public sealed class DiscordConversationCoordinator(
             ["job_id"] = jobId,
             ["trace_id"] = traceId,
             ["elapsed_ms"] = elapsedMs,
+            ["images"] = images,
+            ["images_reviewed"] = imagesReviewed,
             ["reviewed_at"] = DateTimeOffset.UtcNow.ToString("O"),
         };
 

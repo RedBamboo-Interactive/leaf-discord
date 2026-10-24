@@ -195,6 +195,63 @@ public sealed class DiscordOwnerDirectMessageTests
     }
 
     [Fact]
+    public async Task An_owner_dm_with_an_image_is_reviewed_with_the_image_and_sent()
+    {
+        var sentinel = new TestSentinel();
+        var harness = await Harness.CreateAsync(sentinel: sentinel);
+
+        var (status, _) = await harness.OpenAsync(new DiscordOwnerDirectMessageRequest(
+            Recipient, "Here is the picture.", "key-image", "Here is the picture.",
+            [new DiscordBindingOutputAssetRequest("stable-cat.png", "A cartoon cat")]));
+
+        Assert.Equal(StatusCodes.Status200OK, status);
+        var review = Assert.Single(sentinel.Requests);
+        Assert.Equal(new UntrustedContentImage("stable-cat.png", "image/png", "A cartoon cat"),
+            Assert.Single(review.Images!));
+        Assert.Single(harness.Discord.MessagePosts);
+    }
+
+    [Theory]
+    [InlineData(false)] // the Sentinel holds the image
+    [InlineData(true)]  // the Sentinel is unavailable
+    public async Task An_owner_dm_whose_image_is_held_or_unreviewable_is_never_sent(bool unavailable)
+    {
+        var verdict = unavailable
+            ? UntrustedContentVerdict.Unavailable()
+            : new UntrustedContentVerdict("high", ["image-private-screenshot"], "require_private_approval", true,
+                UntrustedContentIsolation.VerifiedToolFree);
+        var harness = await Harness.CreateAsync(sentinel: new FixedSentinel(verdict));
+        var config = (await harness.Configurations.GetAsync(harness.BotId))!;
+
+        var refused = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => harness.Messenger.OpenAsync(
+            config, Owner, new DiscordOwnerDirectMessageRequest(
+                Recipient, "Look.", "key-held", "Look.",
+                [new DiscordBindingOutputAssetRequest("stable-inbox.png", "My inbox")])));
+
+        Assert.Equal(unavailable, refused.Unavailable);
+        Assert.Empty(harness.Discord.MessagePosts);
+        Assert.Empty(harness.Compute.Requests);
+        Assert.Empty(await harness.Bindings.ListAsync());
+    }
+
+    private sealed class FixedSentinel(UntrustedContentVerdict verdict) : IUntrustedContentReview
+    {
+        public Task<UntrustedContentReviewResult> ReviewAsync(
+            UntrustedContentReviewRequest request, CancellationToken ct = default)
+            => Task.FromResult(new UntrustedContentReviewResult(
+                verdict, null, [], new UntrustedContentScreening(0, [], [], request.Content, []), "job", "trace")
+            {
+                Direction = request.Direction,
+                ImagesReviewed = verdict.Available ? request.Images?.Count ?? 0 : 0,
+            });
+
+        public UntrustedContentScreening Screen(
+            string content, UntrustedContentFormat format = UntrustedContentFormat.Text,
+            string? ownerDisplayName = null)
+            => new(0, [], [], content, []);
+    }
+
+    [Fact]
     public async Task Discord_refusal_leaves_no_binding_or_session_behind()
     {
         var harness = await Harness.CreateAsync();
@@ -273,7 +330,7 @@ public sealed class DiscordOwnerDirectMessageTests
         public required string AgentId { get; init; }
         public int OpenInvocations { get; private set; }
 
-        public static async Task<Harness> CreateAsync(bool enabled = true)
+        public static async Task<Harness> CreateAsync(bool enabled = true, IUntrustedContentReview? sentinel = null)
         {
             var entities = new MemoryEntityStore();
             _ = await entities.UpsertBySlugAsync("quality-mode", "deep-codex", "Deep (Codex)",
@@ -299,7 +356,8 @@ public sealed class DiscordOwnerDirectMessageTests
                 new DiscordRuntimeOptionsResolver(entities),
                 new DiscordUserIdentityResolver(entities, NullLogger<DiscordUserIdentityResolver>.Instance),
                 compute, [provider], new PromptInjectionDetector(), new DiscordEgressGuard(),
-                new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+                new DiscordTypingLeases(), NullLogger<DiscordConversationCoordinator>.Instance,
+                sentinel ?? TestSentinel.Clean);
             var discord = new FakeDiscord();
             var messenger = new DiscordOwnerDirectMessenger(
                 bindings, new DiscordBehaviorStore(entities), deliveries, coordinator,

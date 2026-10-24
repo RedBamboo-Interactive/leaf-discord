@@ -610,16 +610,147 @@ public sealed class DiscordOutboundReviewTests
         Assert.DoesNotContain(DiscordEgressGuard.HiddenCharactersFinding, inspected.Findings);
     }
 
+    private static void ImageReply(Harness h, string messageUid = "reply-1", string text = "Here you go.",
+        params ExternalConversationOutputAsset[] assets)
+        => h.Provider.Messages.Add(new ExternalConversationMessage(
+            new ExternalConversationCursor("epoch-1", 1), messageUid, "assistant", "text",
+            text, DateTimeOffset.UtcNow)
+        {
+            OutputAssets = assets.Length == 0
+                ? [new ExternalConversationOutputAsset("stable-cat.png", "A cartoon cat waving")]
+                : assets,
+        });
+
     [Fact]
-    public async Task A_reply_with_an_image_is_held_as_unreviewable_without_asking_the_sentinel()
+    public async Task A_reply_with_an_innocuous_illustration_is_reviewed_with_its_image_and_delivered()
     {
         var h = await Harness.CreateAsync(_ => Clean);
-        h.Provider.Messages.Add(new ExternalConversationMessage(
-            new ExternalConversationCursor("epoch-1", 1), "reply-1", "assistant", "text",
-            "Here you go.", DateTimeOffset.UtcNow)
+        ImageReply(h);
+        await h.ReconcileAsync();
+
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+
+        var request = Assert.Single(h.Sentinel.Requests);
+        Assert.Equal(UntrustedContentDirection.Outbound, request.Direction);
+        var image = Assert.Single(request.Images!);
+        Assert.Equal(new UntrustedContentImage("stable-cat.png", "image/png", "A cartoon cat waving"), image);
+        var queued = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal("queued", queued.State);
+        Assert.Equal("delivered", queued.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.Equal(1, queued.OutboundReview?["images"]?.GetValue<int>());
+        Assert.Equal(1, queued.OutboundReview?["images_reviewed"]?.GetValue<int>());
+        Assert.DoesNotContain("image-not-reviewable", queued.OutboundReview!["signals"]!.AsArray()
+            .Select(signal => signal!.GetValue<string>()));
+        Assert.Empty(h.Provider.Inputs);
+    }
+
+    [Fact]
+    public async Task A_reply_whose_image_the_sentinel_rates_high_is_held_and_rewritten()
+    {
+        var h = await Harness.CreateAsync(request => request.Images is { Count: > 0 }
+            ? new UntrustedContentVerdict("high", ["image-credential"], "require_private_approval", true,
+                UntrustedContentIsolation.VerifiedToolFree)
+            : Clean);
+        ImageReply(h, assets: new ExternalConversationOutputAsset("stable-inbox.png", "My inbox"));
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        var held = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.HeldState, held.State);
+        Assert.Equal("held", held.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.Equal(["image-credential"], held.OutboundReview!["signals"]!.AsArray()
+            .Select(signal => signal!.GetValue<string>()));
+        var notice = Assert.Single(h.Provider.Inputs);
+        Assert.Equal("held", notice.Metadata?["outbound_sentinel_notice"]?["outcome"]?.GetValue<string>());
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId),
+            item => item.State == "queued");
+    }
+
+    [Fact]
+    public async Task A_reply_with_an_image_and_require_private_approval_is_held()
+    {
+        var h = await Harness.CreateAsync(_ => new UntrustedContentVerdict(
+            "low", ["image-private-screenshot"], "require_private_approval", true, UntrustedContentIsolation.VerifiedToolFree));
+        ImageReply(h);
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal(DiscordDeliveryStore.HeldState, Assert.Single(await h.Rows("reply-1")).State);
+    }
+
+    [Fact]
+    public async Task A_reply_with_an_image_fails_closed_while_the_sentinel_is_unavailable()
+    {
+        var h = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable() with
         {
-            OutputAssets = [new ExternalConversationOutputAsset("a.png", "A cat")],
+            Signals = ["verifier-unavailable", "vision-unavailable"],
         });
+        ImageReply(h);
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        var waiting = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, waiting.State);
+        Assert.Equal(1, waiting.ReviewAttempts);
+
+        foreach (var wait in new[] { 30, 60, 120 })
+        {
+            h.Clock.Advance(TimeSpan.FromSeconds(wait + 1));
+            await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        }
+
+        var withheld = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.HeldState, withheld.State);
+        Assert.Equal("withheld", withheld.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.Equal(0, withheld.OutboundReview?["images_reviewed"]?.GetValue<int>());
+        Assert.Equal(DiscordConversationCoordinator.OutboundUnavailableNotice,
+            Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId)).Payload?["content"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_clean_verdict_that_does_not_echo_the_reviewed_images_counts_as_unavailable()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Sentinel.EchoImages = false;
+        ImageReply(h);
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        var waiting = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, waiting.State);
+        Assert.Equal(1, waiting.ReviewAttempts);
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId),
+            item => item.State == "queued");
+    }
+
+    [Fact]
+    public async Task Every_image_of_a_reply_split_across_chunks_is_reviewed_together()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        var assets = Enumerable.Range(1, 11)
+            .Select(index => new ExternalConversationOutputAsset($"stable-{index}.webp", $"Panel {index}"))
+            .ToArray();
+        ImageReply(h, assets: assets);
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        // One review sees all eleven; a bounded Sentinel answers unavailable rather than
+        // reviewing a subset, so the reply never leaves with images nobody saw.
+        var request = Assert.Single(h.Sentinel.Requests);
+        Assert.Equal(assets.Select(asset => asset.AssetId), request.Images!.Select(image => image.AssetId));
+        Assert.All(request.Images!, image => Assert.Equal("image/webp", image.MediaType));
+        Assert.All(await h.Rows("reply-1"), row => Assert.Equal("queued", row.State));
+    }
+
+    [Fact]
+    public async Task Hidden_characters_still_hold_a_reply_with_an_image_without_asking_the_sentinel()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        ImageReply(h, text: "Here​ you go.");
         await h.ReconcileAsync();
 
         await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
@@ -627,8 +758,56 @@ public sealed class DiscordOutboundReviewTests
         Assert.Empty(h.Sentinel.Requests);
         var held = Assert.Single(await h.Rows("reply-1"));
         Assert.Equal(DiscordDeliveryStore.HeldState, held.State);
-        Assert.Contains(DiscordConversationCoordinator.ImageNotReviewableSignal,
-            held.OutboundReview!["signals"]!.AsArray().Select(signal => signal!.GetValue<string>()));
+        Assert.Equal(["hidden-characters"], held.OutboundReview!["signals"]!.AsArray()
+            .Select(signal => signal!.GetValue<string>()));
+    }
+
+    [Theory]
+    [InlineData("stable-a.png", "image/png")]
+    [InlineData("stable-a.JPG", "image/jpeg")]
+    [InlineData("b.jpeg", "image/jpeg")]
+    [InlineData("c.webp", "image/webp")]
+    [InlineData("d.gif", "image/gif")]
+    [InlineData("e.bmp", "application/octet-stream")]
+    [InlineData("noextension", "application/octet-stream")]
+    public void Review_images_take_the_media_type_the_kernel_derives_from_the_asset_name(string assetId, string mediaType)
+        => Assert.Equal(mediaType, DiscordConversationCoordinator.ReviewImage(
+            new ExternalConversationOutputAsset(assetId, "x")).MediaType);
+
+    [Fact]
+    public void Review_image_captions_are_bounded_and_blank_captions_dropped()
+    {
+        Assert.Null(DiscordConversationCoordinator.ReviewImage(new ExternalConversationOutputAsset("a.png", "  ")).Description);
+        Assert.Equal(UntrustedContentImage.MaxDescriptionLength, DiscordConversationCoordinator.ReviewImage(
+            new ExternalConversationOutputAsset("a.png", new string('x', 5000))).Description!.Length);
+    }
+
+    [Fact]
+    public async Task Outreach_with_an_image_is_held_or_refused_as_for_text()
+    {
+        // The passing path (reviewed with its image, injected, queued) is in DiscordCoordinatorTests.
+        ExternalConversationOutputAsset[] image = [new("stable-cat.png", "A cartoon cat")];
+
+        var held = await Harness.CreateAsync(_ => Leak);
+        Assert.False((await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            held.Coordinator.SendExistingProactiveAsync(held.Binding, "out-1", "A picture.", "A picture.", image)))
+            .Unavailable);
+        Assert.Equal("stable-cat.png", Assert.Single(Assert.Single(held.Sentinel.Requests).Images!).AssetId);
+        Assert.Empty(await held.Deliveries.PendingOutboundAsync(held.Binding.BindingId));
+
+        var down = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable());
+        Assert.True((await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            down.Coordinator.SendExistingProactiveAsync(down.Binding, "out-1", "A picture.", "A picture.", image)))
+            .Unavailable);
+        Assert.Empty(await down.Deliveries.PendingOutboundAsync(down.Binding.BindingId));
+
+        var older = await Harness.CreateAsync(_ => Clean);
+        older.Sentinel.EchoImages = false;
+        var refused = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() =>
+            older.Coordinator.SendExistingProactiveAsync(older.Binding, "out-1", "A picture.", "A picture.", image));
+        Assert.True(refused.Unavailable);
+        Assert.Equal(0, refused.Review["images_reviewed"]?.GetValue<int>());
+        Assert.Empty(await older.Deliveries.PendingOutboundAsync(older.Binding.BindingId));
     }
 
     [Fact]
@@ -994,14 +1173,22 @@ public sealed class DiscordOutboundReviewTests
         public Func<UntrustedContentReviewRequest, UntrustedContentVerdict> Decide { get; set; } = decide;
         /// <summary>False acts like a cap-sentinel that predates outbound reviews.</summary>
         public bool EchoDirection { get; set; } = true;
+        /// <summary>False acts like a cap-sentinel that predates image review: it ignores the
+        /// images and reports none reviewed.</summary>
+        public bool EchoImages { get; set; } = true;
 
         public Task<UntrustedContentReviewResult> ReviewAsync(
             UntrustedContentReviewRequest request, CancellationToken ct = default)
         {
             Requests.Add(request);
+            var verdict = Decide(request);
             return Task.FromResult(new UntrustedContentReviewResult(
-                Decide(request), null, [], new UntrustedContentScreening(0, [], [], request.Content, []),
-                "job-1", "trace-1") { Direction = EchoDirection ? request.Direction : UntrustedContentDirection.Inbound });
+                verdict, null, [], new UntrustedContentScreening(0, [], [], request.Content, []),
+                "job-1", "trace-1")
+            {
+                Direction = EchoDirection ? request.Direction : UntrustedContentDirection.Inbound,
+                ImagesReviewed = EchoImages && verdict.Available ? request.Images?.Count ?? 0 : 0,
+            });
         }
 
         public UntrustedContentScreening Screen(

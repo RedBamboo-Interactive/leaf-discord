@@ -129,7 +129,7 @@ internal sealed class DiscordOwnerDirectMessenger(
                 new DiscordOutgoingContext(ownerUserId, config.AgentId,
                     $"{config.ApplicationId}:dm:{recipientUserId}",
                     await conversations.DirectMessageAudienceAsync(recipientUserId, ownerUserId, ct)),
-                prepared.DeliveryContent, prepared.OutputAssets.Count, prepared.HiddenCharacters,
+                prepared.DeliveryContent, prepared.OutputAssets, prepared.HiddenCharacters,
                 $"owner-dm:{config.ApplicationId}:{idempotencyKey}", ct);
             DiscordDirectMessageChannel channel;
             try
