@@ -1036,6 +1036,32 @@ public sealed class DiscordCommonsRelayService(
         return payload;
     }
 
+    /// <summary>
+    /// The native host's own post, reported after Discord accepted it. Its attachments are passed
+    /// as Discord returned them; the relay forwards only bounded image descriptors to the Envoys
+    /// it addresses, which fetch, check and review the bytes themselves.
+    /// </summary>
+    internal static JsonObject BuildHostParticipantPostPayload(
+        string messageId, string participantId, string content, string sourceEnvoyId,
+        string channel, string? channelId, string threadRef, long timestamp, JsonArray? attachments)
+    {
+        var payload = new JsonObject
+        {
+            ["type"] = "host_participant_post",
+            ["eventId"] = $"host-post:{messageId}",
+            ["participantId"] = participantId,
+            ["content"] = content,
+            ["addresses"] = new JsonArray(JsonValue.Create(sourceEnvoyId)),
+            ["channel"] = channel,
+            ["channelId"] = channelId,
+            ["threadRef"] = threadRef,
+            ["messageId"] = messageId,
+            ["timestamp"] = timestamp,
+        };
+        if (attachments is { Count: > 0 }) payload["attachments"] = attachments.DeepClone();
+        return payload;
+    }
+
     internal static JsonObject BuildAnnouncementPayload(
         string eventId,
         string messageId,

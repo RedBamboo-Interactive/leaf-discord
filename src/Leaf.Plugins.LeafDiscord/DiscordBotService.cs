@@ -4188,13 +4188,14 @@ internal sealed class DiscordBotRuntime(
                 }
                 try
                 {
-                    var sentId = useWebhook
-                        ? await rest.SendWebhookAsync(
+                    var sent = useWebhook
+                        ? await rest.SendWebhookMessageAsync(
                             binding.WebhookId!, binding.WebhookToken!, outbound.Content,
                             outbound.Files, ct)
-                        : await rest.SendIdempotentAsync(config.BotToken,
+                        : await rest.SendIdempotentMessageAsync(config.BotToken,
                             binding.ConversationId, outbound.Content,
                             DiscordRestTransport.Nonce(delivery), outbound.Files, ct);
+                    var sentId = sent.Id;
                     await deliveries.MarkSentAsync(delivery, sentId, ct);
                     if (hostTurn is not null)
                     {
@@ -4202,20 +4203,11 @@ internal sealed class DiscordBotRuntime(
                             configId,
                             hostTurn.GuildId,
                             $"host-post:{sentId}",
-                            new JsonObject
-                            {
-                                ["type"] = "host_participant_post",
-                                ["eventId"] = $"host-post:{sentId}",
-                                ["participantId"] = hostTurn.ParticipantId,
-                                ["content"] = outbound.Content,
-                                ["addresses"] = new JsonArray(
-                                    JsonValue.Create(hostTurn.SourceEnvoyId)),
-                                ["channel"] = hostTurn.Channel,
-                                ["channelId"] = hostTurn.ChannelId,
-                                ["threadRef"] = hostTurn.ThreadRef,
-                                ["messageId"] = sentId,
-                                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                            },
+                            DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+                                sentId, hostTurn.ParticipantId, outbound.Content,
+                                hostTurn.SourceEnvoyId, hostTurn.Channel, hostTurn.ChannelId,
+                                hostTurn.ThreadRef, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                                sent.Attachments),
                             ct);
                         await commonsHostTurns.CompleteAsync(hostTurn, "posted", ct);
                     }

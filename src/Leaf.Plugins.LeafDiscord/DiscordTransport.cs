@@ -97,7 +97,11 @@ public sealed class DiscordAttachmentIngestor : IDisposable
     public void Dispose() => http.Dispose();
 }
 
-public sealed record DiscordRestMessage(string Id, string? Nonce, int AttachmentCount);
+public sealed record DiscordRestMessage(string Id, string? Nonce, int AttachmentCount)
+{
+    /// <summary>The message's attachments as Discord returned them (ids, CDN URLs, sizes).</summary>
+    public JsonArray? Attachments { get; init; }
+}
 public sealed record DiscordWebhookCredentials(string Id, string Token);
 public sealed record DiscordDirectMessageChannel(string ChannelId, string RecipientName);
 public sealed record DiscordManagedRole(
@@ -128,12 +132,20 @@ public sealed class DiscordRestTransport : IDisposable
         string botToken, string channelId, string content, string nonce,
         IReadOnlyList<DiscordOutboundFile> files,
         CancellationToken ct = default)
+        => (await SendIdempotentMessageAsync(botToken, channelId, content, nonce, files, ct)).Id;
+
+    /// <summary>As <see cref="SendIdempotentAsync(string, string, string, string, IReadOnlyList{DiscordOutboundFile}, CancellationToken)"/>,
+    /// returning the created message with its attachments.</summary>
+    public async Task<DiscordRestMessage> SendIdempotentMessageAsync(
+        string botToken, string channelId, string content, string nonce,
+        IReadOnlyList<DiscordOutboundFile> files,
+        CancellationToken ct = default)
     {
         var existing = await FindRecentByNonceAsync(botToken, channelId, nonce, ct);
         if (existing is not null)
         {
             EnsureAttachmentCount(existing, files.Count);
-            return existing.Id;
+            return existing;
         }
 
         using var request = Authorized(HttpMethod.Post, $"channels/{channelId}/messages", botToken);
@@ -152,7 +164,7 @@ public sealed class DiscordRestTransport : IDisposable
             throw DiscordRestException.From(response, raw);
         var sent = ReadMessage(raw);
         EnsureAttachmentCount(sent, files.Count);
-        return sent.Id;
+        return sent;
     }
 
     public async Task ModifyCurrentUserAvatarAsync(
@@ -336,6 +348,14 @@ public sealed class DiscordRestTransport : IDisposable
         string webhookId, string webhookToken, string content,
         IReadOnlyList<DiscordOutboundFile> files,
         CancellationToken ct = default)
+        => (await SendWebhookMessageAsync(webhookId, webhookToken, content, files, ct)).Id;
+
+    /// <summary>As <see cref="SendWebhookAsync(string, string, string, IReadOnlyList{DiscordOutboundFile}, CancellationToken)"/>,
+    /// returning the created message with its attachments.</summary>
+    public async Task<DiscordRestMessage> SendWebhookMessageAsync(
+        string webhookId, string webhookToken, string content,
+        IReadOnlyList<DiscordOutboundFile> files,
+        CancellationToken ct = default)
     {
         var token = Uri.EscapeDataString(webhookToken);
         using var request = new HttpRequestMessage(
@@ -354,7 +374,7 @@ public sealed class DiscordRestTransport : IDisposable
             throw DiscordRestException.From(response, raw);
         var sent = ReadMessage(raw);
         EnsureAttachmentCount(sent, files.Count);
-        return sent.Id;
+        return sent;
     }
 
     private static MultipartFormDataContent MultipartMessage(
@@ -496,11 +516,12 @@ public sealed class DiscordRestTransport : IDisposable
                     ? nonceValue.GetRawText()
                     : null
             : null;
-        var attachmentCount = message.TryGetProperty("attachments", out var attachments)
-                              && attachments.ValueKind == JsonValueKind.Array
-            ? attachments.GetArrayLength()
-            : 0;
-        return new DiscordRestMessage(id, nonce, attachmentCount);
+        var hasAttachments = message.TryGetProperty("attachments", out var attachments)
+                             && attachments.ValueKind == JsonValueKind.Array;
+        return new DiscordRestMessage(id, nonce, hasAttachments ? attachments.GetArrayLength() : 0)
+        {
+            Attachments = hasAttachments ? JsonNode.Parse(attachments.GetRawText()) as JsonArray : null,
+        };
     }
 
     private static void EnsureAttachmentCount(

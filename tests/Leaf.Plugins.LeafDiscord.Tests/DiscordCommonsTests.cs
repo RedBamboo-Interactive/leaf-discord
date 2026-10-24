@@ -350,6 +350,29 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
+    public void Native_host_posts_report_their_attachments_to_the_relay()
+    {
+        var attachments = new System.Text.Json.Nodes.JsonArray(new System.Text.Json.Nodes.JsonObject
+        {
+            ["id"] = "77", ["filename"] = "chart.png", ["content_type"] = "image/png", ["size"] = 3,
+            ["url"] = "https://cdn.discordapp.com/attachments/1/77/chart.png",
+        });
+
+        var payload = DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+            "sent-1", "host:nova", "Here is the chart.", "envoy-1", "nova-consult", "700",
+            "thread-1", 1234, attachments);
+        var plain = DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+            "sent-2", "host:nova", "Text.", "envoy-1", "nova-consult", "700", "thread-1", 1234, null);
+
+        Assert.Equal("host_participant_post", payload["type"]!.GetValue<string>());
+        Assert.Equal("host-post:sent-1", payload["eventId"]!.GetValue<string>());
+        Assert.Equal("envoy-1", payload["addresses"]![0]!.GetValue<string>());
+        Assert.Equal("https://cdn.discordapp.com/attachments/1/77/chart.png",
+            payload["attachments"]![0]!["url"]!.GetValue<string>());
+        Assert.False(plain.ContainsKey("attachments"));
+    }
+
+    [Fact]
     public void Announcements_ingest_is_listening_only_and_strips_every_addressing_signal()
     {
         var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(

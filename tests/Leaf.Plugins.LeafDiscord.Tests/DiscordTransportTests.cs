@@ -34,6 +34,26 @@ public sealed class DiscordTransportTests
     }
 
     [Fact]
+    public async Task Sent_messages_return_the_attachments_discord_created()
+    {
+        const string created = "{\"id\":\"9001\",\"attachments\":[{\"id\":\"77\",\"filename\":\"chart.png\",\"content_type\":\"image/png\",\"size\":3,\"url\":\"https://cdn.discordapp.com/attachments/1/77/chart.png\"}]}";
+        var handler = new QueueHandler(Json("[]"), Json(created), Json(created));
+        using var transport = new DiscordRestTransport(handler);
+        DiscordOutboundFile[] files = [new("chart.png", "image/png", "Chart", [1, 2, 3])];
+
+        var bot = await transport.SendIdempotentMessageAsync("secret", "123", "Here.", "0123456789abcdef01234567", files);
+        var webhook = await transport.SendWebhookMessageAsync("hook", "token", "Here.", files);
+
+        foreach (var sent in new[] { bot, webhook })
+        {
+            Assert.Equal("9001", sent.Id);
+            var attachment = Assert.Single(sent.Attachments!)!.AsObject();
+            Assert.Equal("https://cdn.discordapp.com/attachments/1/77/chart.png", attachment["url"]!.GetValue<string>());
+            Assert.Equal("image/png", attachment["content_type"]!.GetValue<string>());
+        }
+    }
+
+    [Fact]
     public async Task Outbound_image_uses_discord_multipart_with_nonce_and_alt_description()
     {
         var nonce = "0123456789abcdef01234567";
