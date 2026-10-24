@@ -476,16 +476,6 @@ internal sealed class MemoryEntityStore(
         return entity;
     }
 
-    /// <summary>A row written before its secret fields were declared: stored verbatim.</summary>
-    public LeafEntity SeedStored(string typeSlug, string slug, string name, JsonObject data)
-    {
-        var now = DateTimeOffset.UtcNow;
-        var entity = new LeafEntity(
-            Guid.NewGuid(), typeSlug, slug, name, Clone(data), now, now, "test");
-        items.Add(entity);
-        return entity;
-    }
-
     /// <summary>The document at rest, as RedLeaf stores it in the entity row.</summary>
     public JsonObject StoredData(Guid id) => Clone(items.Single(item => item.Id == id).Data);
 

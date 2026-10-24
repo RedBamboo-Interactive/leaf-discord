@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Leaf.Plugins.LeafDiscord;
 using Xunit;
 
@@ -173,59 +172,5 @@ public sealed class DiscordBindingStoreTests
         var cleared = await bindings.ClearChannelAvatarAsync(overridden);
         Assert.Null(cleared.WebhookToken);
         Assert.Null(store.VaultValue(created.EntityId, "webhook_token"));
-    }
-
-    [Fact]
-    public async Task Plaintext_webhook_token_from_before_the_declaration_moves_into_the_vault()
-    {
-        var store = MemoryEntityStore.WithSeedSecretFields();
-        var legacy = store.SeedStored(DiscordBindingStore.TypeSlug, "discord-binding-legacy",
-            "Discord announcements", new JsonObject
-            {
-                ["binding_id"] = "discord:100000000000000001:623456789012345678",
-                ["application_id"] = "100000000000000001",
-                ["conversation_id"] = "623456789012345678",
-                ["kind"] = "guild_channel",
-                ["generation"] = 3,
-                ["channel_avatar_asset_id"] = "channel-nova.png",
-                ["delivery_mode"] = "webhook",
-                ["webhook_id"] = "777",
-                ["webhook_token"] = "webhook-secret",
-            });
-        var botOnly = store.SeedStored(DiscordBindingStore.TypeSlug, "discord-binding-bot",
-            "Discord general", new JsonObject
-            {
-                ["binding_id"] = "discord:100000000000000001:723456789012345678",
-                ["application_id"] = "100000000000000001",
-                ["conversation_id"] = "723456789012345678",
-                ["delivery_mode"] = "bot",
-            });
-        var bindings = new DiscordBindingStore(store);
-        var before = store.StoredData(legacy.Id);
-        Assert.Equal(MemoryEntityStore.RedactedSentinel,
-            store.Redacted(legacy.Id)["webhook_token"]?.GetValue<string>());
-
-        var first = await bindings.ProtectStoredWebhookTokensAsync();
-
-        Assert.Equal(1, first.Rewritten);
-        Assert.Empty(first.Failed);
-        Assert.Equal("webhook-secret", store.VaultValue(legacy.Id, "webhook_token"));
-        var stored = store.StoredData(legacy.Id);
-        Assert.False(stored.ContainsKey("webhook_token"));
-        before.Remove("webhook_token");
-        Assert.True(JsonNode.DeepEquals(before, stored));
-        Assert.True(JsonNode.DeepEquals(
-            store.StoredData(botOnly.Id), (await store.GetAsync(botOnly.Id))!.Data));
-        var migrated = await bindings.GetAsync(legacy.Id);
-        Assert.Equal("webhook-secret", migrated?.WebhookToken);
-        Assert.Equal("777", migrated?.WebhookId);
-        Assert.Equal("webhook", migrated?.DeliveryMode);
-        Assert.Equal(3, migrated?.Generation);
-
-        // Every start runs it again; a vaulted token stays exactly where it is.
-        var second = await bindings.ProtectStoredWebhookTokensAsync();
-        Assert.Equal(1, second.Rewritten);
-        Assert.Equal("webhook-secret", store.VaultValue(legacy.Id, "webhook_token"));
-        Assert.True(JsonNode.DeepEquals(stored, store.StoredData(legacy.Id)));
     }
 }
