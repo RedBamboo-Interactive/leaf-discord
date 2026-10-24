@@ -313,6 +313,43 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
+    public void Human_ingest_describes_attachments_for_the_relay_and_omits_the_key_without_any()
+    {
+        var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(
+            "message-1", "human-1", "Lynial", "What is wrong here?", ["user-1"], [],
+            "700000000000000007", "nova-consult", "thread-1", null, 1234,
+            [
+                new("111", "shot.png", "image/png", 48213, 1280, 720,
+                    "https://cdn.discordapp.com/attachments/7/111/shot.png?ex=1", "the error"),
+                new("112", "notes.pdf", "application/pdf", 900, null, null,
+                    "https://cdn.discordapp.com/attachments/7/112/notes.pdf", null),
+            ]);
+
+        var attachments = payload["attachments"]!.AsArray();
+        Assert.Equal(2, attachments.Count);
+        var image = attachments[0]!.AsObject();
+        Assert.Equal("111", image["id"]!.GetValue<string>());
+        Assert.Equal("shot.png", image["filename"]!.GetValue<string>());
+        Assert.Equal("image/png", image["contentType"]!.GetValue<string>());
+        Assert.Equal(48213, image["size"]!.GetValue<long>());
+        Assert.Equal(1280, image["width"]!.GetValue<int>());
+        Assert.Equal(720, image["height"]!.GetValue<int>());
+        Assert.Equal("https://cdn.discordapp.com/attachments/7/111/shot.png?ex=1", image["url"]!.GetValue<string>());
+        Assert.Equal("the error", image["description"]!.GetValue<string>());
+        // The relay decides what is forwarded; the host reports every attachment it saw.
+        Assert.Equal("application/pdf", attachments[1]!["contentType"]!.GetValue<string>());
+
+        var plain = DiscordCommonsRelayService.BuildHumanMessagePayload(
+            "message-2", "human-1", "Lynial", "hello", [], [], "700000000000000007", "nova-consult",
+            "thread-1", null, 1234, []);
+        Assert.False(plain.ContainsKey("attachments"));
+        var announcement = DiscordCommonsRelayService.BuildHumanMessagePayload(
+            "message-3", "human-1", "Lynial", "news", [], [], "700000000000000007", "announcements",
+            null, null, 1234, [new("113", "a.png", "image/png", 10, 1, 1, "https://cdn.discordapp.com/a.png", null)]);
+        Assert.False(announcement.ContainsKey("attachments"));
+    }
+
+    [Fact]
     public void Announcements_ingest_is_listening_only_and_strips_every_addressing_signal()
     {
         var payload = DiscordCommonsRelayService.BuildHumanMessagePayload(

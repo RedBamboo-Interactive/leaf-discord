@@ -973,6 +973,11 @@ public sealed class DiscordCommonsRelayService(
         return normalized is "général" or "general" ? "general" : normalized;
     }
 
+    /// <summary>A Discord attachment as the relay's human_message ingest describes it.</summary>
+    internal sealed record DiscordCommonsAttachment(
+        string Id, string Filename, string? ContentType, long Size, int? Width, int? Height,
+        string Url, string? Description);
+
     internal static JsonObject BuildHumanMessagePayload(
         string eventId,
         string authorId,
@@ -984,7 +989,8 @@ public sealed class DiscordCommonsRelayService(
         string channel,
         string? threadRef,
         string? referencedMessageId,
-        long timestamp)
+        long timestamp,
+        IReadOnlyList<DiscordCommonsAttachment>? attachments = null)
     {
         var listeningOnly = string.Equals(
             ChannelName(channel), "announcements", StringComparison.Ordinal);
@@ -992,7 +998,7 @@ public sealed class DiscordCommonsRelayService(
         IReadOnlyList<string> forwardedRoles = listeningOnly ? [] : mentionRoles;
         var forwardedThread = listeningOnly ? null : threadRef;
         var forwardedReference = listeningOnly ? null : referencedMessageId;
-        return new JsonObject
+        var payload = new JsonObject
         {
             ["type"] = "human_message",
             ["eventId"] = eventId,
@@ -1013,6 +1019,21 @@ public sealed class DiscordCommonsRelayService(
                 && forwardedReference is null,
             ["timestamp"] = timestamp,
         };
+        // Descriptors only: the relay forwards bounded images on Discord's CDN, and each Leaf
+        // Community connector fetches, checks and reviews the bytes itself.
+        if (!listeningOnly && attachments is { Count: > 0 })
+            payload["attachments"] = new JsonArray(attachments.Select(item => (JsonNode?)new JsonObject
+            {
+                ["id"] = item.Id,
+                ["filename"] = item.Filename,
+                ["contentType"] = item.ContentType,
+                ["size"] = item.Size,
+                ["width"] = item.Width,
+                ["height"] = item.Height,
+                ["url"] = item.Url,
+                ["description"] = item.Description,
+            }).ToArray());
+        return payload;
     }
 
     internal static JsonObject BuildAnnouncementPayload(

@@ -2789,7 +2789,10 @@ internal sealed class DiscordBotRuntime(
                 location.Channel,
                 location.ThreadRef,
                 message.Reference?.MessageId.ToString(),
-                message.Timestamp.ToUnixTimeMilliseconds()));
+                message.Timestamp.ToUnixTimeMilliseconds(),
+                message.Attachments.Select(attachment => new DiscordCommonsRelayService.DiscordCommonsAttachment(
+                    attachment.Id.ToString(), attachment.Filename, attachment.ContentType, attachment.Size,
+                    attachment.Width, attachment.Height, attachment.Url, attachment.Description)).ToArray()));
     }
 
     private async Task OnReactionAddedAsync(
