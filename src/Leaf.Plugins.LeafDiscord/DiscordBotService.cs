@@ -311,6 +311,29 @@ public sealed class DiscordBotService(
         return await runtime.GetCommandsAsync(config, ct);
     }
 
+    internal async Task<IReadOnlyList<DiscordApplicationEmoji>> ListApplicationEmojisAsync(
+        Guid botId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(botId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.ListApplicationEmojisAsync(config, ct);
+    }
+
+    internal async Task<DiscordApplicationEmoji> CreateApplicationEmojiAsync(
+        Guid botId, string name, DiscordApplicationEmojiImage image,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(botId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.CreateApplicationEmojiAsync(config, name, image, ct);
+    }
+
     public async Task<IReadOnlyList<DiscordGuildChannel>> ListGuildChannelsAsync(
         Guid botId, CancellationToken ct = default)
     {
@@ -710,6 +733,39 @@ internal sealed class DiscordBotRuntime(
         {
             ProfileWarning = profileWarning,
         };
+    }
+
+    public async Task<IReadOnlyList<DiscordApplicationEmoji>> ListApplicationEmojisAsync(
+        LeafDiscordConfig config, CancellationToken ct)
+    {
+        var current = ConnectedApplicationClient(config);
+        var emotes = await current.GetApplicationEmotesAsync(
+            new RequestOptions { CancelToken = ct });
+        return emotes.Select(DiscordApplicationEmojis.Project).ToArray();
+    }
+
+    public async Task<DiscordApplicationEmoji> CreateApplicationEmojiAsync(
+        LeafDiscordConfig config, string name, DiscordApplicationEmojiImage image,
+        CancellationToken ct)
+    {
+        var current = ConnectedApplicationClient(config);
+        using var stream = new MemoryStream(image.Bytes, writable: false);
+        using var upload = new Image(stream);
+        var created = await current.CreateApplicationEmoteAsync(
+            name, upload, new RequestOptions { CancelToken = ct });
+        return DiscordApplicationEmojis.Project(created);
+    }
+
+    // Application emojis belong to the connected application, so its identity must
+    // be the configured one before anything is listed or uploaded.
+    private DiscordSocketClient ConnectedApplicationClient(LeafDiscordConfig config)
+    {
+        var current = client;
+        if (current is null || current.ConnectionState != ConnectionState.Connected
+            || current.CurrentUser is null)
+            throw new InvalidOperationException("Discord bot is not connected.");
+        DiscordCommandDiagnostics.ValidateIdentity(config, configId, current.CurrentUser.Id);
+        return current;
     }
 
     public async Task<DiscordCommandReport> GetCommandsAsync(

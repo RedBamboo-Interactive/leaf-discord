@@ -646,6 +646,29 @@ public static class DiscordEndpoints
             }
         });
 
+        group.MapGet("/bots/{id:guid}/application-emojis", async (
+            Guid id,
+            HttpContext http,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+            await ListApplicationEmojisAsync(
+                id, http, configurations, agents, bot.ListApplicationEmojisAsync, ct));
+
+        group.MapPost("/bots/{id:guid}/application-emojis", async (
+            Guid id,
+            DiscordApplicationEmojiCreateRequest request,
+            HttpContext http,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            IAssets assets,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+            await CreateApplicationEmojiAsync(
+                id, request, http, configurations, agents, assets,
+                bot.ListApplicationEmojisAsync, bot.CreateApplicationEmojiAsync, ct));
+
         group.MapGet("/bots/{id:guid}/commons", async (
             Guid id,
             IAuthContext auth,
@@ -2077,6 +2100,131 @@ public static class DiscordEndpoints
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     }
+
+    /// <summary>
+    /// Lists the bot application's own emojis from the connected client. Authority is the
+    /// same signed private Nova discussion, exact bot Agent, and owner as the other bot routes.
+    /// </summary>
+    internal static async Task<IResult> ListApplicationEmojisAsync(
+        Guid id,
+        HttpContext http,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        Func<Guid, CancellationToken, Task<IReadOnlyList<DiscordApplicationEmoji>>> list,
+        CancellationToken ct)
+    {
+        if (await AuthorizeBotAgentAsync(id, http, configurations, agents, ct) is { } denied)
+            return denied;
+        try
+        {
+            return Results.Ok(new { items = await list(id, ct) });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return ApplicationEmojiDiscordError(ex, "listed");
+        }
+    }
+
+    /// <summary>
+    /// Uploads one application emoji from a RedLeaf image Asset. An existing emoji of the
+    /// same name is returned with 409 instead of being duplicated.
+    /// </summary>
+    internal static async Task<IResult> CreateApplicationEmojiAsync(
+        Guid id,
+        DiscordApplicationEmojiCreateRequest request,
+        HttpContext http,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        IAssets assets,
+        Func<Guid, CancellationToken, Task<IReadOnlyList<DiscordApplicationEmoji>>> list,
+        Func<Guid, string, DiscordApplicationEmojiImage, CancellationToken, Task<DiscordApplicationEmoji>> create,
+        CancellationToken ct)
+    {
+        if (await AuthorizeBotAgentAsync(id, http, configurations, agents, ct) is { } denied)
+            return denied;
+        string name;
+        DiscordApplicationEmojiImage image;
+        try
+        {
+            name = DiscordApplicationEmojis.ValidateName(request.Name);
+            image = await DiscordApplicationEmojis.ReadImageAsync(request.AssetId, assets, ct);
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = "invalid_application_emoji", message = ex.Message });
+        }
+        catch (DiscordApplicationEmojiAssetNotFoundException ex)
+        {
+            return Results.NotFound(new { error = "application_emoji_asset_not_found", message = ex.Message });
+        }
+
+        var gate = DiscordApplicationEmojis.CreateGate(id);
+        await gate.WaitAsync(ct);
+        try
+        {
+            var existing = (await list(id, ct)).FirstOrDefault(emoji =>
+                string.Equals(emoji.Name, name, StringComparison.Ordinal));
+            if (existing is not null)
+                return Results.Conflict(new
+                {
+                    error = "application_emoji_exists",
+                    message = $"An application emoji named '{name}' already exists.",
+                    emoji = existing,
+                });
+            return Results.Ok(await create(id, name, image, ct));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            return ApplicationEmojiDiscordError(ex, "created");
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static async Task<IResult?> AuthorizeBotAgentAsync(
+        Guid id,
+        HttpContext http,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        CancellationToken ct)
+    {
+        var caller = ReadPrivateLeafAgentCaller(http);
+        if (caller is null)
+            return Forbidden("A signed private Nova Agent discussion is required.");
+        var config = await configurations.GetAsync(id, ct);
+        if (config is null) return Results.NotFound();
+        var agent = await agents.ResolveAsync(config.AgentId, ct);
+        return CanAddressBot(caller, config, agent?.Id.ToString())
+            ? null
+            : Forbidden("This Agent cannot address that Discord bot.");
+    }
+
+    // Never emit Discord exception messages or response bodies; only bounded codes.
+    private static IResult ApplicationEmojiDiscordError(Exception exception, string action)
+        => exception switch
+        {
+            KeyNotFoundException => Results.NotFound(),
+            InvalidOperationException => Results.Json(new
+            {
+                error = "discord_bot_unavailable",
+                message = "Discord bot is disconnected or its configured identity is unavailable.",
+            }, statusCode: StatusCodes.Status503ServiceUnavailable),
+            Discord.Net.HttpException http => Results.Json(new
+            {
+                error = "discord_application_emoji_rejected",
+                message = $"Discord refused the application emoji request ({(int)http.HttpCode}).",
+                discordCode = (int?)http.DiscordCode,
+            }, statusCode: StatusCodes.Status502BadGateway),
+            _ => Results.Json(new
+            {
+                error = "discord_application_emoji_failed",
+                message = $"Discord application emojis could not be {action}.",
+            }, statusCode: StatusCodes.Status502BadGateway),
+        };
 
     private static bool IsAdmin(IAuthContext auth)
         => auth.IsInRole("admin") || auth.IsInRole("owner");
