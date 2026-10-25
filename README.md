@@ -389,9 +389,9 @@ Envoy: a record whose Envoy is gone, no longer suspended, or owned by someone el
 without acting, so a manual unsuspend, re-suspend, or deletion is never undone by a stale
 record. A failed member listing suspends nobody; relay or Discord errors are
 logged by status code only and retried on the next cycle, one minute later, or after a
-rate limit's `Retry-After`. A relay shared by several guilds of the same bot is skipped. Leave
-and ban events need **Server Members Intent** for that bot (the periodic listing already
-does); if Discord refuses the intent, the bot reconnects without those events and relies on
+rate limit's `Retry-After`. A relay shared by several guilds of the same bot is skipped. Join
+and leave events need **Server Members Intent** for that bot (the periodic listing already
+does); if Discord refuses the intent, the bot reconnects without member events and relies on
 the periodic reconcile until it is restarted.
 
 `#announcements` stays inside the Community transport scope even though it is read-only
