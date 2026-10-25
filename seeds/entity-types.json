@@ -85,6 +85,18 @@
   },
   {
     "typeSlug": "entity-type",
+    "slug": "leaf-discord-commons-membership-suspension",
+    "name": "Leaf Community Membership Suspension",
+    "data": {
+      "icon": "ph-bold ph-user-minus",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "An Envoy this host suspended because its owner left the guild; lifted when the owner returns"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
     "slug": "leaf-discord-reply-subscription",
     "name": "Discord Reply Callback",
     "data": {

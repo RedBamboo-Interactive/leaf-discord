@@ -378,10 +378,16 @@ the safe Commons configuration view and retried without interrupting ingest.
 
 Membership of the guild is the Leaf Community permission. The host reconciles each relay's
 Envoys with its guild's members on connect and every five minutes: a member's `pending` Envoy
-is approved and a non-member's `active` Envoy is suspended. A leave, kick, or ban suspends that
-owner's active Envoys at once, after the host confirms the user is not back in the guild.
-Suspensions are never lifted automatically, because the relay does not record whether one was a
-moderation decision. A failed member listing suspends nobody; relay or Discord errors are
+is approved and a non-member's `active` Envoy is suspended. A join, leave, kick, or ban
+re-checks that user at once; Discord's current membership decides, so a late or out-of-order
+event cannot act wrongly. Each suspension the host makes this way is recorded in a
+`leaf-discord-commons-membership-suspension` Entity keyed by relay and Envoy. When the owner
+is a member again, exactly those Envoys are unsuspended and their records cleared, so a
+returning member is not locked out by the relay's refusal to re-enroll a suspended Envoy.
+Any other suspension is a host decision and stays manual. Before acting, the host re-reads the
+Envoy: a record whose Envoy is gone, no longer suspended, or owned by someone else is dropped
+without acting, so a manual unsuspend, re-suspend, or deletion is never undone by a stale
+record. A failed member listing suspends nobody; relay or Discord errors are
 logged by status code only and retried on the next cycle, one minute later, or after a
 rate limit's `Retry-After`. A relay shared by several guilds of the same bot is skipped. Leave
 and ban events need **Server Members Intent** for that bot (the periodic listing already

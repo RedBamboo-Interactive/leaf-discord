@@ -810,8 +810,10 @@ public sealed class DiscordCommonsRelayService(
         Guid botId, string guildId, string envoyId, string action,
         CancellationToken ct = default)
     {
-        if (action is not (DiscordCommonsEnvoyActions.Approve or DiscordCommonsEnvoyActions.Suspend))
-            throw new ArgumentException("Envoy status action must be approve or suspend.", nameof(action));
+        if (action is not (DiscordCommonsEnvoyActions.Approve or DiscordCommonsEnvoyActions.Suspend
+                or DiscordCommonsEnvoyActions.Unsuspend))
+            throw new ArgumentException(
+                "Envoy status action must be approve, suspend or unsuspend.", nameof(action));
         using var response = await SendHostAsync(botId, guildId, HttpMethod.Post,
             $"/v1/admin/envoys/{Uri.EscapeDataString(envoyId)}/{action}", null, ct);
         if (!response.IsSuccessStatusCode)

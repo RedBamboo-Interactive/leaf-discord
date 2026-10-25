@@ -56,6 +56,12 @@
   { "parentType": "leaf-discord-commons-host-turn", "slug": "participant_id", "name": "Host Participant", "fieldType": "string", "sortOrder": 9 },
   { "parentType": "leaf-discord-commons-host-turn", "slug": "state", "name": "State", "fieldType": "string", "sortOrder": 10 },
 
+  { "parentType": "leaf-discord-commons-membership-suspension", "slug": "relay_url", "name": "Relay", "fieldType": "string", "sortOrder": 0 },
+  { "parentType": "leaf-discord-commons-membership-suspension", "slug": "envoy_id", "name": "Envoy ID", "fieldType": "string", "sortOrder": 1 },
+  { "parentType": "leaf-discord-commons-membership-suspension", "slug": "owner_discord_user_id", "name": "Owner Discord User ID", "fieldType": "string", "sortOrder": 2 },
+  { "parentType": "leaf-discord-commons-membership-suspension", "slug": "guild_id", "name": "Guild ID", "fieldType": "string", "sortOrder": 3 },
+  { "parentType": "leaf-discord-commons-membership-suspension", "slug": "suspended_at", "name": "Suspended At", "fieldType": "string", "sortOrder": 4 },
+
   { "parentType": "leaf-discord-gateway-inbox", "slug": "bot_id", "name": "Discord Bot", "fieldType": "entity_ref", "sortOrder": 0, "constraints": "{\u0022target_type\u0022:\u0022leaf-discord-bot\u0022}" },
   { "parentType": "leaf-discord-gateway-inbox", "slug": "message_id", "name": "Discord Message ID", "fieldType": "string", "sortOrder": 1 },
   { "parentType": "leaf-discord-gateway-inbox", "slug": "channel_id", "name": "Discord Channel ID", "fieldType": "string", "sortOrder": 2 },

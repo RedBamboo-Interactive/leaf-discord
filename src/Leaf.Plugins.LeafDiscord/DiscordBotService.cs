@@ -96,6 +96,7 @@ public sealed class DiscordBotService(
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
     DiscordCommonsHostTurnStore commonsHostTurns,
+    DiscordCommonsMembershipSuspensionStore commonsMembershipSuspensions,
     DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
     IAssets assets,
@@ -610,6 +611,7 @@ public sealed class DiscordBotService(
             commons,
             commonsConfigurations,
             commonsHostTurns,
+            commonsMembershipSuspensions,
             gatewayInbox,
             replyNotifier,
             assets,
@@ -679,6 +681,7 @@ internal sealed class DiscordBotRuntime(
     DiscordCommonsRelayService commons,
     DiscordCommonsConfigurationStore commonsConfigurations,
     DiscordCommonsHostTurnStore commonsHostTurns,
+    DiscordCommonsMembershipSuspensionStore commonsMembershipSuspensions,
     DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
     IAssets assets,
@@ -1871,6 +1874,7 @@ internal sealed class DiscordBotRuntime(
             next.SlashCommandExecuted += OnSlashCommandAsync;
             next.UserLeft += OnGuildMemberLeftAsync;
             next.UserBanned += OnGuildMemberBannedAsync;
+            next.UserJoined += OnGuildMemberJoinedAsync;
             Func<SocketUser, SocketPresence, SocketPresence, Task> presenceHandler =
                 (_, _, _) => PublishOwnerPresenceAsync(next);
             Func<SocketUser, SocketVoiceState, SocketVoiceState, Task> voiceHandler =
@@ -1922,6 +1926,7 @@ internal sealed class DiscordBotRuntime(
                     async ct => (await GetConfigAsync(ct)).BotToken
                         ?? throw new InvalidOperationException("Discord bot token is unavailable."),
                     logger),
+                commonsMembershipSuspensions,
                 logger);
             var membership = commonsMembership;
             var membershipToken = runCts.Token;
@@ -1982,16 +1987,22 @@ internal sealed class DiscordBotRuntime(
         return false;
     }
 
-    // Leaves, kicks and bans only queue work; the membership loop calls Discord and the relay.
+    // Joins, leaves, kicks and bans only queue work; the membership loop calls Discord and the relay.
+    private Task OnGuildMemberJoinedAsync(SocketGuildUser user)
+    {
+        commonsMembership?.NotifyMemberChanged(user.Guild.Id.ToString(), user.Id.ToString());
+        return Task.CompletedTask;
+    }
+
     private Task OnGuildMemberLeftAsync(SocketGuild guild, SocketUser user)
     {
-        commonsMembership?.NotifyDeparture(guild.Id.ToString(), user.Id.ToString());
+        commonsMembership?.NotifyMemberChanged(guild.Id.ToString(), user.Id.ToString());
         return Task.CompletedTask;
     }
 
     private Task OnGuildMemberBannedAsync(SocketUser user, SocketGuild guild)
     {
-        commonsMembership?.NotifyDeparture(guild.Id.ToString(), user.Id.ToString());
+        commonsMembership?.NotifyMemberChanged(guild.Id.ToString(), user.Id.ToString());
         return Task.CompletedTask;
     }
 
@@ -2218,7 +2229,7 @@ internal sealed class DiscordBotRuntime(
             intents |= GatewayIntents.GuildPresences | GatewayIntents.GuildVoiceStates;
         if (mode == DiscordPresenceContextModes.Roster)
             intents |= GatewayIntents.GuildMembers;
-        // Leaves and kicks need Server Members Intent; bans need only the moderation intent.
+        // Joins, leaves and kicks need Server Members Intent; bans need only the moderation intent.
         if (commonsMembershipEvents)
             intents |= GatewayIntents.GuildMembers | GatewayIntents.GuildBans;
         return new DiscordSocketConfig
@@ -4603,6 +4614,7 @@ internal sealed class DiscordBotRuntime(
         target.SlashCommandExecuted -= OnSlashCommandAsync;
         target.UserLeft -= OnGuildMemberLeftAsync;
         target.UserBanned -= OnGuildMemberBannedAsync;
+        target.UserJoined -= OnGuildMemberJoinedAsync;
         if (clientPresenceHandler is not null)
             target.PresenceUpdated -= clientPresenceHandler;
         if (clientVoiceHandler is not null)

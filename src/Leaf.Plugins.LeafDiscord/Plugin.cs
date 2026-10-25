@@ -45,6 +45,8 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
         services.AddSingleton(sp => new DiscordCommonsHostTurnStore(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
+        services.AddSingleton(sp => new DiscordCommonsMembershipSuspensionStore(
+            sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
         services.AddSingleton(sp => new DiscordGatewayInboxStore(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
         services.AddSingleton(sp => new DiscordCommonsRelayService(

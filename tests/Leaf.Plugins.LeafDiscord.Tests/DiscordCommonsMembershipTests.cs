@@ -13,6 +13,8 @@ public sealed class DiscordCommonsMembershipTests
     private const string GuildId = "400000000000000004";
     private const string MemberId = "100000000000000001";
     private const string FormerMemberId = "100000000000000002";
+    private const string RelayUrl = "https://relay.example.test";
+    private static readonly DiscordCommonsMembershipGuild Guild = new(GuildId, RelayUrl);
 
     [Fact]
     public async Task Pending_envoy_of_a_current_member_is_approved()
@@ -21,7 +23,7 @@ public sealed class DiscordCommonsMembershipTests
         gateway.Envoys.Add(Envoy("envoy-takit", MemberId, "pending"));
         var reconciler = Reconciler(gateway);
 
-        await reconciler.ReconcileGuildAsync(GuildId, CancellationToken.None);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
 
         Assert.Equal([(GuildId, "envoy-takit", "approve")], gateway.Calls);
         Assert.Equal("active", gateway.Envoys.Single().Status);
@@ -35,7 +37,7 @@ public sealed class DiscordCommonsMembershipTests
         gateway.Envoys.Add(Envoy("envoy-gone", FormerMemberId, "active"));
         var reconciler = Reconciler(gateway);
 
-        await reconciler.ReconcileGuildAsync(GuildId, CancellationToken.None);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
 
         Assert.Equal([(GuildId, "envoy-gone", "suspend")], gateway.Calls);
     }
@@ -50,8 +52,8 @@ public sealed class DiscordCommonsMembershipTests
         gateway.Envoys.Add(Envoy("envoy-active-gone", FormerMemberId, "active"));
         var reconciler = Reconciler(gateway);
 
-        await reconciler.ReconcileGuildAsync(GuildId, CancellationToken.None);
-        await reconciler.ReconcileGuildAsync(GuildId, CancellationToken.None);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
 
         Assert.Equal([(GuildId, "envoy-active-gone", "suspend")], gateway.Calls);
         Assert.Equal("suspended", gateway.Envoys[0].Status);
@@ -67,8 +69,8 @@ public sealed class DiscordCommonsMembershipTests
         gateway.Envoys.Add(Envoy("envoy-member", MemberId, "active"));
         var reconciler = Reconciler(gateway);
 
-        reconciler.NotifyDeparture(GuildId, FormerMemberId);
-        reconciler.NotifyDeparture(GuildId, FormerMemberId);
+        reconciler.NotifyMemberChanged(GuildId, FormerMemberId);
+        reconciler.NotifyMemberChanged(GuildId, FormerMemberId);
         var cycle = await reconciler.RunOnceAsync(full: false, CancellationToken.None);
 
         Assert.True(cycle.Healthy);
@@ -85,12 +87,128 @@ public sealed class DiscordCommonsMembershipTests
         gateway.Envoys.Add(Envoy("envoy-member", MemberId, "active"));
         var reconciler = Reconciler(gateway);
 
-        reconciler.NotifyDeparture(GuildId, MemberId);
-        reconciler.NotifyDeparture("900000000000000009", MemberId);
+        reconciler.NotifyMemberChanged(GuildId, MemberId);
+        reconciler.NotifyMemberChanged("900000000000000009", MemberId);
         await reconciler.RunOnceAsync(full: false, CancellationToken.None);
 
         Assert.Empty(gateway.Calls);
         Assert.Equal("active", gateway.Envoys.Single().Status);
+    }
+
+    [Fact]
+    public async Task Leave_suspends_and_records_then_rejoin_unsuspends_and_clears_the_record()
+    {
+        var gateway = new FakeGateway { Members = [MemberId, FormerMemberId] };
+        gateway.Envoys.Add(Envoy("envoy-returning", FormerMemberId, "active"));
+        var reconciler = Reconciler(gateway);
+
+        gateway.Members.Remove(FormerMemberId);
+        reconciler.NotifyMemberChanged(GuildId, FormerMemberId);
+        await reconciler.RunOnceAsync(full: false, CancellationToken.None);
+
+        Assert.Equal("suspended", gateway.Envoys.Single().Status);
+        var record = Assert.Single(await gateway.Suspensions.ListAsync(RelayUrl));
+        Assert.Equal("envoy-returning", record.EnvoyId);
+        Assert.Equal(FormerMemberId, record.OwnerDiscordUserId);
+
+        gateway.Members.Add(FormerMemberId);
+        reconciler.NotifyMemberChanged(GuildId, FormerMemberId);
+        await reconciler.RunOnceAsync(full: false, CancellationToken.None);
+
+        Assert.Equal(
+            [(GuildId, "envoy-returning", "suspend"), (GuildId, "envoy-returning", "unsuspend")],
+            gateway.Calls);
+        Assert.Equal("active", gateway.Envoys.Single().Status);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+    }
+
+    [Fact]
+    public async Task Periodic_reconcile_lifts_a_recorded_suspension_of_a_returned_member()
+    {
+        var gateway = new FakeGateway { Members = [MemberId] };
+        gateway.Envoys.Add(Envoy("envoy-returning", FormerMemberId, "active"));
+        var reconciler = Reconciler(gateway);
+
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
+        Assert.Single(await gateway.Suspensions.ListAsync(RelayUrl));
+        gateway.Members.Add(FormerMemberId);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
+
+        Assert.Equal("active", gateway.Envoys.Single().Status);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+    }
+
+    [Fact]
+    public async Task Host_suspended_member_stays_suspended_on_rejoin()
+    {
+        var gateway = new FakeGateway { Members = [MemberId] };
+        gateway.Envoys.Add(Envoy("envoy-moderated", MemberId, "suspended"));
+        var reconciler = Reconciler(gateway);
+
+        reconciler.NotifyMemberChanged(GuildId, MemberId);
+        await reconciler.RunOnceAsync(full: true, CancellationToken.None);
+
+        Assert.Empty(gateway.Calls);
+        Assert.Equal("suspended", gateway.Envoys.Single().Status);
+    }
+
+    [Fact]
+    public async Task Stale_records_are_dropped_without_acting()
+    {
+        var gateway = new FakeGateway { Members = [MemberId, FormerMemberId] };
+        // Host unsuspended this one by hand; the record no longer describes it.
+        gateway.Envoys.Add(Envoy("envoy-host-lifted", MemberId, "active"));
+        // Same ID now belongs to someone else's suspended Envoy.
+        gateway.Envoys.Add(Envoy("envoy-other-owner", FormerMemberId, "suspended"));
+        await gateway.Suspensions.RecordAsync(RelayUrl, GuildId,
+            Envoy("envoy-host-lifted", MemberId, "active"));
+        await gateway.Suspensions.RecordAsync(RelayUrl, GuildId,
+            Envoy("envoy-other-owner", MemberId, "active"));
+        await gateway.Suspensions.RecordAsync(RelayUrl, GuildId,
+            Envoy("envoy-deleted", MemberId, "active"));
+        var reconciler = Reconciler(gateway);
+
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
+
+        Assert.Empty(gateway.Calls);
+        Assert.Equal("suspended", gateway.Envoys[1].Status);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+    }
+
+    [Fact]
+    public async Task Host_resuspension_after_a_lift_was_observed_is_not_undone()
+    {
+        var gateway = new FakeGateway { Members = [MemberId] };
+        gateway.Envoys.Add(Envoy("envoy-1", FormerMemberId, "active"));
+        var reconciler = Reconciler(gateway);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
+
+        gateway.Envoys[0] = gateway.Envoys[0] with { Status = "active" };   // host unsuspends
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None); // still gone: ours again
+        gateway.Envoys[0] = gateway.Envoys[0] with { Status = "active" };   // host lifts it again
+        gateway.Members.Add(FormerMemberId);
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None); // record dropped
+        gateway.Envoys[0] = gateway.Envoys[0] with { Status = "suspended" }; // host moderates
+        reconciler.NotifyMemberChanged(GuildId, FormerMemberId);
+        await reconciler.RunOnceAsync(full: true, CancellationToken.None);
+
+        Assert.Equal("suspended", gateway.Envoys[0].Status);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+        Assert.DoesNotContain(gateway.Calls, call => call.Action == "unsuspend");
+    }
+
+    [Fact]
+    public async Task Records_are_keyed_by_relay_and_envoy()
+    {
+        var suspensions = new DiscordCommonsMembershipSuspensionStore(new MemoryEntityStore());
+        var envoy = Envoy("envoy-1", MemberId, "active");
+
+        await suspensions.RecordAsync(RelayUrl, GuildId, envoy);
+        await suspensions.RecordAsync("https://RELAY.example.test/", GuildId, envoy);
+        await suspensions.RecordAsync("https://lab.example.test", GuildId, envoy);
+
+        Assert.Single(await suspensions.ListAsync(RelayUrl));
+        Assert.Single(await suspensions.ListAsync("https://lab.example.test"));
     }
 
     [Fact]
@@ -154,7 +272,7 @@ public sealed class DiscordCommonsMembershipTests
         gateway.Envoys.Add(Envoy("envoy-gone", FormerMemberId, "active"));
         var reconciler = Reconciler(gateway);
 
-        reconciler.NotifyDeparture(GuildId, FormerMemberId);
+        reconciler.NotifyMemberChanged(GuildId, FormerMemberId);
         Assert.False((await reconciler.RunOnceAsync(full: false, CancellationToken.None)).Healthy);
         gateway.GuildsFailure = null;
         await reconciler.RunOnceAsync(full: false, CancellationToken.None);
@@ -197,7 +315,7 @@ public sealed class DiscordCommonsMembershipTests
             Scope("700000000000000007", "https://other.example.test", null),
         ]);
 
-        Assert.Equal(["400000000000000004"], guilds);
+        Assert.Equal([new DiscordCommonsMembershipGuild("400000000000000004", RelayUrl)], guilds);
         Assert.Equal(["500000000000000005", "600000000000000006"], shared);
     }
 
@@ -209,7 +327,7 @@ public sealed class DiscordCommonsMembershipTests
 
         await relay.SetEnvoyStatusAsync(botId, GuildId, "envoy-1", "approve");
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            relay.SetEnvoyStatusAsync(botId, GuildId, "envoy-1", "unsuspend"));
+            relay.SetEnvoyStatusAsync(botId, GuildId, "envoy-1", "delete"));
 
         var request = Assert.Single(handler.Requests);
         Assert.Equal(HttpMethod.Post, request.Method);
@@ -289,7 +407,7 @@ public sealed class DiscordCommonsMembershipTests
     }
 
     private static DiscordCommonsMembershipReconciler Reconciler(FakeGateway gateway)
-        => new(gateway, NullLogger.Instance, TimeSpan.FromMinutes(5));
+        => new(gateway, gateway.Suspensions, NullLogger.Instance, TimeSpan.FromMinutes(5));
 
     private static DiscordCommonsRelayEnvoy Envoy(string id, string owner, string status)
         => new(id, owner, "Owner", "agent-1", "Atlas", "Owner", "Atlas · Owner", status, null);
@@ -318,6 +436,7 @@ public sealed class DiscordCommonsMembershipTests
     {
         public List<DiscordCommonsRelayEnvoy> Envoys { get; } = [];
         public HashSet<string> Members { get; init; } = [];
+        public DiscordCommonsMembershipSuspensionStore Suspensions { get; } = new(new MemoryEntityStore());
         public List<(string Guild, string Envoy, string Action)> Calls { get; } = [];
         public SemaphoreSlim EnvoyReads { get; } = new(0);
         public int MemberListings { get; private set; }
@@ -326,10 +445,10 @@ public sealed class DiscordCommonsMembershipTests
         public Exception? MembersFailure { get; init; }
         public Exception? StatusFailure { get; set; }
 
-        public Task<IReadOnlyList<string>> GuildIdsAsync(CancellationToken ct)
+        public Task<IReadOnlyList<DiscordCommonsMembershipGuild>> GuildsAsync(CancellationToken ct)
             => GuildsFailure is { } failure
-                ? Task.FromException<IReadOnlyList<string>>(failure)
-                : Task.FromResult<IReadOnlyList<string>>([GuildId]);
+                ? Task.FromException<IReadOnlyList<DiscordCommonsMembershipGuild>>(failure)
+                : Task.FromResult<IReadOnlyList<DiscordCommonsMembershipGuild>>([Guild]);
 
         public Task<IReadOnlyList<DiscordCommonsRelayEnvoy>> GetEnvoysAsync(string guildId, CancellationToken ct)
         {
@@ -355,7 +474,7 @@ public sealed class DiscordCommonsMembershipTests
             if (StatusFailure is { } failure) return Task.FromException(failure);
             Calls.Add((guildId, envoyId, action));
             var index = Envoys.FindIndex(envoy => envoy.Id == envoyId);
-            Envoys[index] = Envoys[index] with { Status = action == "approve" ? "active" : "suspended" };
+            Envoys[index] = Envoys[index] with { Status = action == "suspend" ? "suspended" : "active" };
             return Task.CompletedTask;
         }
     }
