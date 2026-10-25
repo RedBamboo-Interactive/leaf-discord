@@ -638,8 +638,9 @@ public sealed class DiscordBotService(
     internal static string DescribeDisconnect(Exception exception)
         => DiscordBotRuntime.DescribeDisconnect(exception);
 
-    internal static DiscordSocketConfig CreateSocketConfig(string presenceContextMode)
-        => DiscordBotRuntime.CreateSocketConfig(presenceContextMode);
+    internal static DiscordSocketConfig CreateSocketConfig(
+        string presenceContextMode, bool commonsMembershipEvents = false)
+        => DiscordBotRuntime.CreateSocketConfig(presenceContextMode, commonsMembershipEvents);
 
     internal static void ValidateExistingBindingTarget(
         DiscordBinding binding, IReadOnlySet<string> dmAllowlist)
@@ -722,6 +723,10 @@ internal sealed class DiscordBotRuntime(
     private Task? presenceLoop;
     private Task? commonsRoleLoop;
     private Task? commonsWebhookLoop;
+    private Task? commonsMembershipLoop;
+    private DiscordCommonsMembershipReconciler? commonsMembership;
+    // Set when Discord refused the member intents; cleared by an explicit restart.
+    private bool commonsMemberIntentsDisallowed;
     private string state = "stopped";
     private DateTimeOffset? connectedAt;
     private string? lastError;
@@ -1782,6 +1787,8 @@ internal sealed class DiscordBotRuntime(
     {
         await lifecycle.WaitAsync(stoppingToken);
         DiscordSocketClient? startingClient = null;
+        var commonsMembershipEvents = false;
+        var retryWithoutMemberIntents = false;
         try
         {
             if (client is not null) return;
@@ -1797,8 +1804,11 @@ internal sealed class DiscordBotRuntime(
 
             state = "connecting";
             lastError = null;
+            // Leaf Community membership reconciliation reacts to leaves, kicks and bans at once.
+            commonsMembershipEvents = !commonsMemberIntentsDisallowed
+                && await HasReadyCommonsAsync(stoppingToken);
             var next = new DiscordSocketClient(CreateSocketConfig(
-                config.PresenceContextMode));
+                config.PresenceContextMode, commonsMembershipEvents));
             next.Log += OnLogAsync;
             Func<Task> connectedHandler = () => OnConnectedAsync(next);
             Func<Exception, Task> disconnectedHandler =
@@ -1859,6 +1869,8 @@ internal sealed class DiscordBotRuntime(
             next.MessageUpdated += OnMessageUpdatedAsync;
             next.ReactionAdded += OnReactionAddedAsync;
             next.SlashCommandExecuted += OnSlashCommandAsync;
+            next.UserLeft += OnGuildMemberLeftAsync;
+            next.UserBanned += OnGuildMemberBannedAsync;
             Func<SocketUser, SocketPresence, SocketPresence, Task> presenceHandler =
                 (_, _, _) => PublishOwnerPresenceAsync(next);
             Func<SocketUser, SocketVoiceState, SocketVoiceState, Task> voiceHandler =
@@ -1903,7 +1915,33 @@ internal sealed class DiscordBotRuntime(
             presenceLoop = RunPresenceLoopAsync(next, runCts.Token);
             commonsRoleLoop = RunCommonsRoleLoopAsync(next, runCts.Token);
             commonsWebhookLoop = RunCommonsWebhookLoopAsync(next, runCts.Token);
+            commonsMembership = new DiscordCommonsMembershipReconciler(
+                new DiscordCommonsMembershipGateway(
+                    configId, commonsConfigurations, commons, rest, next,
+                    () => ReferenceEquals(client, next),
+                    async ct => (await GetConfigAsync(ct)).BotToken
+                        ?? throw new InvalidOperationException("Discord bot token is unavailable."),
+                    logger),
+                logger);
+            var membership = commonsMembership;
+            var membershipToken = runCts.Token;
+            commonsMembershipLoop = Task.Run(
+                () => membership.RunAsync(membershipToken), CancellationToken.None);
             await OnReadyAsync(next);
+        }
+        catch (Exception ex) when (commonsMembershipEvents && DisallowsIntents(ex))
+        {
+            // Server Members Intent is off in the Developer Portal. Connect without the member
+            // events; the periodic reconcile still runs and logs its own failures.
+            logger.LogWarning(
+                "Discord refused the Leaf Community member intents for bot configuration {ConfigId}; "
+                + "reconnecting without leave and ban events", configId);
+            commonsMemberIntentsDisallowed = true;
+            retryWithoutMemberIntents = true;
+            DetachConversationReconciledHandler();
+            if (startingClient is not null) await DisposeClientAsync(startingClient);
+            client = null;
+            state = "stopped";
         }
         catch (Exception ex)
         {
@@ -1918,6 +1956,43 @@ internal sealed class DiscordBotRuntime(
         {
             lifecycle.Release();
         }
+        if (retryWithoutMemberIntents) await StartAsync(stoppingToken);
+    }
+
+    private async Task<bool> HasReadyCommonsAsync(CancellationToken ct)
+    {
+        try
+        {
+            return (await commonsConfigurations.GetAsync(configId, ct))?.Ready == true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(
+                "Leaf Community configuration could not be read for bot configuration {ConfigId}: {ErrorType}",
+                configId, ex.GetType().Name);
+            return false;
+        }
+    }
+
+    internal static bool DisallowsIntents(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+            if (current is WebSocketClosedException { CloseCode: 4014 })
+                return true;
+        return false;
+    }
+
+    // Leaves, kicks and bans only queue work; the membership loop calls Discord and the relay.
+    private Task OnGuildMemberLeftAsync(SocketGuild guild, SocketUser user)
+    {
+        commonsMembership?.NotifyDeparture(guild.Id.ToString(), user.Id.ToString());
+        return Task.CompletedTask;
+    }
+
+    private Task OnGuildMemberBannedAsync(SocketUser user, SocketGuild guild)
+    {
+        commonsMembership?.NotifyDeparture(guild.Id.ToString(), user.Id.ToString());
+        return Task.CompletedTask;
     }
 
     internal static void ValidateApplicationId(string configuredApplicationId, ulong botUserId)
@@ -2051,6 +2126,7 @@ internal sealed class DiscordBotRuntime(
     public async Task RestartAsync(CancellationToken stoppingToken)
     {
         await StopAsync();
+        commonsMemberIntentsDisallowed = false;
         await StartAsync(stoppingToken);
     }
 
@@ -2068,6 +2144,7 @@ internal sealed class DiscordBotRuntime(
             await ObserveBackgroundLoopAsync(presenceLoop, "presence");
             await ObserveBackgroundLoopAsync(commonsRoleLoop, "Public Agent role reconciliation");
             await ObserveBackgroundLoopAsync(commonsWebhookLoop, "Leaf Community lazy webhooks");
+            await ObserveBackgroundLoopAsync(commonsMembershipLoop, "Leaf Community membership");
             if (client is not null)
             {
                 await DisposeClientAsync(client);
@@ -2080,6 +2157,9 @@ internal sealed class DiscordBotRuntime(
             presenceLoop = null;
             commonsRoleLoop = null;
             commonsWebhookLoop = null;
+            commonsMembershipLoop = null;
+            commonsMembership?.Dispose();
+            commonsMembership = null;
             connectedAt = null;
             state = "stopped";
         }
@@ -2122,9 +2202,11 @@ internal sealed class DiscordBotRuntime(
         await RegisterCommandsAsync();
         await BackfillBindingsAsync();
         await PublishOwnerPresenceAsync(source, forceRefresh: true);
+        commonsMembership?.RequestFullReconcile();
     }
 
-    internal static DiscordSocketConfig CreateSocketConfig(string presenceContextMode)
+    internal static DiscordSocketConfig CreateSocketConfig(
+        string presenceContextMode, bool commonsMembershipEvents = false)
     {
         var mode = DiscordPresenceContextModes.Normalize(presenceContextMode);
         var intents = GatewayIntents.Guilds
@@ -2136,6 +2218,9 @@ internal sealed class DiscordBotRuntime(
             intents |= GatewayIntents.GuildPresences | GatewayIntents.GuildVoiceStates;
         if (mode == DiscordPresenceContextModes.Roster)
             intents |= GatewayIntents.GuildMembers;
+        // Leaves and kicks need Server Members Intent; bans need only the moderation intent.
+        if (commonsMembershipEvents)
+            intents |= GatewayIntents.GuildMembers | GatewayIntents.GuildBans;
         return new DiscordSocketConfig
         {
             GatewayIntents = intents,
@@ -4516,6 +4601,8 @@ internal sealed class DiscordBotRuntime(
         target.MessageUpdated -= OnMessageUpdatedAsync;
         target.ReactionAdded -= OnReactionAddedAsync;
         target.SlashCommandExecuted -= OnSlashCommandAsync;
+        target.UserLeft -= OnGuildMemberLeftAsync;
+        target.UserBanned -= OnGuildMemberBannedAsync;
         if (clientPresenceHandler is not null)
             target.PresenceUpdated -= clientPresenceHandler;
         if (clientVoiceHandler is not null)

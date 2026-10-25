@@ -707,9 +707,10 @@ public sealed class DiscordCommonsIngestStore(IEntityStore store)
 public sealed class DiscordCommonsRelayService(
     DiscordCommonsConfigurationStore configurations,
     DiscordCommonsIngestStore deliveries,
-    ILogger<DiscordCommonsRelayService> logger) : IAsyncDisposable
+    ILogger<DiscordCommonsRelayService> logger,
+    HttpMessageHandler? handler = null) : IAsyncDisposable
 {
-    private readonly HttpClient http = new(new HttpClientHandler
+    private readonly HttpClient http = new(handler ?? new HttpClientHandler
     {
         AllowAutoRedirect = false,
     })
@@ -803,6 +804,19 @@ public sealed class DiscordCommonsRelayService(
             $"/v1/admin/envoys/{Uri.EscapeDataString(envoyId)}/discord-role",
             new JsonObject { ["discordRoleId"] = roleId }, ct);
         response.EnsureSuccessStatusCode();
+    }
+
+    public async Task SetEnvoyStatusAsync(
+        Guid botId, string guildId, string envoyId, string action,
+        CancellationToken ct = default)
+    {
+        if (action is not (DiscordCommonsEnvoyActions.Approve or DiscordCommonsEnvoyActions.Suspend))
+            throw new ArgumentException("Envoy status action must be approve or suspend.", nameof(action));
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Post,
+            $"/v1/admin/envoys/{Uri.EscapeDataString(envoyId)}/{action}", null, ct);
+        if (!response.IsSuccessStatusCode)
+            throw new DiscordCommonsRelayException(
+                response.StatusCode, response.Headers.RetryAfter?.Delta);
     }
 
     public async Task SyncOwnerDisplayNameAsync(

@@ -306,6 +306,19 @@ public sealed class DiscordRestTransport : IDisposable
         return result;
     }
 
+    /// <summary>True when the user is a current member; a 404 means they are not.</summary>
+    public async Task<bool> IsGuildMemberAsync(
+        string botToken, string guildId, string userId, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Get,
+            $"guilds/{guildId}/members/{Uri.EscapeDataString(userId)}", botToken);
+        using var response = await http.SendAsync(request, ct);
+        if (response.IsSuccessStatusCode) return true;
+        if (response.StatusCode == HttpStatusCode.NotFound) return false;
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        throw DiscordRestException.From(response, raw);
+    }
+
     private static DiscordManagedRole ReadRole(JsonElement item)
         => new(
             item.GetProperty("id").GetString() ?? "",

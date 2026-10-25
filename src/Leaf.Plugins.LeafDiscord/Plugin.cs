@@ -47,7 +47,10 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
         services.AddSingleton(sp => new DiscordGatewayInboxStore(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
-        services.AddSingleton<DiscordCommonsRelayService>();
+        services.AddSingleton(sp => new DiscordCommonsRelayService(
+            sp.GetRequiredService<DiscordCommonsConfigurationStore>(),
+            sp.GetRequiredService<DiscordCommonsIngestStore>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DiscordCommonsRelayService>>()));
         services.AddSingleton<DiscordCommonsSecretInstaller>();
         services.AddSingleton(sp => new DiscordAgentResolver(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
