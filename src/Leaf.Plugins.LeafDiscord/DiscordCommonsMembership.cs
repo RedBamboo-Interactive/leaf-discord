@@ -38,11 +38,18 @@ public sealed record DiscordCommonsMembershipSuspension(
 /// </summary>
 public static class DiscordCommonsMembershipPolicy
 {
+    /// <summary>
+    /// Only an Envoy owned by a real Discord user is governed by membership. Host-enrolled
+    /// Envoys carry a synthetic owner (the relay mints <c>lab-owner_…</c>) that is never a member.
+    /// </summary>
+    public static bool IsDiscordSnowflake(string? value)
+        => value is { Length: >= 17 and <= 20 } && value.All(char.IsAsciiDigit);
+
     public static IReadOnlyList<DiscordCommonsMembershipAction> Plan(
         IEnumerable<DiscordCommonsRelayEnvoy> envoys,
         IReadOnlySet<string> memberIds,
         IReadOnlySet<string> membershipSuspendedEnvoyIds)
-        => envoys.Where(envoy => !string.IsNullOrWhiteSpace(envoy.OwnerDiscordUserId))
+        => envoys.Where(envoy => IsDiscordSnowflake(envoy.OwnerDiscordUserId))
             .Select(envoy => (envoy, member: memberIds.Contains(envoy.OwnerDiscordUserId)) switch
             {
                 ({ Status: "pending" }, true)
@@ -280,7 +287,9 @@ public sealed class DiscordCommonsMembershipReconciler(
     {
         var envoys = await gateway.GetEnvoysAsync(guild.GuildId, ct);
         var records = await LiveRecordsAsync(guild, envoys, ct);
-        if (records.Count == 0 && !envoys.Any(envoy => envoy.Status is "pending" or "active")) return;
+        if (records.Count == 0 && !envoys.Any(envoy => envoy.Status is "pending" or "active"
+                && DiscordCommonsMembershipPolicy.IsDiscordSnowflake(envoy.OwnerDiscordUserId)))
+            return;
         var members = await gateway.ListMemberIdsAsync(guild.GuildId, ct);
         await ApplyPlanAsync(guild, envoys, members, records, "membership-reconcile", ct);
     }
@@ -288,6 +297,7 @@ public sealed class DiscordCommonsMembershipReconciler(
     public async Task HandleMemberChangeAsync(
         DiscordCommonsMembershipGuild guild, string userId, CancellationToken ct)
     {
+        if (!DiscordCommonsMembershipPolicy.IsDiscordSnowflake(userId)) return;
         var envoys = await gateway.GetEnvoysAsync(guild.GuildId, ct);
         var records = (await LiveRecordsAsync(guild, envoys, ct))
             .Where(pair => pair.Value.OwnerDiscordUserId == userId)
@@ -313,6 +323,11 @@ public sealed class DiscordCommonsMembershipReconciler(
         var live = new Dictionary<string, DiscordCommonsMembershipSuspension>(StringComparer.Ordinal);
         foreach (var record in await suspensions.ListAsync(guild.RelayUrl, ct))
         {
+            if (!DiscordCommonsMembershipPolicy.IsDiscordSnowflake(record.OwnerDiscordUserId))
+            {
+                await RepairNonMemberSuspensionAsync(guild, record, byId, ct);
+                continue;
+            }
             if (DiscordCommonsMembershipPolicy.IsStale(record, byId) || !live.TryAdd(record.EnvoyId, record))
             {
                 await suspensions.ClearAsync(record, ct);
@@ -322,6 +337,28 @@ public sealed class DiscordCommonsMembershipReconciler(
             }
         }
         return live;
+    }
+
+    /// <summary>
+    /// A recorded suspension of a host-enrolled Envoy (synthetic owner) was made before such
+    /// Envoys were excluded; membership never applied to it. Lift it if the relay still shows
+    /// the suspension this host made, then forget it either way.
+    /// </summary>
+    private async Task RepairNonMemberSuspensionAsync(
+        DiscordCommonsMembershipGuild guild,
+        DiscordCommonsMembershipSuspension record,
+        IReadOnlyDictionary<string, DiscordCommonsRelayEnvoy> envoysById,
+        CancellationToken ct)
+    {
+        var lift = !DiscordCommonsMembershipPolicy.IsStale(record, envoysById);
+        if (lift)
+            await gateway.SetEnvoyStatusAsync(
+                guild.GuildId, record.EnvoyId, DiscordCommonsEnvoyActions.Unsuspend, ct);
+        await suspensions.ClearAsync(record, ct);
+        logger.LogInformation(
+            "Leaf Community Envoy {EnvoyId} in guild {GuildId}: host-enrolled Envoy outside membership; "
+            + "{Repair} (membership-repair)",
+            record.EnvoyId, guild.GuildId, lift ? "unsuspended and record cleared" : "record cleared");
     }
 
     private async Task ApplyPlanAsync(

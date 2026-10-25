@@ -378,7 +378,12 @@ the safe Commons configuration view and retried without interrupting ingest.
 
 Membership of the guild is the Leaf Community permission. The host reconciles each relay's
 Envoys with its guild's members on connect and every five minutes: a member's `pending` Envoy
-is approved and a non-member's `active` Envoy is suspended. A join, leave, kick, or ban
+is approved and a non-member's `active` Envoy is suspended. Only Envoys whose owner is a real
+Discord user ID (a 17-20 digit snowflake) are governed this way; host-enrolled Envoys, whose
+relay-minted owner such as `lab-owner_…` is never a guild member, are never approved, suspended,
+or unsuspended by it. A recorded suspension of such an Envoy, made before this exclusion
+existed, is repaired on the next cycle: unsuspended if the relay still shows it suspended
+under the same owner, and its record cleared either way. A join, leave, kick, or ban
 re-checks that user at once; Discord's current membership decides, so a late or out-of-order
 event cannot act wrongly. Each suspension the host makes this way is recorded in a
 `leaf-discord-commons-membership-suspension` Entity keyed by relay and Envoy. When the owner

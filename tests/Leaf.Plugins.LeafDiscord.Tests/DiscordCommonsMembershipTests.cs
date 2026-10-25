@@ -13,6 +13,7 @@ public sealed class DiscordCommonsMembershipTests
     private const string GuildId = "400000000000000004";
     private const string MemberId = "100000000000000001";
     private const string FormerMemberId = "100000000000000002";
+    private const string LabOwnerId = "lab-owner_ANdQ24GRCJZqQaEL";
     private const string RelayUrl = "https://relay.example.test";
     private static readonly DiscordCommonsMembershipGuild Guild = new(GuildId, RelayUrl);
 
@@ -209,6 +210,96 @@ public sealed class DiscordCommonsMembershipTests
 
         Assert.Single(await suspensions.ListAsync(RelayUrl));
         Assert.Single(await suspensions.ListAsync("https://lab.example.test"));
+    }
+
+    [Theory]
+    [InlineData("100000000000000001", true)]
+    [InlineData("12345678901234567", true)]
+    [InlineData("12345678901234567890", true)]
+    [InlineData("1234567890123456", false)]
+    [InlineData("123456789012345678901", false)]
+    [InlineData("lab-owner_ANdQ24GRCJZqQaEL", false)]
+    [InlineData("10000000000000000x", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void Only_discord_snowflakes_are_membership_owners(string? owner, bool expected)
+        => Assert.Equal(expected, DiscordCommonsMembershipPolicy.IsDiscordSnowflake(owner));
+
+    [Fact]
+    public async Task Host_enrolled_envoys_are_outside_membership_reconcile()
+    {
+        var gateway = new FakeGateway { Members = [MemberId] };
+        gateway.Envoys.Add(Envoy("envoy-lab-active", LabOwnerId, "active"));
+        gateway.Envoys.Add(Envoy("envoy-lab-pending", LabOwnerId, "pending"));
+        gateway.Envoys.Add(Envoy("envoy-lab-suspended", LabOwnerId, "suspended"));
+        var reconciler = Reconciler(gateway);
+
+        await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
+        reconciler.NotifyMemberChanged(GuildId, LabOwnerId);
+        await reconciler.RunOnceAsync(full: false, CancellationToken.None);
+
+        Assert.Empty(gateway.Calls);
+        Assert.Equal(["active", "pending", "suspended"], gateway.Envoys.Select(envoy => envoy.Status));
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+        // Nothing governed by membership, so Discord was not even asked for the member list.
+        Assert.Equal(0, gateway.MemberListings);
+    }
+
+    [Fact]
+    public async Task Repair_unsuspends_a_recorded_host_enrolled_suspension_and_clears_it()
+    {
+        var gateway = new FakeGateway
+        {
+            Members = [MemberId],
+            MembersFailure = new DiscordRestException(HttpStatusCode.Forbidden, "Missing Access"),
+        };
+        gateway.Envoys.Add(Envoy("envoy_TCGc4YJc2z67hG2K", LabOwnerId, "suspended"));
+        await gateway.Suspensions.RecordAsync(RelayUrl, GuildId,
+            Envoy("envoy_TCGc4YJc2z67hG2K", LabOwnerId, "active"));
+
+        await Reconciler(gateway).RunOnceAsync(full: true, CancellationToken.None);
+
+        Assert.Equal([(GuildId, "envoy_TCGc4YJc2z67hG2K", "unsuspend")], gateway.Calls);
+        Assert.Equal("active", gateway.Envoys.Single().Status);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+        Assert.Equal(0, gateway.MemberListings);
+    }
+
+    [Fact]
+    public async Task Repair_only_clears_a_host_enrolled_record_whose_envoy_moved_on()
+    {
+        var gateway = new FakeGateway { Members = [MemberId] };
+        gateway.Envoys.Add(Envoy("envoy-lab-lifted", LabOwnerId, "active"));
+        gateway.Envoys.Add(Envoy("envoy-lab-reowned", "lab-owner_someone-else", "suspended"));
+        foreach (var id in new[] { "envoy-lab-lifted", "envoy-lab-reowned", "envoy-lab-deleted" })
+            await gateway.Suspensions.RecordAsync(RelayUrl, GuildId, Envoy(id, LabOwnerId, "active"));
+
+        await Reconciler(gateway).ReconcileGuildAsync(Guild, CancellationToken.None);
+
+        Assert.Empty(gateway.Calls);
+        Assert.Equal("suspended", gateway.Envoys[1].Status);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
+    }
+
+    [Fact]
+    public async Task Failed_repair_keeps_the_record_for_the_next_cycle()
+    {
+        var gateway = new FakeGateway
+        {
+            Members = [MemberId],
+            StatusFailure = new HttpRequestException("relay down", null, HttpStatusCode.BadGateway),
+        };
+        gateway.Envoys.Add(Envoy("envoy-lab", LabOwnerId, "suspended"));
+        await gateway.Suspensions.RecordAsync(RelayUrl, GuildId, Envoy("envoy-lab", LabOwnerId, "active"));
+        var reconciler = Reconciler(gateway);
+
+        Assert.False((await reconciler.RunOnceAsync(full: true, CancellationToken.None)).Healthy);
+        Assert.Single(await gateway.Suspensions.ListAsync(RelayUrl));
+        gateway.StatusFailure = null;
+        Assert.True((await reconciler.RunOnceAsync(full: true, CancellationToken.None)).Healthy);
+
+        Assert.Equal([(GuildId, "envoy-lab", "unsuspend")], gateway.Calls);
+        Assert.Empty(await gateway.Suspensions.ListAsync(RelayUrl));
     }
 
     [Fact]
