@@ -6,6 +6,47 @@ namespace Leaf.Plugins.LeafDiscord.Tests;
 public sealed class DiscordGatewayInboxTests
 {
     [Fact]
+    public async Task Consumer_recovers_after_a_transient_poll_failure()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var iterations = 0;
+        Exception? observed = null;
+
+        await DiscordBotRuntime.RunRecoveringGatewayInboxLoopAsync(
+            _ =>
+            {
+                iterations++;
+                if (iterations == 1)
+                    throw new InvalidOperationException("database unavailable");
+
+                cts.Cancel();
+                return Task.CompletedTask;
+            },
+            TimeSpan.Zero,
+            ex => observed = ex,
+            cts.Token);
+
+        Assert.Equal(2, iterations);
+        Assert.IsType<InvalidOperationException>(observed);
+    }
+
+    [Fact]
+    public async Task Consumer_cancellation_is_not_retried_as_a_failure()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(25));
+        var failures = 0;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            DiscordBotRuntime.RunRecoveringGatewayInboxLoopAsync(
+                token => Task.Delay(Timeout.InfiniteTimeSpan, token),
+                TimeSpan.Zero,
+                _ => failures++,
+                cts.Token));
+
+        Assert.Equal(0, failures);
+    }
+
+    [Fact]
     public async Task Enqueue_is_durable_and_idempotent_by_bot_channel_and_message()
     {
         var store = new MemoryEntityStore();

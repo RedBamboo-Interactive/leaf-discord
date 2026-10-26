@@ -692,6 +692,7 @@ internal sealed class DiscordBotRuntime(
     private static readonly TimeSpan UserProfileCacheTtl = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MaintenanceRecoveryInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MaintenanceFailureBackoff = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan GatewayInboxFailureBackoff = TimeSpan.FromSeconds(5);
     internal static readonly TimeSpan SelectiveTypingDelay = TimeSpan.FromSeconds(2);
     private const int GuildStartupBackfillLimit = 25;
     private const int DmStartupBackfillLimit = 50;
@@ -2797,51 +2798,84 @@ internal sealed class DiscordBotRuntime(
     private async Task RunGatewayInboxLoopAsync(
         DiscordSocketClient source, CancellationToken ct)
     {
+        await RunRecoveringGatewayInboxLoopAsync(
+            token => RunGatewayInboxIterationAsync(source, token),
+            GatewayInboxFailureBackoff,
+            ex => logger.LogError(ex,
+                "Discord gateway inbox iteration failed for bot configuration {ConfigId}; retrying",
+                configId),
+            ct);
+    }
+
+    internal static async Task RunRecoveringGatewayInboxLoopAsync(
+        Func<CancellationToken, Task> iteration,
+        TimeSpan failureBackoff,
+        Action<Exception> onFailure,
+        CancellationToken ct)
+    {
         while (!ct.IsCancellationRequested)
         {
-            var pending = await gatewayInbox.PendingAsync(configId, ct);
-            var due = DiscordGatewayInboxStore.DueChannelHeads(
-                pending, DateTimeOffset.UtcNow);
-            if (due.Count == 0)
+            try
             {
-                await Task.Delay(TimeSpan.FromSeconds(1), ct);
-                continue;
+                await iteration(ct);
             }
-
-            foreach (var item in due)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                ct.ThrowIfCancellationRequested();
-                try
-                {
-                    await ProcessGatewayInboxItemAsync(source, item, ct);
-                    await gatewayInbox.MarkCompletedAsync(item, ct);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (HttpException ex) when (ex.HttpCode == HttpStatusCode.NotFound)
-                {
-                    // A message deleted before the worker refetched it cannot ever be
-                    // admitted. Retrying it would permanently block later messages in
-                    // this binding, so settle the durable coordinate as gone.
-                    await gatewayInbox.MarkCompletedAsync(item, ct);
-                    logger.LogInformation(
-                        "Discord gateway inbox message {MessageId} disappeared before processing",
-                        item.MessageId);
-                }
-                catch (Exception ex)
-                {
-                    var safeError = ex.GetType().Name;
-                    await gatewayInbox.MarkRetryAsync(
-                        item,
-                        safeError,
-                        DiscordGatewayInboxStore.RetryDelay(item.Attempts),
-                        ct);
-                    logger.LogWarning(ex,
-                        "Discord gateway inbox message {MessageId} will be retried",
-                        item.MessageId);
-                }
+                throw;
+            }
+            catch (Exception ex)
+            {
+                onFailure(ex);
+                await Task.Delay(failureBackoff, ct);
+            }
+        }
+    }
+
+    private async Task RunGatewayInboxIterationAsync(
+        DiscordSocketClient source, CancellationToken ct)
+    {
+        var pending = await gatewayInbox.PendingAsync(configId, ct);
+        var due = DiscordGatewayInboxStore.DueChannelHeads(
+            pending, DateTimeOffset.UtcNow);
+        if (due.Count == 0)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(1), ct);
+            return;
+        }
+
+        foreach (var item in due)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await ProcessGatewayInboxItemAsync(source, item, ct);
+                await gatewayInbox.MarkCompletedAsync(item, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (HttpException ex) when (ex.HttpCode == HttpStatusCode.NotFound)
+            {
+                // A message deleted before the worker refetched it cannot ever be
+                // admitted. Retrying it would permanently block later messages in
+                // this binding, so settle the durable coordinate as gone.
+                await gatewayInbox.MarkCompletedAsync(item, ct);
+                logger.LogInformation(
+                    "Discord gateway inbox message {MessageId} disappeared before processing",
+                    item.MessageId);
+            }
+            catch (Exception ex)
+            {
+                var safeError = ex.GetType().Name;
+                await gatewayInbox.MarkRetryAsync(
+                    item,
+                    safeError,
+                    DiscordGatewayInboxStore.RetryDelay(item.Attempts),
+                    ct);
+                logger.LogWarning(ex,
+                    "Discord gateway inbox message {MessageId} will be retried",
+                    item.MessageId);
             }
         }
     }
