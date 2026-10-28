@@ -1057,8 +1057,13 @@ public sealed class DiscordCommonsRelayService(
     /// as Discord returned them; the relay forwards only bounded image descriptors to the Envoys
     /// it addresses, which fetch, check and review the bytes themselves.
     /// </summary>
+    /// <summary>
+    /// A native host post in a Leaf Community thread. An answer to an Envoy addresses that Envoy
+    /// and was already authorized by the relay governor. An unprompted post (no source Envoy)
+    /// lets the relay address the thread's Envoys it tags or names, and records it in history.
+    /// </summary>
     internal static JsonObject BuildHostParticipantPostPayload(
-        string messageId, string participantId, string content, string sourceEnvoyId,
+        string messageId, string participantId, string content, string? sourceEnvoyId,
         string channel, string? channelId, string threadRef, long timestamp, JsonArray? attachments)
     {
         var payload = new JsonObject
@@ -1067,13 +1072,16 @@ public sealed class DiscordCommonsRelayService(
             ["eventId"] = $"host-post:{messageId}",
             ["participantId"] = participantId,
             ["content"] = content,
-            ["addresses"] = new JsonArray(JsonValue.Create(sourceEnvoyId)),
+            ["addresses"] = sourceEnvoyId is null
+                ? new JsonArray()
+                : new JsonArray(JsonValue.Create(sourceEnvoyId)),
             ["channel"] = channel,
             ["channelId"] = channelId,
             ["threadRef"] = threadRef,
             ["messageId"] = messageId,
             ["timestamp"] = timestamp,
         };
+        if (sourceEnvoyId is null) payload["unprompted"] = true;
         if (attachments is { Count: > 0 }) payload["attachments"] = attachments.DeepClone();
         return payload;
     }

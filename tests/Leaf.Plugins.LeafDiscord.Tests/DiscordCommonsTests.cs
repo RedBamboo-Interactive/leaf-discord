@@ -370,6 +370,19 @@ public sealed class DiscordCommonsTests
         Assert.Equal("https://cdn.discordapp.com/attachments/1/77/chart.png",
             payload["attachments"]![0]!["url"]!.GetValue<string>());
         Assert.False(plain.ContainsKey("attachments"));
+        Assert.False(payload.ContainsKey("unprompted"));
+    }
+
+    [Fact]
+    public void Unprompted_host_post_leaves_addressing_to_the_relay()
+    {
+        var payload = DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+            "sent-3", "host:nova", "Sibylle, what do you think?", null, "agent-consult", "700",
+            "thread-1", 1234, null);
+
+        Assert.Empty(payload["addresses"]!.AsArray());
+        Assert.True(payload["unprompted"]!.GetValue<bool>());
+        Assert.Equal("host-post:sent-3", payload["eventId"]!.GetValue<string>());
     }
 
     [Fact]

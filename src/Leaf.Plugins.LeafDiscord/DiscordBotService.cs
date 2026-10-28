@@ -4416,6 +4416,13 @@ internal sealed class DiscordBotRuntime(
                             ct);
                         await commonsHostTurns.CompleteAsync(hostTurn, "posted", ct);
                     }
+                    else if (delivery.ChunkIndex == 0)
+                    {
+                        // Later chunks continue a message already reported, or a host answer
+                        // whose turn completed with its first chunk.
+                        await ReportUnpromptedCommonsPostAsync(
+                            binding, config, sentId, outbound.Content, sent.Attachments, ct);
+                    }
                 }
                 catch (DiscordRestException ex) when ((int)ex.StatusCode == 429
                                                        || (int)ex.StatusCode >= 500)
@@ -4538,6 +4545,40 @@ internal sealed class DiscordBotRuntime(
                 }
                 return;
             }
+        }
+    }
+
+    /// <summary>
+    /// Reports a native post that answered no Envoy in a Leaf Community thread, so the relay
+    /// keeps it in the thread's history and pings the thread's Envoys it tags or names. The
+    /// Discord message is already sent, so a failure here is logged rather than retried as a
+    /// delivery failure.
+    /// </summary>
+    private async Task ReportUnpromptedCommonsPostAsync(
+        DiscordBinding binding, LeafDiscordConfig config, string messageId, string content,
+        JsonArray? attachments, CancellationToken ct)
+    {
+        try
+        {
+            if (!ulong.TryParse(binding.ConversationId, out var channelId)
+                || client?.GetChannel(channelId) is not SocketThreadChannel thread
+                || CommonsLocation(thread) is not { ThreadRef: { } threadRef } location)
+                return;
+            var scope = await commons.GetScopeAsync(configId, location.GuildId, ct);
+            if (scope is null || scope.SuppressesNativeAgent
+                || !scope.Contains(location.ChannelId, location.CategoryId))
+                return;
+            await commons.EnqueueAsync(configId, location.GuildId, $"host-post:{messageId}",
+                DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+                    messageId, $"host:{config.ApplicationId}", content, null,
+                    location.Channel, location.ChannelId, threadRef,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), attachments),
+                ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex,
+                "Leaf Community could not record native post {MessageId} for its thread", messageId);
         }
     }
 
