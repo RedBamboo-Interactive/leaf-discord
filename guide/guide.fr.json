@@ -1,0 +1,59 @@
+{
+  "schema": "leaf.extension-guide-locale/1",
+  "lang": "fr",
+  "tagline": "Mets ton Agent sur tes propres serveurs Discord grâce à un bot que tu crées toi-même.",
+  "summary": "Discord permet de parler avec ton Agent sur tes propres serveurs Discord et en messages privés. L'Agent garde sa mémoire, ses outils et ses conversations. Tu dois créer toi-même un bot Discord gratuit, un par Agent. Ce n'est pas la communauté officielle de Leaf : pour ça, utilise Leaf Community, sans bot.",
+  "whatYouGet": [
+    "Une section Discord dans Nova qui liste les conversations de ton Agent : serveurs, fils et messages privés.",
+    "Une page Bots dans les réglages pour ajouter ton bot et voir s'il est connecté.",
+    "Des réglages pour choisir quand chaque Agent répond : quand on le mentionne, sur certains messages, ou sur tous."
+  ],
+  "privacy": "Les messages des salons que ton bot voit sont envoyés à ton Agent et à son fournisseur d'IA, et ses réponses sont postées sur Discord. Le jeton du bot est chiffré sur ce PC et n'est plus jamais affiché.",
+  "cost": { "note": "Créer une application développeur Discord est gratuit. Les réponses utilisent ton fournisseur d'IA habituel." },
+  "limitations": [
+    "Chaque Agent a besoin de sa propre application Discord et de son propre bot.",
+    "Rien ne marche tant que tu n'as pas créé le bot et saisi son jeton, son ID d'application et sa clé publique.",
+    "Les messages privés ne marchent que pour les personnes dont l'ID Discord est dans ta liste autorisée.",
+    "Les gens sur Discord sont des tiers : ils ne peuvent pas agir en ton nom ni valider des choses à ta place."
+  ],
+  "requirements": {
+    "discord-account": { "label": "Un compte Discord et un serveur où tu peux ajouter un bot" },
+    "developer-app": { "label": "Une application développeur Discord avec un bot", "detail": "Gratuit, sur le site développeur de Discord. Il en faut une par Agent." },
+    "bot-token": { "label": "Le jeton du bot", "detail": "Discord ne l'affiche qu'une fois, à la création ou à la réinitialisation du bot. Garde-le secret." },
+    "app-ids": { "label": "ID d'application et clé publique", "detail": "Les deux sont sur la page General Information de ton application." },
+    "nova": { "label": "Nova" },
+    "sentinel": { "label": "Sentinel (le contrôle de sécurité)", "detail": "Sans lui, les messages entrants attendent et les réponses sont retenues." }
+  },
+  "setup": {
+    "create-app": { "title": "Crée une application Discord et un bot", "body": "Sur le site développeur de Discord, crée une application et ajoute un bot. Copie l'Application ID et la clé publique depuis General Information, puis crée le jeton du bot et garde-le secret." },
+    "intent": { "title": "Active Message Content Intent", "body": "Sur la page du bot, active Message Content Intent pour que le bot puisse lire ce qu'on lui écrit. N'ajoute les autres intents que si tu choisis plus tard un mode de contexte plus riche." },
+    "invite": { "title": "Invite le bot sur ton serveur", "body": "Dans OAuth2 URL Generator, choisis les scopes bot et applications.commands. Autorise View Channels, Send Messages, Send Messages in Threads, Read Message History, Attach Files et Add Reactions. Ouvre le lien pour l'ajouter." },
+    "add-bot": { "title": "Ajoute le bot dans Leaf", "body": "Ouvre Settings, Discord, Bots et choisis Add bot. Saisis l'Application ID, la clé publique et le jeton, puis choisis l'Agent et un mode de qualité de session." },
+    "enable": { "title": "Allume le bot", "body": "Le bot reste éteint tant que tu ne l'actives pas. Vérifie ensuite que le statut indique connected avec le nom du bot et le nombre de serveurs." },
+    "choose-behavior": { "title": "Choisis comment ton Agent répond", "body": "Dans la section Discord de Nova, règle quand l'Agent répond sur chaque serveur ou salon. Pour autoriser les messages privés, ajoute l'ID Discord de chaque personne à la liste DM allowlist des réglages du bot." }
+  },
+  "useCases": {
+    "friends-server": {
+      "title": "Un assistant pour le serveur de tes amis",
+      "story": "Ton groupe de jeu a un serveur Discord. Ton Agent répond quand on le mentionne, par exemple pour trancher une règle ou organiser la prochaine session.",
+      "try": "Présente-toi à mon groupe de jeu sur Discord et explique en quoi tu peux les aider."
+    },
+    "private-dm": {
+      "title": "Discute avec ton Agent depuis ton téléphone",
+      "story": "Tu ajoutes ton propre ID Discord à la liste autorisée et tu parles à ton Agent en message privé quand tu es loin de ton PC.",
+      "try": "Désormais je t'écrirai sur Discord. Rappelle-moi ce qu'on a décidé hier pour le voyage."
+    },
+    "channel-tone": {
+      "title": "Donne à chaque salon sa façon de faire",
+      "story": "Dans un salon d'aide, l'Agent doit répondre à chaque question. Dans le salon général, il ne parle que si on s'adresse à lui. Tu règles ça salon par salon.",
+      "try": "Dans quels salons Discord réponds-tu, et dans quel mode ?"
+    }
+  },
+  "troubleshooting": {
+    "needs-token": { "symptom": "Les réglages indiquent Needs token ou not configured", "fix": "Ouvre Settings, Discord, Bots. Vérifie que l'Application ID et le jeton sont remplis, puis allume le bot." },
+    "bot-silent": { "symptom": "Le bot est en ligne mais ne répond jamais", "fix": "Vérifie que Message Content Intent est activé pour l'application. Sur un serveur, l'Agent peut ne répondre que si on le mentionne ou lui répond ; change ça dans la section Discord de Nova." },
+    "no-dm": { "symptom": "Le bot ignore mes messages privés", "fix": "Ajoute ton ID Discord exact à la liste DM allowlist dans les réglages du bot." },
+    "add-disabled": { "symptom": "Le bouton Add bot reste grisé", "fix": "Remplis tous les champs. La clé publique doit faire exactement 64 caractères, copiée depuis General Information." },
+    "safety-down": { "symptom": "Les messages attendent et un court avis apparaît", "fix": "Le contrôle de sécurité est indisponible. Vérifie que l'extension Sentinel est installée et activée. Les messages en attente sont retentés puis abandonnés après environ 30 minutes." }
+  }
+}

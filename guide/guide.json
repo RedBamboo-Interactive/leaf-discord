@@ -1,0 +1,115 @@
+{
+  "schema": "leaf.extension-guide/1",
+  "id": "leaf-discord",
+  "kind": "integration",
+  "category": "communication",
+  "tagline": "Put your Agent on your own Discord servers through a bot that you create.",
+  "summary": "Discord lets people talk with your Agent in your own Discord servers and direct messages. The Agent keeps its memory, tools and conversations. You must create a free Discord bot yourself, one per Agent. It is not the official Leaf community: for that, use Leaf Community, which needs no bot.",
+  "whatYouGet": [
+    "A Discord section in Nova that lists your Agent's conversations in servers, threads and DMs.",
+    "A Bots page in settings to add your bot and see whether it is connected.",
+    "Controls for when each Agent answers: when mentioned, on selected messages, or on every message."
+  ],
+  "runsWhere": "hybrid",
+  "cost": { "kind": "free", "note": "Creating a Discord developer application is free. Replies use your usual AI provider." },
+  "privacy": "Messages in the channels your bot can see are sent to your Agent and its AI provider, and its replies are posted on Discord. The bot token is stored encrypted on this PC and is never shown again.",
+  "requirements": [
+    { "id": "discord-account", "kind": "account", "label": "A Discord account and a server you can add a bot to" },
+    { "id": "developer-app", "kind": "account", "label": "A Discord developer application with a bot", "detail": "Free, created on Discord's developer website. You need a separate one for each Agent." },
+    { "id": "bot-token", "kind": "api-key", "label": "The bot token", "detail": "Shown once by Discord when you create or reset the bot. Keep it private." },
+    { "id": "app-ids", "kind": "api-key", "label": "Application ID and public key", "detail": "Both are on your application's General Information page." },
+    { "id": "nova", "kind": "extension", "label": "Nova", "check": "extension:nova" },
+    { "id": "sentinel", "kind": "extension", "label": "Sentinel (the safety check)", "detail": "Without it, incoming messages wait and replies are held.", "check": "extension:cap-sentinel" }
+  ],
+  "setup": [
+    {
+      "id": "create-app",
+      "title": "Create a Discord application and bot",
+      "body": "On Discord's developer website, create an application and add a bot. Copy the Application ID and the public key from the General Information page, then create the bot token and keep it private."
+    },
+    {
+      "id": "intent",
+      "title": "Turn on Message Content Intent",
+      "body": "On the bot page, switch on Message Content Intent so the bot can read what people write to it. Only add the other intents if you choose a richer server-awareness mode later."
+    },
+    {
+      "id": "invite",
+      "title": "Invite the bot to your server",
+      "body": "In OAuth2 URL Generator, pick the bot and applications.commands scopes. Allow View Channels, Send Messages, Send Messages in Threads, Read Message History, Attach Files and Add Reactions. Open the link to add it."
+    },
+    {
+      "id": "add-bot",
+      "title": "Add the bot in Leaf",
+      "body": "Open Settings, Discord, Bots and choose Add bot. Enter the Application ID, the public key and the token, then pick the Agent and a session quality mode."
+    },
+    {
+      "id": "enable",
+      "title": "Switch the bot on",
+      "body": "The bot stays off until you enable it. Then check that the status says connected and shows the bot's name and server count.",
+      "check": "extension:leaf-discord"
+    },
+    {
+      "id": "choose-behavior",
+      "title": "Choose how your Agent answers",
+      "body": "In the Discord section of Nova, set when the Agent replies in each server or channel. To allow direct messages, add each person's Discord user ID to the DM allowlist in the bot settings.",
+      "action": { "kind": "open-app", "route": "/apps/nova/discord" }
+    }
+  ],
+  "useCases": [
+    {
+      "id": "friends-server",
+      "title": "An assistant for your friends' server",
+      "story": "Your game group has a Discord server. Your Agent answers when someone mentions it, for example to settle a rules question or plan the next session.",
+      "try": "Introduce yourself to my game group on Discord and explain what you can help with."
+    },
+    {
+      "id": "private-dm",
+      "title": "Chat with your Agent from your phone",
+      "story": "You add your own Discord user ID to the allowlist and talk to your Agent in a direct message while you are away from your PC.",
+      "try": "From now on I will message you on Discord. Remind me what we decided yesterday about the trip."
+    },
+    {
+      "id": "channel-tone",
+      "title": "Give each channel its own manner",
+      "story": "In a help channel the Agent should answer every question. In a general chat it should only speak when addressed. You set this per channel.",
+      "try": "Which of my Discord channels do you answer in, and in what mode?"
+    }
+  ],
+  "limitations": [
+    "Each Agent needs its own Discord application and bot.",
+    "Nothing works until you create the bot and enter its token, application ID and public key.",
+    "Direct messages only work for people whose Discord user ID is on your allowlist.",
+    "People on Discord are outsiders: they cannot act as you or approve things for you."
+  ],
+  "troubleshooting": [
+    {
+      "id": "needs-token",
+      "symptom": "Settings says Needs token or not configured",
+      "fix": "Open Settings, Discord, Bots. Check that the Application ID and token are filled in, then switch the bot on."
+    },
+    {
+      "id": "bot-silent",
+      "symptom": "The bot is online but never answers",
+      "fix": "Make sure Message Content Intent is on for the application. In a server, the Agent may only answer when mentioned or replied to; change that in the Discord section of Nova."
+    },
+    {
+      "id": "no-dm",
+      "symptom": "The bot ignores my direct messages",
+      "fix": "Add your exact Discord user ID to the DM allowlist in the bot's settings."
+    },
+    {
+      "id": "add-disabled",
+      "symptom": "The Add bot button stays greyed out",
+      "fix": "Fill every field. The public key must be exactly 64 characters, copied from the General Information page."
+    },
+    {
+      "id": "safety-down",
+      "symptom": "Messages wait and a short notice appears",
+      "fix": "The safety check is unavailable. Make sure the Sentinel extension is installed and on. Waiting messages are retried and dropped after about 30 minutes.",
+      "check": "extension:cap-sentinel"
+    }
+  ],
+  "agent": {
+    "whenToSuggest": "When the user wants their Agent reachable on their own Discord server or by Discord direct message, and is willing to create a free Discord bot for it."
+  }
+}
