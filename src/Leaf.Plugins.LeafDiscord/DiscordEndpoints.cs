@@ -911,6 +911,71 @@ public static class DiscordEndpoints
             }
         });
 
+        // Moderation of Leaf Community Envoys in a guild this bot hosts: list them, and suspend,
+        // unsuspend or approve one with the bot's host credential. Before this, a host suspension
+        // (including legacy owner switch-offs that read as host) could not be lifted at all.
+        group.MapGet("/bots/{id:guid}/guilds/{guildId}/commons/envoys", async (
+            Guid id,
+            string guildId,
+            IAuthContext auth,
+            DiscordBotConfigurationStore configurations,
+            DiscordCommonsRelayService relay,
+            CancellationToken ct) =>
+        {
+            if (!IsAdmin(auth) || string.IsNullOrWhiteSpace(auth.UserId))
+                return Forbidden("An authenticated owner or administrator is required.");
+            var botConfig = await configurations.GetAsync(id, ct);
+            if (botConfig is null) return Results.NotFound();
+            if (!CanManageBot(auth, botConfig))
+                return Forbidden("You cannot manage this Discord bot.");
+            try
+            {
+                return Results.Ok(new { envoys = await relay.GetEnvoysAsync(id, guildId, ct) });
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException)
+            {
+                return Results.Problem(ex.Message, statusCode: StatusCodes.Status502BadGateway);
+            }
+        });
+
+        group.MapPost("/bots/{id:guid}/guilds/{guildId}/commons/envoys/{envoyId}/{action}", async (
+            Guid id,
+            string guildId,
+            string envoyId,
+            string action,
+            IAuthContext auth,
+            DiscordBotConfigurationStore configurations,
+            DiscordCommonsRelayService relay,
+            CancellationToken ct) =>
+        {
+            if (!IsAdmin(auth) || string.IsNullOrWhiteSpace(auth.UserId))
+                return Forbidden("An authenticated owner or administrator is required.");
+            if (action is not (DiscordCommonsEnvoyActions.Approve or DiscordCommonsEnvoyActions.Suspend
+                    or DiscordCommonsEnvoyActions.Unsuspend))
+                return Results.BadRequest(new
+                {
+                    error = "invalid_envoy_action",
+                    message = "The action must be approve, suspend or unsuspend.",
+                });
+            var botConfig = await configurations.GetAsync(id, ct);
+            if (botConfig is null) return Results.NotFound();
+            if (!CanManageBot(auth, botConfig))
+                return Forbidden("You cannot manage this Discord bot.");
+            try
+            {
+                await relay.SetEnvoyStatusAsync(id, guildId, envoyId, action, ct);
+                return Results.Ok(new { envoyId, action });
+            }
+            catch (DiscordCommonsRelayException ex)
+            {
+                return Results.Problem(ex.Message, statusCode: (int)ex.StatusCode);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException)
+            {
+                return Results.Problem(ex.Message, statusCode: StatusCodes.Status502BadGateway);
+            }
+        });
+
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/channels/{channelId}/commons-webhook", async (
             Guid id,
             string guildId,
