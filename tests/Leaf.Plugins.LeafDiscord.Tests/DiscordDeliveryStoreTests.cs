@@ -404,7 +404,7 @@ public sealed class DiscordDeliveryStoreTests
     }
 
     [Fact]
-    public async Task Only_outreach_native_posts_in_announcements_are_announcements()
+    public async Task Only_native_posts_sent_as_announcements_are_announcements()
     {
         var store = new MemoryEntityStore();
         var deliveries = new DiscordDeliveryStore(store);
@@ -417,14 +417,21 @@ public sealed class DiscordDeliveryStoreTests
             await deliveries.MarkSentAsync(
                 await enqueue(Assistant(uid, "text")), discordId);
             return DiscordBotRuntime.IsNativeAnnouncementPost(
-                await deliveries.FindSentMessageUidAsync(discordId), TimeSpan.Zero);
+                await deliveries.SentAsAnnouncementAsync(discordId), TimeSpan.Zero);
         }
 
-        // Release Manager posts through binding outreach.
+        // Release Manager's outreach states the intent.
         Assert.True(await SentAs(
             DiscordConversationCoordinator.OutreachMessageUid(binding, "nightly-42"),
             "1559000000000000100",
-            message => deliveries.EnqueueOutboundAsync(binding, message, 0, "Nightly")));
+            message => deliveries.EnqueueOutboundAsync(binding, message, 0, "Nightly", [],
+                new JsonObject { ["announcement"] = true })));
+        // Outreach without it: Nova answering a tester from a private discussion.
+        Assert.False(await SentAs(
+            DiscordConversationCoordinator.OutreachMessageUid(binding, "answer-1"),
+            "1559000000000000105",
+            message => deliveries.EnqueueOutboundAsync(binding, message, 0, "Oui", [],
+                new JsonObject { ["announcement"] = false })));
         // The channel's own session answering a member.
         Assert.False(await SentAs(
             "turn-reply-1", "1559000000000000101",
@@ -439,25 +446,25 @@ public sealed class DiscordDeliveryStoreTests
             async message => (await deliveries.EnqueueProgressAsync(
                 binding, message, "Je regarde", null))!));
 
-        // Not recorded yet: wait for the outbox, then a post no delivery sent is the host's.
-        Assert.Null(await deliveries.FindSentMessageUidAsync("1559000000000000104"));
+        // Not recorded yet: wait for the outbox, then fail closed.
+        Assert.Null(await deliveries.SentAsAnnouncementAsync("1559000000000000104"));
         Assert.Null(DiscordBotRuntime.IsNativeAnnouncementPost(null, TimeSpan.FromSeconds(2)));
-        Assert.True(DiscordBotRuntime.IsNativeAnnouncementPost(null, settled));
+        Assert.False(DiscordBotRuntime.IsNativeAnnouncementPost(null, settled));
     }
 
     [Fact]
-    public async Task A_queued_delivery_has_no_sent_message_uid_until_discord_answers()
+    public async Task A_queued_delivery_is_unrecorded_until_discord_answers()
     {
         var store = new MemoryEntityStore();
         var deliveries = new DiscordDeliveryStore(store);
         var binding = await CreateBindingAsync(store);
         var queued = await deliveries.EnqueueOutboundAsync(
-            binding, Assistant("turn-queued", "text"), 0, "text");
+            binding, Assistant("turn-queued", "text"), 0, "text", [],
+            new JsonObject { ["announcement"] = true });
 
-        Assert.Null(await deliveries.FindSentMessageUidAsync("1559000000000000200"));
+        Assert.Null(await deliveries.SentAsAnnouncementAsync("1559000000000000200"));
         await deliveries.MarkSentAsync(queued, "1559000000000000200");
-        Assert.Equal("turn-queued",
-            await deliveries.FindSentMessageUidAsync("1559000000000000200"));
+        Assert.True(await deliveries.SentAsAnnouncementAsync("1559000000000000200"));
     }
 
     [Fact]

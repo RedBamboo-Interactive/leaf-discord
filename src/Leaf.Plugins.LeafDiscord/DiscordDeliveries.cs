@@ -48,6 +48,30 @@ public sealed record DiscordDelivery(
     /// <summary>An inbound message the session refused because the Sentinel was unavailable.
     /// It stays <c>received</c> and is retried in order at <see cref="NextAttemptAt"/>.</summary>
     public bool SentinelRefused { get; init; }
+
+    /// <summary>An outreach chunk its caller sent as an announcement (see
+    /// <see cref="DiscordOutreachProvenance"/>).</summary>
+    public bool Announcement { get; init; }
+}
+
+/// <summary>
+/// What an outreach caller meant and who it was. <see cref="Announcement"/> is the caller's
+/// stated intent: only a native post sent with it is relayed to Leaf Community as an
+/// announcement. It grants nothing, because every caller that reaches outreach may already post
+/// anything as the native bot. The signed caller app and actor are recorded beside it for audit.
+/// </summary>
+public sealed record DiscordOutreachProvenance(
+    bool Announcement,
+    string CallerApp,
+    string CallerActorKind,
+    string CallerActorEntityId)
+{
+    internal JsonObject CallerJson() => new()
+    {
+        ["app"] = CallerApp,
+        ["actor_kind"] = CallerActorKind,
+        ["actor_entity_id"] = CallerActorEntityId,
+    };
 }
 
 public sealed record DiscordOwnerDirectMessageOperation(
@@ -187,12 +211,13 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
     }
 
     /// <summary>
-    /// The message UID of the outbound delivery that sent one Discord message, or null when no
-    /// delivery has recorded that Discord ID (yet: the ID is recorded once Discord answers).
+    /// Whether the outbound delivery that sent one Discord message was an announcement, or null
+    /// when no delivery has recorded that Discord ID (yet: the ID is recorded once Discord answers).
     /// </summary>
-    public async Task<string?> FindSentMessageUidAsync(
+    public async Task<bool?> SentAsAnnouncementAsync(
         string discordMessageId, CancellationToken ct = default)
-        => (await store.QueryAsync(new EntityQuery
+    {
+        var rows = (await store.QueryAsync(new EntityQuery
         {
             TypeSlug = TypeSlug,
             DataEquals = new Dictionary<string, object?>
@@ -201,9 +226,9 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
                 ["discord_id"] = discordMessageId,
             },
             Limit = 10,
-        }, ct)).Select(Map)
-            .Select(item => item.MessageUid)
-            .FirstOrDefault(uid => !string.IsNullOrWhiteSpace(uid));
+        }, ct)).Select(Map).ToList();
+        return rows.Count == 0 ? null : rows.Any(item => item.Announcement);
+    }
 
     private static string InboundSlug(string applicationId, string discordMessageId)
         => $"discord-in-{DiscordBindingStore.Hash($"{applicationId}:{discordMessageId}")}";
@@ -1007,6 +1032,8 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             ReviewExempt = JsonRead.String(data, "review_exempt"),
             HiddenCharacters = data["hidden_characters"] is JsonValue hidden
                 && hidden.TryGetValue<bool>(out var hasHidden) && hasHidden,
+            Announcement = data["announcement"] is JsonValue announcement
+                && announcement.TryGetValue<bool>(out var isAnnouncement) && isAnnouncement,
         };
     }
 

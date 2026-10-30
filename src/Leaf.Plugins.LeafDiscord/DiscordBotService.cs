@@ -270,10 +270,12 @@ public sealed class DiscordBotService(
         string idempotencyKey,
         string? deliveryContent,
         IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        DiscordOutreachProvenance? provenance = null,
         CancellationToken ct = default)
         => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
             .SendExistingBindingMessageAsync(
-                binding, content, idempotencyKey, deliveryContent, outputAssets, ct);
+                binding, content, idempotencyKey, deliveryContent, outputAssets,
+                provenance, ct);
 
     public async Task AddReactionAsync(
         DiscordBinding binding, string messageId, string emoji, CancellationToken ct = default)
@@ -2086,7 +2088,7 @@ internal sealed class DiscordBotRuntime(
         string idempotencyKey,
         CancellationToken ct = default)
         => await SendExistingBindingMessageAsync(
-            binding, content, idempotencyKey, null, [], ct);
+            binding, content, idempotencyKey, null, [], null, ct);
 
     public async Task<DiscordDirectMessageResult> SendExistingBindingMessageAsync(
         DiscordBinding binding,
@@ -2094,6 +2096,7 @@ internal sealed class DiscordBotRuntime(
         string idempotencyKey,
         string? deliveryContent,
         IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        DiscordOutreachProvenance? provenance = null,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(content))
@@ -2119,7 +2122,7 @@ internal sealed class DiscordBotRuntime(
 
         var sent = await conversations.SendExistingProactiveAsync(
             binding, idempotencyKey.Trim(), content.Trim(), deliveryContent,
-            outputAssets, ct);
+            outputAssets, provenance, ct);
         await DrainBindingAsync(sent.Binding, ct);
         return new DiscordDirectMessageResult(sent.Binding, sent.MessageUid);
     }
@@ -2702,8 +2705,9 @@ internal sealed class DiscordBotRuntime(
 
     /// <summary>
     /// Who may announce to Leaf Community from <c>#announcements</c>: the registered native bot,
-    /// or a human who owns the guild or holds Manage Server or Administrator in it. Other bots,
-    /// webhooks and ordinary members never do.
+    /// or a human who owns the guild or holds Manage Server or Administrator in it, in a
+    /// top-level post. That human's Discord reply to another message is conversation. Other
+    /// bots, webhooks and ordinary members never announce.
     /// </summary>
     internal static bool IsAnnouncementHost(
         MessageSource source,
@@ -2711,13 +2715,15 @@ internal sealed class DiscordBotRuntime(
         ulong authorId,
         ulong? nativeBotId,
         bool authorOwnsGuild,
-        GuildPermissions authorPermissions)
+        GuildPermissions authorPermissions,
+        bool repliesToMessage)
         => source != MessageSource.Webhook
            && (authorIsBot
                ? nativeBotId is not null && authorId == nativeBotId.Value
-               : authorOwnsGuild
-                 || authorPermissions.ManageGuild
-                 || authorPermissions.Administrator);
+               : !repliesToMessage
+                 && (authorOwnsGuild
+                     || authorPermissions.ManageGuild
+                     || authorPermissions.Administrator));
 
     /// <summary>
     /// How long the native bot's own post may wait for its outbound delivery to record the
@@ -2727,16 +2733,16 @@ internal sealed class DiscordBotRuntime(
     internal static readonly TimeSpan NativeAnnouncementReceiptGrace = TimeSpan.FromMinutes(1);
 
     /// <summary>
-    /// Whether the native bot's post in <c>#announcements</c> is an announcement. Posts sent
-    /// through binding outreach are, which is how Release Manager posts. So is a post no
-    /// delivery sent. What the channel's own session wrote (its answers to members, tool
-    /// progress, bridge notices) is conversation, never an announcement. A recent post whose
-    /// delivery has not recorded its Discord ID yet is undecided (null).
+    /// Whether the native bot's post in <c>#announcements</c> is an announcement: only when its
+    /// outbound delivery was sent through outreach with the announcement intent, as Release
+    /// Manager posts. Everything else is conversation: outreach without the intent, the
+    /// channel's own session (answers, tool progress, bridge notices), and a post no delivery
+    /// recorded, since every native post goes through the outbox. A recent post whose delivery
+    /// has not recorded its Discord ID yet is undecided (null).
     /// </summary>
-    internal static bool? IsNativeAnnouncementPost(string? sentMessageUid, TimeSpan age)
-        => sentMessageUid is null
-            ? age < NativeAnnouncementReceiptGrace ? null : true
-            : DiscordConversationCoordinator.IsOutreachMessageUid(sentMessageUid);
+    internal static bool? IsNativeAnnouncementPost(bool? sentAsAnnouncement, TimeSpan age)
+        => sentAsAnnouncement
+           ?? (age < NativeAnnouncementReceiptGrace ? null : false);
 
     private async Task<bool> IsAnnouncementHostAsync(IUserMessage message)
     {
@@ -2745,10 +2751,10 @@ internal sealed class DiscordBotRuntime(
         {
             if (!IsAnnouncementHost(
                     message.Source, true, message.Author.Id, client?.CurrentUser?.Id,
-                    false, GuildPermissions.None))
+                    false, GuildPermissions.None, false))
                 return false;
             return IsNativeAnnouncementPost(
-                    await deliveries.FindSentMessageUidAsync(message.Id.ToString()),
+                    await deliveries.SentAsAnnouncementAsync(message.Id.ToString()),
                     DateTimeOffset.UtcNow - message.Timestamp)
                 ?? throw new DiscordGatewayInboxDeferredException(
                     "the native post's delivery has not recorded its Discord ID yet");
@@ -2761,7 +2767,8 @@ internal sealed class DiscordBotRuntime(
         return IsAnnouncementHost(
             message.Source, false, message.Author.Id, client?.CurrentUser?.Id,
             guild.OwnerId == message.Author.Id,
-            member?.GuildPermissions ?? GuildPermissions.None);
+            member?.GuildPermissions ?? GuildPermissions.None,
+            message.Reference is not null);
     }
 
     /// <summary>

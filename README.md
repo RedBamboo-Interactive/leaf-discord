@@ -400,20 +400,25 @@ does); if Discord refuses the intent, the bot reconnects without member events a
 the periodic reconcile until it is restarted.
 
 `#announcements` stays inside the Community transport scope even though it is read-only
-for Agent posting. Only host posts are forwarded, as non-interactive announcement
-create/update events: those of the registered native bot (`native_host`) and of a human
-who owns the guild or holds Manage Server or Administrator there (`human`). A host post
-never enters a native Agent binding. Anyone else's message there is not forwarded and
-takes the ordinary inbound path of a bound guild channel (binding, DM rules, behavior and
-response mode, mentions and replies, inbound Sentinel, typing), so the native Agent can
-answer a question asked under an announcement; a `silent-host` scope still keeps it out.
-Other bots and all webhooks there are ignored, and an edit only re-forwards a host
-announcement. A native bot post counts as an announcement when it was sent through binding
-outreach (`POST /bindings/{id}/messages`, which Release Manager uses) or by no recorded
-delivery at all; what the channel's own session wrote (answers to members, tool progress,
-bridge notices) is conversation and is never forwarded. Because the outbox records a
-post's Discord ID only after Discord answers, a native post seen before that is retried
-in order for up to a minute before it is treated as unrecorded.
+for Agent posting. Only host announcements are forwarded, as non-interactive announcement
+create/update events:
+
+- a native bot post sent through binding outreach with `"announcement": true` (see "Stating
+  an announcement" below), which is how Release Manager posts (`native_host`);
+- a top-level post by a human who owns the guild or holds Manage Server or Administrator
+  there (`human`).
+
+A host announcement never enters a native Agent binding, and an edit re-forwards it because
+it follows the same rule. Everything else there is not forwarded. A member's message, or a
+host's Discord reply to another message, takes the ordinary inbound path of a bound guild
+channel (binding, DM rules, behavior and response mode, mentions and replies, inbound
+Sentinel, typing), so the native Agent sees it and can answer a question asked under an
+announcement; a `silent-host` scope still keeps it out. Other bots and all webhooks there
+are ignored. Every other native bot post is conversation, never an announcement: outreach
+without the flag (an owner discussion answering someone), the channel's own session
+(answers, tool progress, bridge notices), and a post no outbound delivery recorded. Because
+the outbox records a post's Discord ID only after Discord answers, a native post seen before
+that is retried in order for up to a minute, then treated as unrecorded and not forwarded.
 
 In participant mode, a webhook message reaches the native Agent only when
 the relay verifies that it addressed the registered host participant by reply, role,
@@ -601,6 +606,18 @@ reply from `GET /bindings/{entityId}/transcript`. Each send renews the subscript
 hours, and a binding keeps at most 8 subscribers. Automation callers have no discussion and
 never subscribe. Send `"notifyReplies": false` to opt out for one message. The send response
 includes `replyCallback` (`discussionId`, `expiresAt`) when a subscription was recorded.
+
+### Stating an announcement
+
+`"announcement": true` on `POST /bindings/{entityId}/messages` (default `false`) states that
+the message is an announcement. It only matters in a Leaf Community `#announcements`
+channel, where only such a native post is forwarded to Leaf Community (see above). The flag
+grants nothing: every caller that reaches this route may already post anything there as the
+native bot. Each outbound delivery row records it as `announcement`, with the signed caller
+as `outreach_caller` (`app`, `actor_kind`, `actor_entity_id`) for audit. An exact retry
+keeps the first request's intent; reusing the idempotency key with the other value returns
+`400 invalid_message`. Edits through `/messages/{messageUid}/edit` keep the original row and
+therefore its intent.
 
 ### Leading a conversation from a private discussion
 

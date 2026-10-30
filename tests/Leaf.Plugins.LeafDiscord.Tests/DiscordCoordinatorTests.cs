@@ -1,6 +1,8 @@
 ﻿using System.Net;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Leaf.Plugins.LeafDiscord;
+using Leaf.Sdk;
 using Leaf.Sdk.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -338,6 +340,71 @@ public sealed class DiscordCoordinatorTests
             "/ai-session/sessions/existing-session/inject", request.Uri,
             StringComparison.Ordinal));
         Assert.Single(await deliveries.PendingOutboundAsync(binding.BindingId));
+    }
+
+    [Fact]
+    public async Task Outreach_records_its_announcement_intent_and_signed_caller_on_every_chunk()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var bindings = new DiscordBindingStore(entities);
+        var deliveries = new DiscordDeliveryStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", "owner-1",
+            "nova-discord-external", "participate", "announcements"));
+        var provider = new FlakyProvider(false);
+        binding = await bindings.AttachConversationAsync(binding, new ExternalConversationHandle(
+            provider.ProviderId, binding.BindingId, binding.Generation,
+            "existing-conversation", "existing-session"));
+        using var coordinator = new DiscordConversationCoordinator(
+            bindings, deliveries, BotConfigurations(entities),
+            new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
+            new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
+            new DiscordEgressGuard(), new DiscordTypingLeases(),
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+        var announcement = new DiscordOutreachProvenance(true, "nova", "agent", "agent-entity-1");
+        var longNotes = string.Join('\n', Enumerable.Repeat("Nightly notes line.", 150));
+
+        var posted = await coordinator.SendExistingProactiveAsync(
+            binding, "leaf-release-1", longNotes, null, [], announcement);
+        var answered = await coordinator.SendExistingProactiveAsync(
+            binding, "answer-1", "Oui, c'est corrigé.", null, [],
+            announcement with { Announcement = false });
+        var legacy = await coordinator.SendExistingProactiveAsync(
+            binding, "legacy-1", "Bonjour.");
+
+        var rows = (await entities.QueryAsync(new EntityQuery
+        {
+            TypeSlug = DiscordDeliveryStore.TypeSlug,
+            DataEquals = new Dictionary<string, object?> { ["direction"] = "outbound" },
+            Limit = 100,
+        })).ToList();
+        var postedRows = rows.Where(row =>
+            JsonRead.String(row.Data, "message_uid") == posted.MessageUid).ToList();
+        Assert.True(postedRows.Count > 1);
+        Assert.All(postedRows, row =>
+        {
+            Assert.True(row.Data["announcement"]!.GetValue<bool>());
+            Assert.Equal("nova", JsonRead.String((JsonObject)row.Data["outreach_caller"]!, "app"));
+            Assert.Equal("agent",
+                JsonRead.String((JsonObject)row.Data["outreach_caller"]!, "actor_kind"));
+            Assert.Equal("agent-entity-1",
+                JsonRead.String((JsonObject)row.Data["outreach_caller"]!, "actor_entity_id"));
+        });
+        var answeredRow = Assert.Single(rows, row =>
+            JsonRead.String(row.Data, "message_uid") == answered.MessageUid);
+        Assert.False(answeredRow.Data["announcement"]!.GetValue<bool>());
+        var legacyRow = Assert.Single(rows, row =>
+            JsonRead.String(row.Data, "message_uid") == legacy.MessageUid);
+        Assert.Null(legacyRow.Data["announcement"]);
+
+        // An exact retry keeps the first intent; the key cannot be reused to change it.
+        var retry = await coordinator.SendExistingProactiveAsync(
+            binding, "leaf-release-1", longNotes, null, [], announcement);
+        Assert.Equal(posted.MessageUid, retry.MessageUid);
+        await Assert.ThrowsAsync<ArgumentException>(() => coordinator.SendExistingProactiveAsync(
+            binding, "answer-1", "Oui, c'est corrigé.", null, [], announcement));
     }
 
     [Fact]

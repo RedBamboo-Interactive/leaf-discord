@@ -371,7 +371,7 @@ public sealed class DiscordConversationCoordinator(
         string content,
         CancellationToken ct = default)
         => SendProactiveCoreAsync(
-            binding, requestId, content, null, null, null, null, [], ct);
+            binding, requestId, content, null, null, null, null, [], null, ct);
 
     public Task<(DiscordBinding Binding, string MessageUid)> RecordDeliveredProactiveAsync(
         DiscordBinding binding,
@@ -380,7 +380,7 @@ public sealed class DiscordConversationCoordinator(
         string discordMessageId,
         CancellationToken ct = default)
         => SendProactiveCoreAsync(
-            binding, requestId, content, null, null, discordMessageId, null, [], ct);
+            binding, requestId, content, null, null, discordMessageId, null, [], null, ct);
 
     public Task<(DiscordBinding Binding, string MessageUid)> RecordDeliveredProactiveAsync(
         DiscordBinding binding,
@@ -392,7 +392,7 @@ public sealed class DiscordConversationCoordinator(
         CancellationToken ct = default)
         => SendProactiveCoreAsync(
             binding, requestId, content, null, null, discordMessageId,
-            deliveryContent, outputAssets, ct);
+            deliveryContent, outputAssets, null, ct);
 
 
     public async Task<DiscordBinding> EnsureReadyAsync(
@@ -427,13 +427,24 @@ public sealed class DiscordConversationCoordinator(
         string? deliveryContent,
         IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
         CancellationToken ct = default)
+        => SendExistingProactiveAsync(
+            binding, requestId, content, deliveryContent, outputAssets, null, ct);
+
+    public Task<(DiscordBinding Binding, string MessageUid)> SendExistingProactiveAsync(
+        DiscordBinding binding,
+        string requestId,
+        string content,
+        string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset> outputAssets,
+        DiscordOutreachProvenance? provenance,
+        CancellationToken ct = default)
     {
         if (binding.SessionId is null || binding.ConversationHandleId is null)
             throw new DiscordBindingSessionChangedException(
                 "The Discord binding has no existing Agent session");
         return SendProactiveCoreAsync(
             binding, requestId, content, binding.Generation, binding.SessionId,
-            null, deliveryContent, outputAssets, ct);
+            null, deliveryContent, outputAssets, provenance, ct);
     }
 
     internal DiscordPreparedCorrection InspectCorrection(
@@ -493,6 +504,7 @@ public sealed class DiscordConversationCoordinator(
         string? deliveredDiscordMessageId,
         string? deliveryContent,
         IReadOnlyList<ExternalConversationOutputAsset>? outputAssets,
+        DiscordOutreachProvenance? provenance,
         CancellationToken ct)
     {
         // A message delivered before its transcript copy existed was reviewed by its caller
@@ -565,23 +577,33 @@ public sealed class DiscordConversationCoordinator(
             var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
             for (var i = 0; i < deliveryCount; i++)
             {
+                var extra = review is null
+                    ? new JsonObject
+                    {
+                        ["review_exempt"] = DiscordDeliveryStore.DeliveredBeforeTranscriptExemption,
+                    }
+                    : new JsonObject
+                    {
+                        ["outbound_review"] = review.DeepClone(),
+                        ["review_action"] = JsonRead.String(review, "outcome"),
+                    };
+                if (provenance is not null)
+                {
+                    extra["announcement"] = provenance.Announcement;
+                    extra["outreach_caller"] = provenance.CallerJson();
+                }
                 var delivery = await deliveries.EnqueueOutboundAsync(
                     binding,
                     message,
                     i,
                     i < chunks.Count ? chunks[i] : "",
                     i < assetGroups.Length ? assetGroups[i] : [],
-                    review is null
-                        ? new JsonObject
-                        {
-                            ["review_exempt"] = DiscordDeliveryStore.DeliveredBeforeTranscriptExemption,
-                        }
-                        : new JsonObject
-                        {
-                            ["outbound_review"] = review.DeepClone(),
-                            ["review_action"] = JsonRead.String(review, "outcome"),
-                        },
+                    extra,
                     ct);
+                // An exact retry finds the first request's rows; its intent must not change.
+                if (provenance is not null && delivery.Announcement != provenance.Announcement)
+                    throw new ArgumentException(
+                        "This idempotency key was already used with a different announcement intent.");
                 if (deliveredDiscordMessageId is not null)
                 {
                     if (deliveryCount != 1)
@@ -623,15 +645,8 @@ public sealed class DiscordConversationCoordinator(
         }
     }
 
-    private const string OutreachMessageUidPrefix = "discord-outreach-";
-
     internal static string OutreachMessageUid(DiscordBinding binding, string requestId)
-        => $"{OutreachMessageUidPrefix}{DiscordBindingStore.Hash($"{binding.BindingId}:{binding.Generation}:{requestId}")}";
-
-    /// <summary>Whether a message was sent through binding outreach rather than written by the
-    /// binding's own session (its replies, progress and bridge notices).</summary>
-    internal static bool IsOutreachMessageUid(string messageUid)
-        => messageUid.StartsWith(OutreachMessageUidPrefix, StringComparison.Ordinal);
+        => $"discord-outreach-{DiscordBindingStore.Hash($"{binding.BindingId}:{binding.Generation}:{requestId}")}";
 
     /// <summary>
     /// Applies the outreach egress contract without side effects, so a caller that must

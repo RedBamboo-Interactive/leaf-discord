@@ -117,34 +117,52 @@ public sealed class DiscordCommonsTests
     private const ulong NativeBotId = 99;
 
     [Theory]
-    [InlineData("native bot", MessageSource.Bot, true, NativeBotId, false, 0UL, true)]
-    [InlineData("another bot", MessageSource.Bot, true, 98UL, false, 0UL, false)]
+    [InlineData("native bot", MessageSource.Bot, true, NativeBotId, false, 0UL, false, true)]
+    [InlineData("another bot", MessageSource.Bot, true, 98UL, false, 0UL, false, false)]
     [InlineData("another bot with Administrator", MessageSource.Bot, true, 98UL, false,
-        (ulong)GuildPermission.Administrator, false)]
-    [InlineData("webhook", MessageSource.Webhook, true, 97UL, false, 0UL, false)]
+        (ulong)GuildPermission.Administrator, false, false)]
+    [InlineData("webhook", MessageSource.Webhook, true, 97UL, false, 0UL, false, false)]
     [InlineData("webhook named like the native bot", MessageSource.Webhook, true, NativeBotId,
-        false, 0UL, false)]
-    [InlineData("guild owner", MessageSource.User, false, 20UL, true, 0UL, true)]
+        false, 0UL, false, false)]
+    [InlineData("guild owner", MessageSource.User, false, 20UL, true, 0UL, false, true)]
     [InlineData("Manage Server", MessageSource.User, false, 21UL, false,
-        (ulong)GuildPermission.ManageGuild, true)]
+        (ulong)GuildPermission.ManageGuild, false, true)]
     [InlineData("Administrator", MessageSource.User, false, 22UL, false,
-        (ulong)GuildPermission.Administrator, true)]
+        (ulong)GuildPermission.Administrator, false, true)]
     [InlineData("plain member", MessageSource.User, false, 23UL, false,
-        (ulong)(GuildPermission.SendMessages | GuildPermission.ManageMessages), false)]
-    public void Only_the_native_bot_and_guild_managers_are_announcement_hosts(
+        (ulong)(GuildPermission.SendMessages | GuildPermission.ManageMessages), false, false)]
+    [InlineData("guild owner replying", MessageSource.User, false, 20UL, true, 0UL, true, false)]
+    [InlineData("Manage Server replying", MessageSource.User, false, 21UL, false,
+        (ulong)GuildPermission.ManageGuild, true, false)]
+    [InlineData("Administrator replying", MessageSource.User, false, 22UL, false,
+        (ulong)GuildPermission.Administrator, true, false)]
+    [InlineData("plain member replying", MessageSource.User, false, 23UL, false, 0UL, true, false)]
+    public void Only_the_native_bot_and_guild_managers_posting_top_level_are_announcement_hosts(
         string _, MessageSource source, bool authorIsBot, ulong authorId,
-        bool ownsGuild, ulong permissions, bool expected)
+        bool ownsGuild, ulong permissions, bool repliesToMessage, bool expected)
     {
         Assert.Equal(expected, DiscordBotRuntime.IsAnnouncementHost(
             source, authorIsBot, authorId, NativeBotId, ownsGuild,
-            new GuildPermissions(permissions)));
+            new GuildPermissions(permissions), repliesToMessage));
     }
 
     [Fact]
     public void No_native_bot_identity_means_no_bot_announces()
     {
         Assert.False(DiscordBotRuntime.IsAnnouncementHost(
-            MessageSource.Bot, true, NativeBotId, null, false, GuildPermissions.None));
+            MessageSource.Bot, true, NativeBotId, null, false, GuildPermissions.None, false));
+    }
+
+    [Fact]
+    public void A_host_reply_in_announcements_takes_the_member_path()
+    {
+        var hostReply = DiscordBotRuntime.IsAnnouncementHost(
+            MessageSource.User, false, 20, NativeBotId, true, GuildPermissions.All, true);
+
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(announcementHost: hostReply));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: hostReply, edit: true));
     }
 
     private static DiscordCommonsInboundRoute Route(

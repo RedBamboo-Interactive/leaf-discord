@@ -103,6 +103,8 @@ public sealed class DiscordEndpointAuthorizationTests
         Assert.NotNull(caller);
         Assert.Equal("00000000-0000-4000-8000-000000000004", caller.ActorEntityId);
         Assert.Equal("00000000-0000-4000-8000-000000000001", caller.BeneficiaryId);
+        Assert.Equal("nova", caller.AppId);
+        Assert.Equal("agent", caller.ActorKind);
     }
 
     [Fact]

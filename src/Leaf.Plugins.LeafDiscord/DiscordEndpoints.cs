@@ -21,7 +21,8 @@ public sealed record DiscordBindingMessageRequest(
     IReadOnlyList<DiscordBindingOutputAssetRequest>? OutputAssets = null,
     bool NotifyReplies = true,
     bool? LeadConversation = null,
-    int? LeadForMinutes = null);
+    int? LeadForMinutes = null,
+    bool Announcement = false);
 
 public sealed record DiscordBindingOutputAssetRequest(
     string AssetId,
@@ -1444,6 +1445,9 @@ public static class DiscordEndpoints
                         .Select(asset => new ExternalConversationOutputAsset(
                             asset.AssetId, asset.Description))
                         .ToArray(),
+                    new DiscordOutreachProvenance(
+                        request.Announcement, caller.AppId, caller.ActorKind,
+                        caller.ActorEntityId),
                     ct);
                 sent = true;
                 var replyCallback = await SubscribeRepliesAsync(
@@ -2765,11 +2769,13 @@ public static class DiscordEndpoints
         {
             using var document = JsonDocument.Parse(raw);
             var root = document.RootElement;
-            if (root.GetProperty("app").GetProperty("id").GetString() != "nova")
+            var appId = root.GetProperty("app").GetProperty("id").GetString();
+            if (appId != "nova")
                 return null;
             var actor = root.GetProperty("actor");
             var beneficiary = root.GetProperty("beneficiary");
-            if (actor.GetProperty("kind").GetString() != "agent"
+            var actorKind = actor.GetProperty("kind").GetString();
+            if (actorKind != "agent"
                 || beneficiary.GetProperty("kind").GetString() != "user")
                 return null;
             var actorEntityId = actor.GetProperty("entityId").GetString();
@@ -2802,10 +2808,16 @@ public static class DiscordEndpoints
                 return new LeafAgentCaller(actorEntityId, beneficiaryId)
                 {
                     DiscussionId = discussionId,
+                    AppId = appId,
+                    ActorKind = actorKind,
                 };
             return allowAuthorizedAutomation && automationIds.Count == 1
                 ? new LeafAgentCaller(actorEntityId, beneficiaryId,
                     automationIds.Single())
+                {
+                    AppId = appId,
+                    ActorKind = actorKind,
+                }
                 : null;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException
@@ -2833,4 +2845,8 @@ internal sealed record LeafAgentCaller(
 {
     /// <summary>The signed private discussion the call came from, when there is one.</summary>
     public string? DiscussionId { get; init; }
+
+    /// <summary>The signed execution app and actor kind (only <c>nova</c> agents are read).</summary>
+    public string AppId { get; init; } = "nova";
+    public string ActorKind { get; init; } = "agent";
 }
