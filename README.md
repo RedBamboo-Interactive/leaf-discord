@@ -408,7 +408,12 @@ takes the ordinary inbound path of a bound guild channel (binding, DM rules, beh
 response mode, mentions and replies, inbound Sentinel, typing), so the native Agent can
 answer a question asked under an announcement; a `silent-host` scope still keeps it out.
 Other bots and all webhooks there are ignored, and an edit only re-forwards a host
-announcement.
+announcement. A native bot post counts as an announcement when it was sent through binding
+outreach (`POST /bindings/{id}/messages`, which Release Manager uses) or by no recorded
+delivery at all; what the channel's own session wrote (answers to members, tool progress,
+bridge notices) is conversation and is never forwarded. Because the outbox records a
+post's Discord ID only after Discord answers, a native post seen before that is retried
+in order for up to a minute before it is treated as unrecorded.
 
 In participant mode, a webhook message reaches the native Agent only when
 the relay verifies that it addressed the registered host participant by reply, role,

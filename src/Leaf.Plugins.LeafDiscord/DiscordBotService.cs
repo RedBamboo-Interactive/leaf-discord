@@ -2719,13 +2719,40 @@ internal sealed class DiscordBotRuntime(
                  || authorPermissions.ManageGuild
                  || authorPermissions.Administrator);
 
+    /// <summary>
+    /// How long the native bot's own post may wait for its outbound delivery to record the
+    /// Discord ID. The outbox records it right after Discord answers, and the Gateway event
+    /// can arrive first.
+    /// </summary>
+    internal static readonly TimeSpan NativeAnnouncementReceiptGrace = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Whether the native bot's post in <c>#announcements</c> is an announcement. Posts sent
+    /// through binding outreach are, which is how Release Manager posts. So is a post no
+    /// delivery sent. What the channel's own session wrote (its answers to members, tool
+    /// progress, bridge notices) is conversation, never an announcement. A recent post whose
+    /// delivery has not recorded its Discord ID yet is undecided (null).
+    /// </summary>
+    internal static bool? IsNativeAnnouncementPost(string? sentMessageUid, TimeSpan age)
+        => sentMessageUid is null
+            ? age < NativeAnnouncementReceiptGrace ? null : true
+            : DiscordConversationCoordinator.IsOutreachMessageUid(sentMessageUid);
+
     private async Task<bool> IsAnnouncementHostAsync(IUserMessage message)
     {
         if (message.Source == MessageSource.Webhook) return false;
         if (message.Author.IsBot)
-            return IsAnnouncementHost(
-                message.Source, true, message.Author.Id, client?.CurrentUser?.Id,
-                false, GuildPermissions.None);
+        {
+            if (!IsAnnouncementHost(
+                    message.Source, true, message.Author.Id, client?.CurrentUser?.Id,
+                    false, GuildPermissions.None))
+                return false;
+            return IsNativeAnnouncementPost(
+                    await deliveries.FindSentMessageUidAsync(message.Id.ToString()),
+                    DateTimeOffset.UtcNow - message.Timestamp)
+                ?? throw new DiscordGatewayInboxDeferredException(
+                    "the native post's delivery has not recorded its Discord ID yet");
+        }
         if (message.Channel is not IGuildChannel { Guild: { } guild }) return false;
         // A refetched message can carry a plain user; ask the guild for the member. A member
         // who already left holds no permission here.
@@ -2965,6 +2992,17 @@ internal sealed class DiscordBotRuntime(
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 throw;
+            }
+            catch (DiscordGatewayInboxDeferredException ex)
+            {
+                await gatewayInbox.MarkRetryAsync(
+                    item,
+                    "deferred",
+                    DiscordGatewayInboxStore.RetryDelay(item.Attempts),
+                    ct);
+                logger.LogInformation(
+                    "Discord gateway inbox message {MessageId} deferred: {Reason}",
+                    item.MessageId, ex.Message);
             }
             catch (HttpException ex) when (ex.HttpCode == HttpStatusCode.NotFound)
             {
@@ -4855,6 +4893,9 @@ internal enum DiscordCommonsInboundNext
 internal readonly record struct DiscordCommonsInboundRoute(
     bool Forward,
     DiscordCommonsInboundNext Next);
+
+/// <summary>A gateway inbox item that cannot be decided yet; it is retried in order.</summary>
+internal sealed class DiscordGatewayInboxDeferredException(string reason) : Exception(reason);
 
 internal sealed record DiscordTransportStatus(
     string State,

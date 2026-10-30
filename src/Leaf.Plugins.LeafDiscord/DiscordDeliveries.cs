@@ -186,6 +186,25 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
         }, ct)).Select(Map).Any(item => item.Generation == binding.Generation);
     }
 
+    /// <summary>
+    /// The message UID of the outbound delivery that sent one Discord message, or null when no
+    /// delivery has recorded that Discord ID (yet: the ID is recorded once Discord answers).
+    /// </summary>
+    public async Task<string?> FindSentMessageUidAsync(
+        string discordMessageId, CancellationToken ct = default)
+        => (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["discord_id"] = discordMessageId,
+            },
+            Limit = 10,
+        }, ct)).Select(Map)
+            .Select(item => item.MessageUid)
+            .FirstOrDefault(uid => !string.IsNullOrWhiteSpace(uid));
+
     private static string InboundSlug(string applicationId, string discordMessageId)
         => $"discord-in-{DiscordBindingStore.Hash($"{applicationId}:{discordMessageId}")}";
 

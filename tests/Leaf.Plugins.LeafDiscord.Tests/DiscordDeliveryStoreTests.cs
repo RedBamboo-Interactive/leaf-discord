@@ -404,6 +404,63 @@ public sealed class DiscordDeliveryStoreTests
     }
 
     [Fact]
+    public async Task Only_outreach_native_posts_in_announcements_are_announcements()
+    {
+        var store = new MemoryEntityStore();
+        var deliveries = new DiscordDeliveryStore(store);
+        var binding = await CreateBindingAsync(store);
+        var settled = DiscordBotRuntime.NativeAnnouncementReceiptGrace + TimeSpan.FromSeconds(1);
+
+        async Task<bool?> SentAs(string uid, string discordId, Func<ExternalConversationMessage,
+            Task<DiscordDelivery>> enqueue)
+        {
+            await deliveries.MarkSentAsync(
+                await enqueue(Assistant(uid, "text")), discordId);
+            return DiscordBotRuntime.IsNativeAnnouncementPost(
+                await deliveries.FindSentMessageUidAsync(discordId), TimeSpan.Zero);
+        }
+
+        // Release Manager posts through binding outreach.
+        Assert.True(await SentAs(
+            DiscordConversationCoordinator.OutreachMessageUid(binding, "nightly-42"),
+            "1559000000000000100",
+            message => deliveries.EnqueueOutboundAsync(binding, message, 0, "Nightly")));
+        // The channel's own session answering a member.
+        Assert.False(await SentAs(
+            "turn-reply-1", "1559000000000000101",
+            message => deliveries.EnqueueOutboundForReviewAsync(
+                binding, message, 0, "Bonne question", [], 1, "turn-1", false)));
+        Assert.False(await SentAs(
+            DiscordConversationCoordinator.NoticeMessageUid(binding, "1559000000000000050"),
+            "1559000000000000102",
+            message => deliveries.EnqueueOutboundAsync(binding, message, 0, "notice")));
+        Assert.False(await SentAs(
+            "turn-progress-1", "1559000000000000103",
+            async message => (await deliveries.EnqueueProgressAsync(
+                binding, message, "Je regarde", null))!));
+
+        // Not recorded yet: wait for the outbox, then a post no delivery sent is the host's.
+        Assert.Null(await deliveries.FindSentMessageUidAsync("1559000000000000104"));
+        Assert.Null(DiscordBotRuntime.IsNativeAnnouncementPost(null, TimeSpan.FromSeconds(2)));
+        Assert.True(DiscordBotRuntime.IsNativeAnnouncementPost(null, settled));
+    }
+
+    [Fact]
+    public async Task A_queued_delivery_has_no_sent_message_uid_until_discord_answers()
+    {
+        var store = new MemoryEntityStore();
+        var deliveries = new DiscordDeliveryStore(store);
+        var binding = await CreateBindingAsync(store);
+        var queued = await deliveries.EnqueueOutboundAsync(
+            binding, Assistant("turn-queued", "text"), 0, "text");
+
+        Assert.Null(await deliveries.FindSentMessageUidAsync("1559000000000000200"));
+        await deliveries.MarkSentAsync(queued, "1559000000000000200");
+        Assert.Equal("turn-queued",
+            await deliveries.FindSentMessageUidAsync("1559000000000000200"));
+    }
+
+    [Fact]
     public async Task Clear_generation_and_new_session_are_persisted_together()
     {
         var store = new MemoryEntityStore();

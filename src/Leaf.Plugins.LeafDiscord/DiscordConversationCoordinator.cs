@@ -623,8 +623,15 @@ public sealed class DiscordConversationCoordinator(
         }
     }
 
-    private static string OutreachMessageUid(DiscordBinding binding, string requestId)
-        => $"discord-outreach-{DiscordBindingStore.Hash($"{binding.BindingId}:{binding.Generation}:{requestId}")}";
+    private const string OutreachMessageUidPrefix = "discord-outreach-";
+
+    internal static string OutreachMessageUid(DiscordBinding binding, string requestId)
+        => $"{OutreachMessageUidPrefix}{DiscordBindingStore.Hash($"{binding.BindingId}:{binding.Generation}:{requestId}")}";
+
+    /// <summary>Whether a message was sent through binding outreach rather than written by the
+    /// binding's own session (its replies, progress and bridge notices).</summary>
+    internal static bool IsOutreachMessageUid(string messageUid)
+        => messageUid.StartsWith(OutreachMessageUidPrefix, StringComparison.Ordinal);
 
     /// <summary>
     /// Applies the outreach egress contract without side effects, so a caller that must
