@@ -2652,7 +2652,7 @@ public static class DiscordEndpoints
     internal static IResult? ValidateLeadRequest(
         DiscordBindingMessageRequest request, LeafAgentCaller caller)
     {
-        var maxMinutes = (int)DiscordConversationLeadStore.DefaultWindow.TotalMinutes;
+        var maxMinutes = (int)DiscordConversationLeadStore.MaxWindow.TotalMinutes;
         if (request.LeadForMinutes is { } minutes)
         {
             if (request.LeadConversation != true)

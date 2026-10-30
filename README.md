@@ -608,21 +608,21 @@ POST /bindings/{entityId}/messages
 ```
 
 - `leadConversation: true` needs a signed private discussion caller and reply callbacks
-  (`lead_requires_discussion`, `lead_requires_reply_callback`). `leadForMinutes` (1-2880) is
-  optional; the default window is the reply-callback window, 48 hours. Each later message from
-  the leading discussion, with or without the flag, renews the window.
+  (`lead_requires_discussion`, `lead_requires_reply_callback`). `leadForMinutes` is
+  optional. The default window is 60 minutes, so a forgotten lead does not silence the session
+  for long. The maximum is 2880 minutes, the 48-hour reply-callback window. Each later message
+  from the leading discussion, with or without the flag, renews the window from that message.
   `leadConversation: false` from the leader sends the message and then hands back.
   `DELETE /bindings/{entityId}/lead` hands back early. A discussion can end only its own lead,
   while the owner in the Leaf UI can end any. While one discussion leads, another one that
   asks to lead gets `409 discord_conversation_led_elsewhere`. Messages sent without the flag
-  are delivered as before.
+  are delivered and answered as before.
 - While the discussion leads, inbound messages are admitted exactly as before: same inbound
   Sentinel review, same transcript, same reply callback. The session still runs its turn, so
   its own history stays complete and in order. Each turn carries a trusted
   `discord_conversation_lead` block (`leaf-discord-conversation-lead/v1`, `state:
   owner_leads`, `reply_policy: observe_only`) with the leader's messages since the session's
-  last turn. A transcript injection never reaches the session's model, so this block is the
-  only way the session learns what was said for it. The bridge posts nothing the session
+  last turn (see "Owner messages reach the session" below). The bridge posts nothing the session
   writes for a led turn: replies, tool markers, and typing stay off Discord, and the session's
   own `POST /reactions` returns `409 discord_conversation_owner_leads`. Those replies are
   listed as unposted, and the transcript marks them `metadata.discord.conversationLead.posted:
@@ -640,6 +640,20 @@ POST /bindings/{entityId}/messages
   hands back). The status also carries counts of pending owner messages and unposted
   replies. Reply notices carry `conversation_lead` (`state`, `lead_discussion_id`,
   `this_discussion_leads`, `expires_at`).
+
+### Owner messages reach the session
+
+An outreach message is a transcript injection, and an injection never reaches the session's
+model: Claude Code and Codex sessions resume their own history. Without help, the session cannot
+know what the owner said in its name, and it may contradict it. So every owner message sent into
+a binding waits, with or without a lead. This covers `POST /bindings/{entityId}/messages`, owner
+DM openings, forum starters, and the session's own `outreach/dm` into another binding. The next
+admitted turn carries it in the same trusted `discord_conversation_lead` block. Outside a lead,
+that block is `state: session_leads`, `reply_policy: answer`, and `owner_messages` (oldest
+first, at most 12, each at most 4000 characters, with `omitted_owner_messages` counting any
+overflow). It is delivered once, and turns with nothing pending carry no block. Outside a lead,
+nothing else changes: replies, tool markers, typing, reactions, and outbound review stay as they
+were. A turn the inbound Sentinel refuses keeps the messages waiting for its retry.
 
 ### Recovering queued turns after a restart
 

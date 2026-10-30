@@ -119,15 +119,15 @@ public sealed class DiscordConversationLeadTests
         h.Clock.Advance(TimeSpan.FromMinutes(31));
         Assert.Equal(DiscordConversationLeadStore.HandingBackState,
             DiscordConversationLeadStore.Project(await h.Leads.GetAsync(h.Binding), h.Clock.GetUtcNow()).State);
-        // An owner message after the lead ended is ordinary outreach again: nothing is kept.
-        await h.Coordinator.SendExistingProactiveAsync(h.Binding, "late-1", "Merci !");
+        // Sent after the lead ended: ordinary outreach, which the session must still hear.
+        var late = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "late-1", "Merci !");
         await h.SubmitAsync("1002", "c'est bon, ça marche");
 
         var handback = h.Provider.Inputs[^1].Metadata!["discord_conversation_lead"]!.AsObject();
         Assert.Equal("handed_back", handback["state"]!.GetValue<string>());
         Assert.Equal("answer", handback["reply_policy"]!.GetValue<string>());
         Assert.Equal("expired", handback["end_reason"]!.GetValue<string>());
-        Assert.Equal([second.MessageUid], handback["owner_messages"]!.AsArray()
+        Assert.Equal([second.MessageUid, late.MessageUid], handback["owner_messages"]!.AsArray()
             .Select(item => item!["message_uid"]!.GetValue<string>()));
         Assert.Equal(["reply-1"], handback["unposted_replies"]!.AsArray().Select(item => item!.GetValue<string>()));
         Assert.DoesNotContain(first.MessageUid, handback.ToJsonString());
@@ -176,22 +176,67 @@ public sealed class DiscordConversationLeadTests
     }
 
     [Fact]
-    public async Task Without_a_lead_nothing_changes()
+    public async Task Outside_a_lead_the_next_turn_carries_the_owner_messages_and_replies_are_unchanged()
     {
         var h = await Harness.CreateAsync();
-        var owner = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "hello-1", "Bonjour !");
-        await h.SubmitAsync("1001", "salut");
+        // No outreach yet: the turn is exactly what it was before conversation leads existed.
+        await h.SubmitAsync("1000", "salut");
+        Assert.DoesNotContain(h.Provider.Inputs[^1].Metadata!, pair => pair.Key == "discord_conversation_lead");
 
-        Assert.DoesNotContain(h.Provider.Inputs[0].Metadata!, pair => pair.Key == "discord_conversation_lead");
-        h.Reply(1, owner.MessageUid, "Bonjour !");
-        h.Reply(2, "reply-1", "Comment ça va ?");
+        // 28 Oct: the owner approves a plan from a private discussion, without leading.
+        var approve = await h.Coordinator.SendExistingProactiveAsync(
+            h.Binding, "approve-1", "Accord pour la correction: désactive la tâche planifiée.");
+        var steps = await h.Coordinator.SendExistingProactiveAsync(
+            h.Binding, "steps-1", "Ensuite lance le launcher une fois.");
+        Assert.Equal(DiscordConversationLeadStore.SessionState,
+            DiscordConversationLeadStore.Project(await h.Leads.GetAsync(h.Binding), h.Clock.GetUtcNow()).State);
+        Assert.Equal(2, DiscordConversationLeadStore.Project(
+            await h.Leads.GetAsync(h.Binding), h.Clock.GetUtcNow()).PendingOwnerMessages);
+        await h.SubmitAsync("1001", "ok je lance");
+
+        var context = h.Provider.Inputs[^1].Metadata!["discord_conversation_lead"]!.AsObject();
+        Assert.Equal("trusted_bridge_state", context["trust"]!.GetValue<string>());
+        Assert.Equal("session_leads", context["state"]!.GetValue<string>());
+        Assert.Equal("answer", context["reply_policy"]!.GetValue<string>());
+        Assert.Null(context["lead_started_at"]);
+        Assert.Null(context["lead_expires_at"]);
+        Assert.Null(context["end_reason"]);
+        Assert.Empty(context["unposted_replies"]!.AsArray());
+        var relayed = context["owner_messages"]!.AsArray().Select(item => item!.AsObject()).ToArray();
+        Assert.Equal([approve.MessageUid, steps.MessageUid],
+            relayed.Select(item => item["message_uid"]!.GetValue<string>()));
+        Assert.Equal("Accord pour la correction: désactive la tâche planifiée.",
+            relayed[0]["content"]!.GetValue<string>());
+        // The participant's message is unchanged and still untrusted.
+        Assert.Equal("ok je lance", h.Provider.Inputs[^1].Content);
+        Assert.True(h.Provider.Inputs[^1].Metadata!["untrusted"]!.GetValue<bool>());
+
+        // Posting is unchanged: the session's reply goes through its outbound review and out;
+        // the owner's transcript copies keep their one reviewed row each.
+        h.Reply(1, approve.MessageUid, "Accord pour la correction: désactive la tâche planifiée.");
+        h.Reply(2, steps.MessageUid, "Ensuite lance le launcher une fois.");
+        h.Tool(3, "tool-1");
+        h.Reply(4, "reply-1", "Parfait, je te laisse faire.");
         await h.ReconcileAsync();
         Assert.Equal(DiscordDeliveryStore.ReviewingState, Assert.Single(await h.Rows("reply-1")).State);
-        Assert.Single(await h.Rows(owner.MessageUid));
-        Assert.Null(await h.Leads.GetAsync(h.Binding));
+        Assert.NotEmpty(await h.Rows("tool-1"));
+        Assert.Single(await h.Rows(approve.MessageUid));
+        Assert.Single(await h.Rows(steps.MessageUid));
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+        Assert.Equal("queued", Assert.Single(await h.Rows("reply-1")).State);
+        Assert.Contains(h.Sentinel.Requests, request => request.Content == "Parfait, je te laisse faire.");
+        Assert.Empty((await h.Leads.GetAsync(h.Binding))!.UnpostedReplies);
         Assert.Null(await h.Coordinator.ActiveLeadAsync(h.Binding));
-        Assert.Equal(DiscordConversationLeadStore.SessionState,
-            DiscordConversationLeadStore.Project(null, h.Clock.GetUtcNow()).State);
+        Assert.Null(await DiscordEndpoints.RejectWhileDiscussionLeadsAsync(
+            h.Binding, h.Leads, h.Clock.GetUtcNow(), default));
+
+        // Relayed once: the following turn carries nothing.
+        await h.SubmitAsync("1002", "merci");
+        Assert.DoesNotContain(h.Provider.Inputs[^1].Metadata!, pair => pair.Key == "discord_conversation_lead");
+        var status = DiscordConversationLeadStore.Project(await h.Leads.GetAsync(h.Binding), h.Clock.GetUtcNow());
+        Assert.Equal(DiscordConversationLeadStore.SessionState, status.State);
+        Assert.Equal(0, status.PendingOwnerMessages);
+        Assert.Null(status.LeadDiscussionId);
 
         var subscriptions = new DiscordReplySubscriptionStore(h.Entities);
         await subscriptions.SubscribeAsync(h.Binding, "d1", "owner-1", "agent-1", "m1", DateTimeOffset.UtcNow);
@@ -201,6 +246,68 @@ public sealed class DiscordConversationLeadTests
             .NotifyAsync(h.Binding, "1001", Takit, "salut", 0, "uid-1001", false, false, DateTimeOffset.UtcNow);
         Assert.Equal("session", Assert.Single(events.Published).Payload["conversation_lead"]!["state"]!
             .GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Outside_a_lead_owner_messages_wait_for_a_turn_the_inbound_sentinel_admits()
+    {
+        var h = await Harness.CreateAsync();
+        var owner = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "approve-1", "Accord.");
+        h.Provider.Refuse = true;
+
+        Assert.Equal(ExternalConversationDispositions.RefusedSentinelUnavailable,
+            (await h.SubmitAsync("1001", "ok"))!.Disposition);
+        Assert.Equal([owner.MessageUid],
+            (await h.Leads.GetAsync(h.Binding))!.OwnerMessages.Select(item => item.MessageUid));
+
+        h.Provider.Refuse = false;
+        h.Clock.Advance(TimeSpan.FromMinutes(1));
+        await h.Coordinator.RetryPendingAsync(h.Binding);
+        var context = h.Provider.Inputs[^1].Metadata!["discord_conversation_lead"]!;
+        Assert.Equal("session_leads", context["state"]!.GetValue<string>());
+        Assert.Equal(owner.MessageUid, context["owner_messages"]![0]!["message_uid"]!.GetValue<string>());
+        Assert.Empty((await h.Leads.GetAsync(h.Binding))!.OwnerMessages);
+    }
+
+    [Fact]
+    public async Task Owner_messages_sent_before_a_lead_ride_on_its_first_observed_turn()
+    {
+        var h = await Harness.CreateAsync();
+        var before = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "hello-1", "Bonjour !");
+        await h.ClaimAsync("d1", TimeSpan.FromMinutes(30));
+        var during = await h.Coordinator.SendExistingProactiveAsync(h.Binding, "approve-1", "Accord.");
+
+        await h.SubmitAsync("1001", "ok");
+
+        var context = h.Provider.Inputs[^1].Metadata!["discord_conversation_lead"]!;
+        Assert.Equal("owner_leads", context["state"]!.GetValue<string>());
+        Assert.Equal([before.MessageUid, during.MessageUid], context["owner_messages"]!.AsArray()
+            .Select(item => item!["message_uid"]!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task A_lead_lasts_an_hour_by_default_and_at_most_the_reply_callback_window()
+    {
+        Assert.Equal(TimeSpan.FromMinutes(60), DiscordConversationLeadStore.DefaultWindow);
+        Assert.Equal(DiscordReplySubscriptionStore.Lifetime, DiscordConversationLeadStore.MaxWindow);
+        var h = await Harness.CreateAsync();
+        var now = h.Clock.GetUtcNow();
+
+        var (lead, _) = await h.Leads.ClaimAsync(h.Binding, "d1", "owner-1", "agent-1",
+            DiscordConversationLeadStore.DefaultWindow, now);
+        Assert.Equal(now.AddHours(1), lead.ExpiresAt);
+        // Each leader message renews the hour from that message.
+        var renewed = await h.Leads.RenewAsync(h.Binding, "d1", null, now.AddMinutes(50));
+        Assert.Equal(now.AddMinutes(110), renewed!.ExpiresAt);
+        Assert.False(renewed.IsActive(now.AddMinutes(111)));
+
+        // An explicit window up to the maximum still works; beyond it is refused.
+        var (longest, _) = await h.Leads.ClaimAsync(h.Binding, "d1", "owner-1", "agent-1",
+            DiscordConversationLeadStore.MaxWindow, now.AddMinutes(200));
+        Assert.Equal(now.AddMinutes(200).AddHours(48), longest.ExpiresAt);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => h.Leads.ClaimAsync(
+            h.Binding, "d1", "owner-1", "agent-1",
+            DiscordConversationLeadStore.MaxWindow + TimeSpan.FromMinutes(1), now));
     }
 
     [Fact]

@@ -215,8 +215,9 @@ public sealed class DiscordConversationCoordinator(
             // whatever the session actually holds; only the session-bound turn is compacted.
             var serverMap = DiscordServerMapDisclosure.Plan(binding, guildContext);
             var sessionGuildContext = serverMap.GuildContext;
-            // A leading discussion changes only what the session is told and what the bridge
-            // posts afterwards. The turn itself, and its inbound review, are the same.
+            // Owner messages the session has not heard, and any lead, change only what the
+            // session is told and (while a discussion leads) what the bridge posts afterwards.
+            // The turn itself, and its inbound review, are the same.
             var lead = await leadStore.GetAsync(binding, ct);
             var leadContext = DiscordConversationLeadStore.SessionContext(lead, now);
             var metadata = new JsonObject
@@ -589,7 +590,7 @@ public sealed class DiscordConversationCoordinator(
                     await deliveries.MarkSentAsync(delivery, deliveredDiscordMessageId, ct);
                 }
             }
-            await RecordLedOwnerMessageAsync(binding, messageUid, prepared, ct);
+            await RelayOwnerMessageAsync(binding, messageUid, prepared, ct);
             return (binding, messageUid);
         }
         finally
@@ -599,11 +600,11 @@ public sealed class DiscordConversationCoordinator(
     }
 
     /// <summary>
-    /// The session never sees a transcript injection as its own turn, so a message sent into a
-    /// led conversation waits on the lead until the session's next admitted turn carries it.
-    /// The message is already queued; failing to remember it must not fail the send.
+    /// The session's model never sees a transcript injection, so every owner message, led or
+    /// not, waits until the session's next admitted turn carries it as trusted context. The
+    /// message is already queued; failing to remember it must not fail the send.
     /// </summary>
-    private async Task RecordLedOwnerMessageAsync(
+    private async Task RelayOwnerMessageAsync(
         DiscordBinding binding, string messageUid, DiscordPreparedOutreach prepared,
         CancellationToken ct)
     {
@@ -617,7 +618,7 @@ public sealed class DiscordConversationCoordinator(
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex,
-                "Discord message {MessageUid} on {BindingId} could not be kept for the led session",
+                "Discord message {MessageUid} on {BindingId} could not be kept for the session's next turn",
                 messageUid, binding.BindingId);
         }
     }

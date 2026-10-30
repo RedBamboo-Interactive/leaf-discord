@@ -6,7 +6,7 @@ using Leaf.Sdk.Services;
 
 namespace Leaf.Plugins.LeafDiscord;
 
-/// <summary>A message the leading discussion sent, kept until the binding's session has heard it.</summary>
+/// <summary>An owner message sent into the binding, kept until the binding's session has heard it.</summary>
 public sealed record DiscordConversationLeadMessage(
     string MessageUid,
     DateTimeOffset SentAt,
@@ -18,6 +18,9 @@ public sealed record DiscordConversationLeadMessage(
 /// but the bridge posts nothing it writes: the leading discussion is the only voice. When the
 /// lead ends (released, or its window elapsed without a new owner message), the session's next
 /// turn is told so, with the owner messages it never saw, and it answers on its own again.
+/// The same row also carries owner messages sent outside any lead: a transcript injection never
+/// reaches the session's model, so every owner message waits here for the session's next turn.
+/// A row whose <see cref="DiscussionId"/> is empty has never been led.
 /// </summary>
 public sealed record DiscordConversationLead(
     Guid EntityId,
@@ -40,14 +43,18 @@ public sealed record DiscordConversationLead(
     IReadOnlyList<string> LedTurns,
     IReadOnlyList<string> UnpostedHistory)
 {
-    public bool IsActive(DateTimeOffset now) => ReleasedAt is null && ExpiresAt > now;
+    /// <summary>Whether a discussion ever led this binding generation (not only relayed messages).</summary>
+    public bool EverLed => DiscussionId.Length > 0;
+
+    public bool IsActive(DateTimeOffset now) => EverLed && ReleasedAt is null && ExpiresAt > now;
 
     /// <summary>When the lead stopped: its release, or the end of its window.</summary>
     public DateTimeOffset? EndedAt(DateTimeOffset now)
         => ReleasedAt ?? (ExpiresAt <= now ? ExpiresAt : null);
 
     /// <summary>The lead ended and the session has not yet been told on an admitted turn.</summary>
-    public bool HandbackPending(DateTimeOffset now) => !IsActive(now) && HandbackRelayedAt is null;
+    public bool HandbackPending(DateTimeOffset now)
+        => EverLed && !IsActive(now) && HandbackRelayedAt is null;
 }
 
 /// <summary>What <c>GET /bindings</c> and the outreach response show about who answers.</summary>
@@ -80,9 +87,19 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
     public const string OwnerState = "owner";
     public const string HandingBackState = "handing_back";
 
-    /// <summary>Unless the request names a shorter one, a lead lasts as long as a reply callback.</summary>
-    public static readonly TimeSpan DefaultWindow = DiscordReplySubscriptionStore.Lifetime;
+    /// <summary>
+    /// A lead lasts an hour unless the request names another window; each leader message renews
+    /// it. A forgotten lead must not silence the session for long.
+    /// </summary>
+    public static readonly TimeSpan DefaultWindow = TimeSpan.FromMinutes(60);
+    /// <summary>The longest window a request may ask for: the reply-callback lifetime, which the
+    /// leader's subscription must outlive.</summary>
+    public static readonly TimeSpan MaxWindow = DiscordReplySubscriptionStore.Lifetime;
     public static readonly TimeSpan MinWindow = TimeSpan.FromMinutes(1);
+    /// <summary>The <c>state</c> values of the session context.</summary>
+    public const string OwnerLeadsContext = "owner_leads";
+    public const string HandedBackContext = "handed_back";
+    public const string SessionLeadsContext = "session_leads";
     public const int MaxOwnerMessages = 12;
     public const int MaxOwnerMessageLength = 4000;
     public const int MaxUnpostedReplies = 20;
@@ -117,7 +134,7 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
     {
         if (string.IsNullOrWhiteSpace(discussionId) || discussionId.Length > 100)
             throw new ArgumentException("A bounded discussion ID is required.");
-        if (window < MinWindow || window > DefaultWindow)
+        if (window < MinWindow || window > MaxWindow)
             throw new ArgumentOutOfRangeException(nameof(window));
         return await LockedAsync(binding.BindingId, async () =>
         {
@@ -187,16 +204,16 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
                 : lead with { ReleasedAt = now, ReleaseReason = reason }, ct);
 
     /// <summary>
-    /// Keeps a message sent into a led conversation until the session's next admitted turn, so
-    /// the session learns what was said for it. Outside a lead nothing is recorded.
+    /// Keeps an owner message sent into the binding until the session's next admitted turn, so
+    /// the session learns what was said for it, with or without a lead. The first message of a
+    /// binding that was never led creates its row.
     /// </summary>
     public Task<DiscordConversationLead?> RecordOwnerMessageAsync(
         DiscordBinding binding, string messageUid, string content, DateTimeOffset now,
         CancellationToken ct = default)
         => MutateAsync(binding, lead =>
         {
-            if (!lead.IsActive(now)
-                || lead.OwnerMessages.Any(item => item.MessageUid == messageUid))
+            if (lead.OwnerMessages.Any(item => item.MessageUid == messageUid))
                 return null;
             var text = content.Length <= MaxOwnerMessageLength
                 ? content
@@ -209,7 +226,7 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
                 OwnerMessages = messages.Skip(omitted).ToArray(),
                 OmittedOwnerMessages = lead.OmittedOwnerMessages + omitted,
             };
-        }, ct);
+        }, ct, createIfMissing: true);
 
     /// <summary>A reply the session wrote while the lead held it back from Discord.</summary>
     public Task<DiscordConversationLead?> RecordUnpostedReplyAsync(
@@ -256,7 +273,9 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
                     LedTurns = updated.LedTurns.Append(discordMessageId)
                         .Distinct(StringComparer.Ordinal).TakeLast(MaxLedTurns).ToArray(),
                 }
-                : updated with { HandbackRelayedAt = updated.HandbackRelayedAt ?? now };
+                : updated.EverLed
+                    ? updated with { HandbackRelayedAt = updated.HandbackRelayedAt ?? now }
+                    : updated;
         }, ct);
 
     /// <summary>
@@ -274,27 +293,31 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
     }
 
     /// <summary>
-    /// Trusted bridge state for the session's next turn, or null when there is nothing to say
-    /// (no lead, or a lead that ended and was already handed back with nothing pending).
+    /// Trusted bridge state for the session's next turn, or null when there is nothing to say:
+    /// no row, or no lead and nothing pending. Outside a lead the state is
+    /// <see cref="SessionLeadsContext"/> and the session answers as usual; the block only tells
+    /// it what the owner sent since its last turn.
     /// </summary>
     public static JsonObject? SessionContext(DiscordConversationLead? lead, DateTimeOffset now)
     {
         if (lead is null) return null;
         var active = lead.IsActive(now);
-        if (!active && !lead.HandbackPending(now)
+        var handingBack = lead.HandbackPending(now);
+        if (!active && !handingBack
             && lead.OwnerMessages.Count == 0 && lead.UnpostedReplies.Count == 0)
             return null;
+        var state = active ? OwnerLeadsContext : handingBack ? HandedBackContext : SessionLeadsContext;
         var context = new JsonObject
         {
             ["schema"] = ContextSchema,
             ["source"] = "leaf_discord_bridge",
             ["trust"] = "trusted_bridge_state",
-            ["state"] = active ? "owner_leads" : "handed_back",
+            ["state"] = state,
             ["reply_policy"] = active ? "observe_only" : "answer",
-            ["lead_started_at"] = Utc(lead.StartedAt),
+            ["lead_started_at"] = active || handingBack ? Utc(lead.StartedAt) : null,
             ["lead_expires_at"] = active ? Utc(lead.ExpiresAt) : null,
-            ["lead_ended_at"] = active ? null : Utc(lead.EndedAt(now)!.Value),
-            ["end_reason"] = active ? null : lead.ReleaseReason ?? "expired",
+            ["lead_ended_at"] = handingBack ? Utc(lead.EndedAt(now)!.Value) : null,
+            ["end_reason"] = handingBack ? lead.ReleaseReason ?? "expired" : null,
             ["owner_messages"] = new JsonArray(lead.OwnerMessages.Select(item => (JsonNode?)new JsonObject
             {
                 ["message_uid"] = item.MessageUid,
@@ -311,6 +334,9 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
     public static DiscordConversationLeadStatus Project(DiscordConversationLead? lead, DateTimeOffset now)
     {
         if (lead is null) return new DiscordConversationLeadStatus(SessionState);
+        if (!lead.EverLed)
+            return new DiscordConversationLeadStatus(
+                SessionState, PendingOwnerMessages: lead.OwnerMessages.Count);
         var state = lead.IsActive(now) ? OwnerState
             : lead.HandbackPending(now) ? HandingBackState
             : SessionState;
@@ -332,11 +358,14 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
     private async Task<DiscordConversationLead?> MutateAsync(
         DiscordBinding binding,
         Func<DiscordConversationLead, DiscordConversationLead?> change,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool createIfMissing = false)
         => await LockedAsync(binding.BindingId, async () =>
         {
             var entity = await store.GetBySlugAsync(TypeSlug, Slug(binding.BindingId), ct);
             var current = entity is null ? null : Current(binding, Map(entity));
+            // A row from an older generation is replaced, never carried over.
+            if (current is null && createIfMissing) current = NeverLed(binding);
             if (current is null) return null;
             var updated = change(current);
             return updated is null ? null : await SaveAsync(binding, updated, ct);
@@ -374,6 +403,12 @@ public sealed class DiscordConversationLeadStore(IEntityStore store)
             }, ct);
         return Map(entity);
     }
+
+    private static DiscordConversationLead NeverLed(DiscordBinding binding)
+        => new(Guid.Empty, binding.BindingId, binding.EntityId, binding.Generation,
+            "", "", "", DefaultWindow,
+            DateTimeOffset.MinValue, DateTimeOffset.MinValue, DateTimeOffset.MinValue,
+            null, null, null, [], 0, [], [], []);
 
     /// <summary>A row left by an older generation or a recreated binding means nothing here.</summary>
     private static DiscordConversationLead? Current(DiscordBinding binding, DiscordConversationLead lead)
