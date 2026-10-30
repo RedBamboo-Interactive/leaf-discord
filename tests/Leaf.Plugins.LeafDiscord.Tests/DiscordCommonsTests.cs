@@ -103,7 +103,7 @@ public sealed class DiscordCommonsTests
     }
 
     [Fact]
-    public void Announcements_are_read_only_events_from_humans_or_the_native_host_only()
+    public void Announcements_are_read_only_events()
     {
         var payload = DiscordCommonsRelayService.BuildAnnouncementPayload(
             "announcement:10:create", "10", "create", "human", "20", "Laurent",
@@ -112,14 +112,132 @@ public sealed class DiscordCommonsTests
         Assert.Equal("announcement", payload["type"]!.GetValue<string>());
         Assert.Equal("10", payload["messageId"]!.GetValue<string>());
         Assert.Equal("announcements", payload["channel"]!.GetValue<string>());
-        Assert.True(DiscordBotRuntime.ShouldForwardAnnouncement(
-            MessageSource.User, false, 20, 99));
-        Assert.True(DiscordBotRuntime.ShouldForwardAnnouncement(
-            MessageSource.Bot, true, 99, 99));
-        Assert.False(DiscordBotRuntime.ShouldForwardAnnouncement(
-            MessageSource.Bot, true, 98, 99));
-        Assert.False(DiscordBotRuntime.ShouldForwardAnnouncement(
-            MessageSource.Webhook, true, 99, 99));
+    }
+
+    private const ulong NativeBotId = 99;
+
+    [Theory]
+    [InlineData("native bot", MessageSource.Bot, true, NativeBotId, false, 0UL, true)]
+    [InlineData("another bot", MessageSource.Bot, true, 98UL, false, 0UL, false)]
+    [InlineData("another bot with Administrator", MessageSource.Bot, true, 98UL, false,
+        (ulong)GuildPermission.Administrator, false)]
+    [InlineData("webhook", MessageSource.Webhook, true, 97UL, false, 0UL, false)]
+    [InlineData("webhook named like the native bot", MessageSource.Webhook, true, NativeBotId,
+        false, 0UL, false)]
+    [InlineData("guild owner", MessageSource.User, false, 20UL, true, 0UL, true)]
+    [InlineData("Manage Server", MessageSource.User, false, 21UL, false,
+        (ulong)GuildPermission.ManageGuild, true)]
+    [InlineData("Administrator", MessageSource.User, false, 22UL, false,
+        (ulong)GuildPermission.Administrator, true)]
+    [InlineData("plain member", MessageSource.User, false, 23UL, false,
+        (ulong)(GuildPermission.SendMessages | GuildPermission.ManageMessages), false)]
+    public void Only_the_native_bot_and_guild_managers_are_announcement_hosts(
+        string _, MessageSource source, bool authorIsBot, ulong authorId,
+        bool ownsGuild, ulong permissions, bool expected)
+    {
+        Assert.Equal(expected, DiscordBotRuntime.IsAnnouncementHost(
+            source, authorIsBot, authorId, NativeBotId, ownsGuild,
+            new GuildPermissions(permissions)));
+    }
+
+    [Fact]
+    public void No_native_bot_identity_means_no_bot_announces()
+    {
+        Assert.False(DiscordBotRuntime.IsAnnouncementHost(
+            MessageSource.Bot, true, NativeBotId, null, false, GuildPermissions.None));
+    }
+
+    private static DiscordCommonsInboundRoute Route(
+        bool announcementHost = false,
+        MessageSource source = MessageSource.User,
+        bool authorIsBot = false,
+        bool suppressesNativeAgent = false,
+        bool inCommonsScope = true,
+        bool announcements = true,
+        bool canPostInLocation = true,
+        bool edit = false)
+        => DiscordBotRuntime.RouteCommonsInbound(
+            inCommonsScope, announcements, canPostInLocation, announcementHost,
+            source, authorIsBot, suppressesNativeAgent, edit);
+
+    [Fact]
+    public void A_host_post_in_announcements_is_relayed_and_never_answered()
+    {
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, source: MessageSource.Bot, authorIsBot: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, canPostInLocation: false));
+    }
+
+    [Fact]
+    public void A_member_post_in_announcements_reaches_the_binding_and_is_not_relayed()
+    {
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route());
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(canPostInLocation: false));
+        // A silent host keeps the native Agent out of the scope, as in every other channel.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(suppressesNativeAgent: true));
+    }
+
+    [Fact]
+    public void Webhooks_and_other_bots_in_announcements_are_neither_relayed_nor_answered()
+    {
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(source: MessageSource.Webhook, authorIsBot: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(source: MessageSource.Bot, authorIsBot: true));
+    }
+
+    [Fact]
+    public void An_announcement_edit_is_relayed_only_for_a_host_and_never_admitted()
+    {
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, edit: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, source: MessageSource.Bot, authorIsBot: true,
+                edit: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(edit: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(source: MessageSource.Webhook, authorIsBot: true, edit: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, inCommonsScope: false, edit: true));
+    }
+
+    [Fact]
+    public void Other_scope_channels_relay_every_post_as_before()
+    {
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.NativeAgent),
+            Route(announcements: false));
+        // Host status means nothing outside #announcements.
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.NativeAgent),
+            Route(announcements: false, announcementHost: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Envoy),
+            Route(announcements: false, source: MessageSource.Webhook, authorIsBot: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.NativeAgent),
+            Route(announcements: false, source: MessageSource.Bot, authorIsBot: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcements: false, suppressesNativeAgent: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcements: false, source: MessageSource.Webhook, authorIsBot: true,
+                suppressesNativeAgent: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(announcements: false, canPostInLocation: false));
+    }
+
+    [Fact]
+    public void Outside_a_scope_nothing_is_relayed_even_in_announcements()
+    {
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(inCommonsScope: false, announcementHost: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(inCommonsScope: false, announcements: false));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(inCommonsScope: false, source: MessageSource.Webhook, authorIsBot: true));
     }
 
     [Fact]

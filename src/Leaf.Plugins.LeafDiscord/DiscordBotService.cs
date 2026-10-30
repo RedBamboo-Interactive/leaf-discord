@@ -2481,9 +2481,7 @@ internal sealed class DiscordBotRuntime(
     {
         if (after is not IUserMessage message) return Task.CompletedTask;
         var location = CommonsLocation(message.Channel);
-        if (location is null || !string.Equals(
-                DiscordCommonsRelayService.ChannelName(location.Value.Channel),
-                "announcements", StringComparison.Ordinal))
+        if (location is null || !IsAnnouncements(location.Value.Channel))
             return Task.CompletedTask;
         var editedAt = message.EditedTimestamp ?? DateTimeOffset.UtcNow;
         return EnqueueGatewayMessageAsync(
@@ -2521,22 +2519,29 @@ internal sealed class DiscordBotRuntime(
             && commonsScope is not null
             && commonsScope.Contains(
                 commonsLocation.Value.ChannelId, commonsLocation.Value.CategoryId);
-        var announcements = commonsLocation is not null && string.Equals(
-            DiscordCommonsRelayService.ChannelName(commonsLocation.Value.Channel),
-            "announcements", StringComparison.Ordinal);
-        var inCommonsTransport = inCommonsScope
-            && CanPostInCommonsLocation(message.Channel);
-        if (inCommonsScope && (inCommonsTransport || announcements))
+        var announcements = commonsLocation is not null
+            && IsAnnouncements(commonsLocation.Value.Channel);
+        var route = RouteCommonsInbound(
+            inCommonsScope,
+            announcements,
+            inCommonsScope && !announcements && CanPostInCommonsLocation(message.Channel),
+            inCommonsScope && announcements && await IsAnnouncementHostAsync(message),
+            message.Source,
+            message.Author.IsBot,
+            commonsScope?.SuppressesNativeAgent == true);
+        if (route.Forward)
         {
-            await ForwardCommonsMessageAsync(message, commonsLocation!.Value);
-            if (announcements) return;
-            if (commonsScope!.SuppressesNativeAgent) return;
-            if (message.Source == MessageSource.Webhook)
-            {
-                await TryAdmitCommonsEnvoyMessageAsync(
-                    message, commonsLocation.Value, commonsScope);
-                return;
-            }
+            if (announcements)
+                await ForwardAnnouncementAsync(message, commonsLocation!.Value, "create");
+            else
+                await ForwardCommonsMessageAsync(message, commonsLocation!.Value);
+        }
+        if (route.Next == DiscordCommonsInboundNext.Stop) return;
+        if (route.Next == DiscordCommonsInboundNext.Envoy)
+        {
+            await TryAdmitCommonsEnvoyMessageAsync(
+                message, commonsLocation!.Value, commonsScope!);
+            return;
         }
         if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
         var current = client?.CurrentUser;
@@ -2690,10 +2695,82 @@ internal sealed class DiscordBotRuntime(
         };
     }
 
-    internal static bool ShouldForwardAnnouncement(
-        MessageSource source, bool authorIsBot, ulong authorId, ulong? nativeBotId)
+    private static bool IsAnnouncements(string channel)
+        => string.Equals(
+            DiscordCommonsRelayService.ChannelName(channel), "announcements",
+            StringComparison.Ordinal);
+
+    /// <summary>
+    /// Who may announce to Leaf Community from <c>#announcements</c>: the registered native bot,
+    /// or a human who owns the guild or holds Manage Server or Administrator in it. Other bots,
+    /// webhooks and ordinary members never do.
+    /// </summary>
+    internal static bool IsAnnouncementHost(
+        MessageSource source,
+        bool authorIsBot,
+        ulong authorId,
+        ulong? nativeBotId,
+        bool authorOwnsGuild,
+        GuildPermissions authorPermissions)
         => source != MessageSource.Webhook
-           && (!authorIsBot || nativeBotId is not null && authorId == nativeBotId.Value);
+           && (authorIsBot
+               ? nativeBotId is not null && authorId == nativeBotId.Value
+               : authorOwnsGuild
+                 || authorPermissions.ManageGuild
+                 || authorPermissions.Administrator);
+
+    private async Task<bool> IsAnnouncementHostAsync(IUserMessage message)
+    {
+        if (message.Source == MessageSource.Webhook) return false;
+        if (message.Author.IsBot)
+            return IsAnnouncementHost(
+                message.Source, true, message.Author.Id, client?.CurrentUser?.Id,
+                false, GuildPermissions.None);
+        if (message.Channel is not IGuildChannel { Guild: { } guild }) return false;
+        // A refetched message can carry a plain user; ask the guild for the member. A member
+        // who already left holds no permission here.
+        var member = message.Author as IGuildUser
+            ?? await guild.GetUserAsync(message.Author.Id, CacheMode.AllowDownload);
+        return IsAnnouncementHost(
+            message.Source, false, message.Author.Id, client?.CurrentUser?.Id,
+            guild.OwnerId == message.Author.Id,
+            member?.GuildPermissions ?? GuildPermissions.None);
+    }
+
+    /// <summary>
+    /// Where a message in a Leaf Community scope goes. A host post in <c>#announcements</c> is
+    /// relayed as an announcement and nobody answers it; anyone else posting there is not relayed
+    /// and takes the ordinary inbound path, unless the scope silences the native Agent. Other
+    /// postable scope channels relay every message, then hand webhooks to Envoy admission and
+    /// everyone else to the native Agent. An edit only ever re-relays a host announcement.
+    /// </summary>
+    internal static DiscordCommonsInboundRoute RouteCommonsInbound(
+        bool inCommonsScope,
+        bool announcements,
+        bool canPostInLocation,
+        bool announcementHost,
+        MessageSource source,
+        bool authorIsBot,
+        bool suppressesNativeAgent,
+        bool edit = false)
+    {
+        if (edit)
+            return new(inCommonsScope && announcements && announcementHost,
+                DiscordCommonsInboundNext.Stop);
+        if (inCommonsScope && announcements)
+            return announcementHost
+                ? new(true, DiscordCommonsInboundNext.Stop)
+                : new(false,
+                    source == MessageSource.Webhook || authorIsBot || suppressesNativeAgent
+                        ? DiscordCommonsInboundNext.Stop
+                        : DiscordCommonsInboundNext.NativeAgent);
+        if (!inCommonsScope || !canPostInLocation)
+            return new(false, DiscordCommonsInboundNext.NativeAgent);
+        if (suppressesNativeAgent) return new(true, DiscordCommonsInboundNext.Stop);
+        return new(true, source == MessageSource.Webhook
+            ? DiscordCommonsInboundNext.Envoy
+            : DiscordCommonsInboundNext.NativeAgent);
+    }
 
     private async Task TryAdmitCommonsEnvoyMessageAsync(
         IUserMessage message,
@@ -2946,51 +3023,54 @@ internal sealed class DiscordBotRuntime(
         IUserMessage message, string eventId)
     {
         var location = CommonsLocation(message.Channel);
-        if (location is null || !string.Equals(
-                DiscordCommonsRelayService.ChannelName(location.Value.Channel),
-                "announcements", StringComparison.Ordinal))
+        if (location is null || !IsAnnouncements(location.Value.Channel))
             return;
         var scope = await commons.GetScopeAsync(configId, location.Value.GuildId);
-        if (scope is null || !scope.Contains(
-                location.Value.ChannelId, location.Value.CategoryId))
-            return;
-        await ForwardCommonsMessageAsync(
-            message, location.Value, "update", eventId);
+        var inCommonsScope = scope is not null && scope.Contains(
+            location.Value.ChannelId, location.Value.CategoryId);
+        var route = RouteCommonsInbound(
+            inCommonsScope,
+            true,
+            false,
+            inCommonsScope && await IsAnnouncementHostAsync(message),
+            message.Source,
+            message.Author.IsBot,
+            scope?.SuppressesNativeAgent == true,
+            edit: true);
+        if (route.Forward)
+            await ForwardAnnouncementAsync(message, location.Value, "update", eventId);
+    }
+
+    /// <summary>Relays a host post in <c>#announcements</c>; the caller has decided it is one.</summary>
+    private async Task ForwardAnnouncementAsync(
+        IUserMessage message,
+        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location,
+        string operation,
+        string? eventId = null)
+    {
+        var nativeHost = message.Author.IsBot
+            && message.Author.Id == client?.CurrentUser.Id;
+        var id = eventId ?? $"announcement:{message.Id}:create";
+        await commons.EnqueueAsync(configId, location.GuildId, id,
+            DiscordCommonsRelayService.BuildAnnouncementPayload(
+                id,
+                message.Id.ToString(),
+                operation,
+                nativeHost ? "native_host" : "human",
+                message.Author.Id.ToString(),
+                message.Author is SocketGuildUser announcementMember
+                    ? announcementMember.DisplayName
+                    : message.Author.GlobalName ?? message.Author.Username,
+                message.Content,
+                location.ChannelId,
+                location.Channel,
+                (message.EditedTimestamp ?? message.Timestamp).ToUnixTimeMilliseconds()));
     }
 
     private async Task ForwardCommonsMessageAsync(
         IUserMessage message,
-        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location,
-        string announcementOperation = "create",
-        string? eventId = null)
+        (string GuildId, string ChannelId, string? CategoryId, string Channel, string? ThreadRef) location)
     {
-        if (string.Equals(
-                DiscordCommonsRelayService.ChannelName(location.Channel),
-                "announcements", StringComparison.Ordinal))
-        {
-            if (!ShouldForwardAnnouncement(
-                    message.Source, message.Author.IsBot, message.Author.Id,
-                    client?.CurrentUser.Id))
-                return;
-            var nativeHost = message.Author.IsBot
-                && message.Author.Id == client?.CurrentUser.Id;
-            var id = eventId ?? $"announcement:{message.Id}:create";
-            await commons.EnqueueAsync(configId, location.GuildId, id,
-                DiscordCommonsRelayService.BuildAnnouncementPayload(
-                    id,
-                    message.Id.ToString(),
-                    announcementOperation,
-                    nativeHost ? "native_host" : "human",
-                    message.Author.Id.ToString(),
-                    message.Author is SocketGuildUser announcementMember
-                        ? announcementMember.DisplayName
-                        : message.Author.GlobalName ?? message.Author.Username,
-                    message.Content,
-                    location.ChannelId,
-                    location.Channel,
-                    (message.EditedTimestamp ?? message.Timestamp).ToUnixTimeMilliseconds()));
-            return;
-        }
         if (message.Source == MessageSource.Webhook)
         {
             await commons.EnqueueAsync(configId, location.GuildId, message.Id.ToString(), new JsonObject
@@ -4763,6 +4843,18 @@ internal readonly record struct DiscordStartupBackfillPolicy(
     int MessageLimit,
     TimeSpan MaxAge,
     bool RequiresDirectAddress);
+
+/// <summary>What happens to a message after Leaf Community has (or has not) relayed it.</summary>
+internal enum DiscordCommonsInboundNext
+{
+    NativeAgent,
+    Envoy,
+    Stop,
+}
+
+internal readonly record struct DiscordCommonsInboundRoute(
+    bool Forward,
+    DiscordCommonsInboundNext Next);
 
 internal sealed record DiscordTransportStatus(
     string State,

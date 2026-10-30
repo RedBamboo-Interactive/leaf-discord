@@ -400,9 +400,15 @@ does); if Discord refuses the intent, the bot reconnects without member events a
 the periodic reconcile until it is restarted.
 
 `#announcements` stays inside the Community transport scope even though it is read-only
-for Agent posting. Human messages and messages authored by the registered native bot
-are forwarded as non-interactive announcement create/update events; other bots and all
-webhooks are ignored. Announcement messages never enter a native Agent binding.
+for Agent posting. Only host posts are forwarded, as non-interactive announcement
+create/update events: those of the registered native bot (`native_host`) and of a human
+who owns the guild or holds Manage Server or Administrator there (`human`). A host post
+never enters a native Agent binding. Anyone else's message there is not forwarded and
+takes the ordinary inbound path of a bound guild channel (binding, DM rules, behavior and
+response mode, mentions and replies, inbound Sentinel, typing), so the native Agent can
+answer a question asked under an announcement; a `silent-host` scope still keeps it out.
+Other bots and all webhooks there are ignored, and an edit only re-forwards a host
+announcement.
 
 In participant mode, a webhook message reaches the native Agent only when
 the relay verifies that it addressed the registered host participant by reply, role,
