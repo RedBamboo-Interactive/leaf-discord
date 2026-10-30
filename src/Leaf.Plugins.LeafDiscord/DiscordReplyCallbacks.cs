@@ -9,7 +9,8 @@ namespace Leaf.Plugins.LeafDiscord;
 
 /// <summary>
 /// A private Leaf discussion that sent a message into a Discord binding and wants to hear
-/// about the replies. The binding's own Agent session keeps answering on Discord; this only
+/// about the replies. The binding's own Agent session keeps answering on Discord, unless the
+/// discussion leads the conversation (<see cref="DiscordConversationLeadStore"/>); this only
 /// tells the sending discussion that someone answered.
 /// </summary>
 public sealed record DiscordReplySubscription(
@@ -155,6 +156,7 @@ public sealed class DiscordReplyNotifier(
         bool repliesToBot,
         DateTimeOffset now,
         DateTimeOffset? discordSentAt = null,
+        DiscordConversationLead? lead = null,
         CancellationToken ct = default)
     {
         if (!ShouldNotify(binding.Kind, mentioned, repliesToBot)) return 0;
@@ -170,7 +172,7 @@ public sealed class DiscordReplyNotifier(
                 await events.PublishAsync(EventType, BuildPayload(
                     binding, subscription, discordMessageId, requestor,
                     attachmentCount, admittedMessageUid, assessment, now,
-                    discordSentAt), ct);
+                    discordSentAt, lead), ct);
                 published++;
             }
             return published;
@@ -192,7 +194,8 @@ public sealed class DiscordReplyNotifier(
         string admittedMessageUid,
         InjectionAssessment assessment,
         DateTimeOffset now,
-        DateTimeOffset? discordSentAt = null)
+        DateTimeOffset? discordSentAt = null,
+        DiscordConversationLead? lead = null)
         => new()
         {
             ["discussion_id"] = subscription.DiscussionId,
@@ -214,7 +217,22 @@ public sealed class DiscordReplyNotifier(
             // When the person wrote it, from Discord's own message timestamp, always in UTC.
             ["discord_sent_at"] = discordSentAt?.ToUniversalTime().ToString("O"),
             ["discord_sent_at_label"] = SentAtLabel(discordSentAt),
+            // Who answers this message on Discord: the session, or a leading discussion.
+            ["conversation_lead"] = LeadPayload(lead, subscription, now),
         };
+
+    private static JsonObject LeadPayload(
+        DiscordConversationLead? lead, DiscordReplySubscription subscription, DateTimeOffset now)
+        => lead is not null && lead.IsActive(now)
+            ? new JsonObject
+            {
+                ["state"] = DiscordConversationLeadStore.OwnerState,
+                ["lead_discussion_id"] = lead.DiscussionId,
+                ["this_discussion_leads"] = string.Equals(
+                    lead.DiscussionId, subscription.DiscussionId, StringComparison.Ordinal),
+                ["expires_at"] = lead.ExpiresAt.ToUniversalTime().ToString("O"),
+            }
+            : new JsonObject { ["state"] = DiscordConversationLeadStore.SessionState };
 
     /// <summary>The send time as a reader sees it, with its zone spelled out.</summary>
     internal static string? SentAtLabel(DateTimeOffset? sentAt)

@@ -432,6 +432,21 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             .ToList();
 
     /// <summary>The outbound review recorded for one reply of the binding's current generation.</summary>
+    /// <summary>Whether this generation's outbox already holds any row for the message.</summary>
+    public async Task<bool> HasOutboundForMessageAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+        => (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["binding_id"] = binding.BindingId,
+                ["message_uid"] = messageUid,
+            },
+            Limit = 100,
+        }, ct)).Select(Map).Any(item => item.Generation == binding.Generation);
+
     public async Task<JsonObject?> FindOutboundReviewAsync(
         DiscordBinding binding, string messageUid, CancellationToken ct = default)
         => (await store.QueryAsync(new EntityQuery

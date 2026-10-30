@@ -172,6 +172,35 @@ public sealed class PluginPackagingContractTests
     }
 
     [Fact]
+    public async Task Conversation_lead_seed_declares_every_field_the_store_writes()
+    {
+        var root = FindRepositoryRoot();
+        using var types = JsonDocument.Parse(File.ReadAllText(
+            Path.Combine(root, "seeds", "entity-types.json")));
+        using var fields = JsonDocument.Parse(File.ReadAllText(
+            Path.Combine(root, "seeds", "field-definitions.json")));
+        var entities = new MemoryEntityStore();
+        var binding = await new DiscordBindingStore(entities).CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "323456789012345678", "dm", null, null, "nova", "owner-1",
+            "nova-discord-external", "direct", "Takit"));
+        await new DiscordConversationLeadStore(entities).ClaimAsync(
+            binding, "d1", "owner-1", "agent-1", TimeSpan.FromMinutes(5), DateTimeOffset.UtcNow);
+        var written = Assert.Single(await entities.QueryAsync(new Leaf.Sdk.EntityQuery
+        {
+            TypeSlug = DiscordConversationLeadStore.TypeSlug,
+        })).Data.Select(pair => pair.Key).ToHashSet();
+
+        Assert.Contains(types.RootElement.EnumerateArray(), entity =>
+            entity.GetProperty("slug").GetString() == DiscordConversationLeadStore.TypeSlug);
+        var declared = fields.RootElement.EnumerateArray()
+            .Where(field => field.GetProperty("parentType").GetString()
+                == DiscordConversationLeadStore.TypeSlug)
+            .Select(field => field.GetProperty("slug").GetString())
+            .ToHashSet();
+        Assert.Equal(written.Order(), declared.Order()!);
+    }
+
+    [Fact]
     public void Plugin_declares_dm_counterparty_for_durable_avatar_projection()
     {
         var root = FindRepositoryRoot();

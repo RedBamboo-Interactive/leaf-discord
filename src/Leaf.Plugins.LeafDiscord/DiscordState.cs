@@ -324,6 +324,8 @@ public sealed record DiscordBinding(
 {
     public string? CounterpartyUserId { get; init; }
     public string? IconUrl { get; init; }
+    /// <summary>Projection only: who answers on Discord right now (never persisted).</summary>
+    public DiscordConversationLeadStatus? ConversationLead { get; init; }
     public string SessionQualityMode { get; init; } = "deep-codex";
     public string? ChannelAvatarAssetId { get; init; }
     public string DeliveryMode { get; init; } = "bot";

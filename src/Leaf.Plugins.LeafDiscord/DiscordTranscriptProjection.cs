@@ -27,7 +27,8 @@ internal static class DiscordTranscriptProjection
         Func<string, CancellationToken, Task<DiscordUserProfile?>> resolveProfile,
         Func<string, CancellationToken, Task<DiscordInboundAttribution?>>? resolveInbound = null,
         CancellationToken ct = default,
-        Func<string, CancellationToken, Task<JsonObject?>>? resolveOutboundReview = null)
+        Func<string, CancellationToken, Task<JsonObject?>>? resolveOutboundReview = null,
+        IReadOnlySet<string>? unpostedReplies = null)
     {
         var projected = new List<ExternalConversationMessage>(messages.Count);
         var profiles = new Dictionary<string, DiscordUserProfile?>(StringComparer.Ordinal);
@@ -59,6 +60,24 @@ internal static class DiscordTranscriptProjection
             if (message.Role == "assistant"
                 && DiscordControlMessages.IsNoReply(message.Content))
                 continue;
+
+            // The session wrote it while a private discussion led the conversation, so the
+            // bridge kept it off Discord. The owner must not read it as something the person saw.
+            if (message.Role == "assistant" && message.Kind == "text"
+                && unpostedReplies?.Contains(message.MessageUid) == true)
+            {
+                var metadata = message.Metadata?.DeepClone() as JsonObject ?? new JsonObject();
+                metadata["discord"] = new JsonObject
+                {
+                    ["conversationLead"] = new JsonObject
+                    {
+                        ["posted"] = false,
+                        ["reason"] = "owner_discussion_led",
+                    },
+                };
+                projected.Add(message with { Metadata = metadata });
+                continue;
+            }
 
             if (message.Role == "assistant" && message.Kind == "text"
                 && resolveOutboundReview is not null

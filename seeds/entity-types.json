@@ -109,6 +109,18 @@
   },
   {
     "typeSlug": "entity-type",
+    "slug": "leaf-discord-conversation-lead",
+    "name": "Discord Conversation Lead",
+    "data": {
+      "icon": "ph-bold ph-hand-pointing",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "A private discussion leading a Discord conversation; the binding's own session observes until it hands back"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
     "slug": "leaf-discord-prompt",
     "name": "Discord Prompt",
     "data": {

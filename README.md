@@ -571,8 +571,8 @@ When a private Leaf discussion sends through `POST /bindings/{entityId}/messages
 subscriber on the binding (`leaf-discord-reply-subscription`). Each later human message the
 binding admits publishes `leaf-discord.reply-received` for every subscriber: every message in
 a DM, and in guild channels or threads only messages that mention or reply to the bot. The
-binding's own Agent session still answers on Discord as usual; the callback only tells the
-sending discussion that someone replied. Nova injects it into that discussion as a
+binding's own Agent session still answers on Discord as usual, unless a discussion leads the
+conversation (below); the callback only tells the sending discussion that someone replied. Nova injects it into that discussion as a
 `discord-reply` event after checking that the kernel-stamped source is Leaf Discord and that the
 discussion belongs to the same owner and Agent. A callback never revives a closed discussion:
 archiving and archived discussions are neither written to nor resumed, and Nova rechecks the
@@ -590,6 +590,56 @@ reply from `GET /bindings/{entityId}/transcript`. Each send renews the subscript
 hours, and a binding keeps at most 8 subscribers. Automation callers have no discussion and
 never subscribe. Send `"notifyReplies": false` to opt out for one message. The send response
 includes `replyCallback` (`discussionId`, `expiresAt`) when a subscription was recorded.
+
+### Leading a conversation from a private discussion
+
+Without a lead, a discussion that messages a binding and the binding's own Discord session
+both answer the person, and they can contradict each other. A discussion that wants to drive
+the exchange can lead it instead: it is then the only voice on that binding.
+
+```json
+POST /bindings/{entityId}/messages
+{
+  "content": "Accord pour la correction ...",
+  "idempotencyKey": "stable-exact-retry-key",
+  "leadConversation": true,
+  "leadForMinutes": 120
+}
+```
+
+- `leadConversation: true` needs a signed private discussion caller and reply callbacks
+  (`lead_requires_discussion`, `lead_requires_reply_callback`). `leadForMinutes` (1-2880) is
+  optional; the default window is the reply-callback window, 48 hours. Each later message from
+  the leading discussion, with or without the flag, renews the window.
+  `leadConversation: false` from the leader sends the message and then hands back.
+  `DELETE /bindings/{entityId}/lead` hands back early. A discussion can end only its own lead,
+  while the owner in the Leaf UI can end any. While one discussion leads, another one that
+  asks to lead gets `409 discord_conversation_led_elsewhere`. Messages sent without the flag
+  are delivered as before.
+- While the discussion leads, inbound messages are admitted exactly as before: same inbound
+  Sentinel review, same transcript, same reply callback. The session still runs its turn, so
+  its own history stays complete and in order. Each turn carries a trusted
+  `discord_conversation_lead` block (`leaf-discord-conversation-lead/v1`, `state:
+  owner_leads`, `reply_policy: observe_only`) with the leader's messages since the session's
+  last turn. A transcript injection never reaches the session's model, so this block is the
+  only way the session learns what was said for it. The bridge posts nothing the session
+  writes for a led turn: replies, tool markers, and typing stay off Discord, and the session's
+  own `POST /reactions` returns `409 discord_conversation_owner_leads`. Those replies are
+  listed as unposted, and the transcript marks them `metadata.discord.conversationLead.posted:
+  false`. Owner messages keep their usual outbound Sentinel review.
+- The sender is not left in silence. Each message that would notify the leader (every DM,
+  or a guild message that mentions or replies to the bot) gets an immediate 👀 reaction from
+  the bridge, with no typing indicator, since no session reply is coming.
+- When the lead is released or its window ends, the session's next turn carries `state:
+  handed_back`, `reply_policy: answer`, the leader's messages it has not yet heard, and the
+  IDs of its replies that were never posted. From then on it answers on its own. A reply
+  still being written for a led turn stays unposted.
+- `GET /bindings` items carry `conversationLead`, and so do `GET /bindings/{entityId}/lead`
+  and the send response: `state` is `session` (the session answers), `owner` (a discussion
+  leads, with `leadDiscussionId` and `expiresAt`), or `handing_back` (ended; the next turn
+  hands back). The status also carries counts of pending owner messages and unposted
+  replies. Reply notices carry `conversation_lead` (`state`, `lead_discussion_id`,
+  `this_discussion_leads`, `expires_at`).
 
 ### Recovering queued turns after a restart
 

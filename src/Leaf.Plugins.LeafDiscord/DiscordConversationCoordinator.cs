@@ -54,9 +54,21 @@ public sealed class DiscordConversationCoordinator(
     DiscordTypingLeases typing,
     ILogger<DiscordConversationCoordinator> logger,
     IUntrustedContentReview? sentinel = null,
-    TimeProvider? time = null) : IDisposable
+    TimeProvider? time = null,
+    DiscordConversationLeadStore? leads = null) : IDisposable
 {
     private readonly TimeProvider clock = time ?? TimeProvider.System;
+    private readonly DiscordConversationLeadStore leadStore =
+        leads ?? new DiscordConversationLeadStore(botConfigurations.EntityStore);
+
+    internal DiscordConversationLeadStore Leads => leadStore;
+
+    /// <summary>The binding's lead when a private discussion currently leads it.</summary>
+    public async Task<DiscordConversationLead?> ActiveLeadAsync(
+        DiscordBinding binding, CancellationToken ct = default)
+        => await leadStore.GetAsync(binding, ct) is { } lead && lead.IsActive(clock.GetUtcNow())
+            ? lead
+            : null;
 
     internal DiscordConversationCoordinator(
         DiscordBindingStore bindings,
@@ -203,27 +215,34 @@ public sealed class DiscordConversationCoordinator(
             // whatever the session actually holds; only the session-bound turn is compacted.
             var serverMap = DiscordServerMapDisclosure.Plan(binding, guildContext);
             var sessionGuildContext = serverMap.GuildContext;
+            // A leading discussion changes only what the session is told and what the bridge
+            // posts afterwards. The turn itself, and its inbound review, are the same.
+            var lead = await leadStore.GetAsync(binding, ct);
+            var leadContext = DiscordConversationLeadStore.SessionContext(lead, now);
+            var metadata = new JsonObject
+            {
+                ["transport"] = "discord",
+                ["binding_id"] = binding.BindingId,
+                ["generation"] = binding.Generation,
+                ["owner_user_id"] = binding.OwnerId,
+                ["agent_id"] = binding.AgentId,
+                ["session_quality_mode"] = binding.SessionQualityMode,
+                ["injection_risk_score"] = assessment.Score,
+                ["untrusted"] = true,
+                ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
+                ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
+                ["discord_behavior"] = behaviorContext.DeepClone(),
+                ["leaf_community_peer"] = relayContext?.DeepClone(),
+                ["outbound_sentinel_reviews"] = await OutboundReviewsForSessionAsync(binding, ct),
+            };
+            if (leadContext is not null)
+                metadata["discord_conversation_lead"] = leadContext;
             var admission = await provider.SendAsync(handle, new ExternalConversationInput(
                 discordMessageId,
                 requestor,
                 sessionContent,
                 attachments ?? [],
-                new JsonObject
-                {
-                    ["transport"] = "discord",
-                    ["binding_id"] = binding.BindingId,
-                    ["generation"] = binding.Generation,
-                    ["owner_user_id"] = binding.OwnerId,
-                    ["agent_id"] = binding.AgentId,
-                    ["session_quality_mode"] = binding.SessionQualityMode,
-                    ["injection_risk_score"] = assessment.Score,
-                    ["untrusted"] = true,
-                    ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
-                    ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
-                    ["discord_behavior"] = behaviorContext.DeepClone(),
-                    ["leaf_community_peer"] = relayContext?.DeepClone(),
-                    ["outbound_sentinel_reviews"] = await OutboundReviewsForSessionAsync(binding, ct),
-                }), ct);
+                metadata), ct);
             if (admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
             {
                 var attempts = delivery.Attempts + 1;
@@ -246,6 +265,8 @@ public sealed class DiscordConversationCoordinator(
             await deliveries.MarkAdmittedAsync(delivery, admission, ct);
             await bindings.MarkReceivedAsync(binding, discordMessageId, ct);
             binding = await bindings.MarkDeliveredAsync(binding, discordMessageId, ct);
+            if (leadContext is not null)
+                await leadStore.RecordAdmittedTurnAsync(binding, discordMessageId, leadContext, now, ct);
             await deliveries.CancelPendingOutboundAsync(
                 binding.BindingId,
                 binding.Generation,
@@ -568,11 +589,36 @@ public sealed class DiscordConversationCoordinator(
                     await deliveries.MarkSentAsync(delivery, deliveredDiscordMessageId, ct);
                 }
             }
+            await RecordLedOwnerMessageAsync(binding, messageUid, prepared, ct);
             return (binding, messageUid);
         }
         finally
         {
             gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// The session never sees a transcript injection as its own turn, so a message sent into a
+    /// led conversation waits on the lead until the session's next admitted turn carries it.
+    /// The message is already queued; failing to remember it must not fail the send.
+    /// </summary>
+    private async Task RecordLedOwnerMessageAsync(
+        DiscordBinding binding, string messageUid, DiscordPreparedOutreach prepared,
+        CancellationToken ct)
+    {
+        try
+        {
+            var text = string.Join("\n", new[] { prepared.DeliveryContent }
+                .Concat(prepared.OutputAssets.Select(asset => $"[image: {asset.Description}]"))
+                .Where(part => !string.IsNullOrWhiteSpace(part)));
+            await leadStore.RecordOwnerMessageAsync(binding, messageUid, text, clock.GetUtcNow(), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex,
+                "Discord message {MessageUid} on {BindingId} could not be kept for the led session",
+                messageUid, binding.BindingId);
         }
     }
 
@@ -686,6 +732,11 @@ public sealed class DiscordConversationCoordinator(
         var cursor = binding.Epoch is null ? null : new ExternalConversationCursor(binding.Epoch, binding.Sequence);
         var showToolActivity = (await botConfigurations.FindByApplicationIdAsync(
             binding.ApplicationId, ct))?.ShowToolActivity ?? true;
+        // While a private discussion leads, it is the only voice here: the session's replies,
+        // tool markers and typing stay off Discord. A message that already has outbox rows
+        // (outreach, bridge notices, a reply begun before the lead) goes through unchanged.
+        var holdReplies = DiscordConversationLeadStore.HoldsReplies(
+            await leadStore.GetAsync(binding, ct), binding, clock.GetUtcNow());
         while (true)
         {
             var page = await provider.ReadSettledAsync(handle, cursor, 100, ct);
@@ -694,6 +745,17 @@ public sealed class DiscordConversationCoordinator(
                          .Where(message => message.Role == "assistant"))
             {
                 if (DiscordControlMessages.IsNoReply(message.Content)) continue;
+                if (holdReplies && message.Kind is "tool_use" or "tool_result" or "commentary")
+                    continue;
+                if (holdReplies && message.Kind == "text"
+                    && !await deliveries.HasOutboundForMessageAsync(binding, message.MessageUid, ct))
+                {
+                    await leadStore.RecordUnpostedReplyAsync(binding, message.MessageUid, ct);
+                    logger.LogInformation(
+                        "Discord reply {MessageUid} on {BindingId} was not posted: a private discussion leads the conversation",
+                        message.MessageUid, binding.BindingId);
+                    continue;
+                }
                 if (message.Kind is "tool_use" or "tool_result")
                 {
                     typing.Activate(binding.BindingId, message.MessageUid);

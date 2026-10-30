@@ -2565,14 +2565,21 @@ internal sealed class DiscordBotRuntime(
             return;
         }
 
-        var startTypingImmediately = ShouldStartTypingImmediately(
-            binding.Kind, behavior.ResponseMode, mentioned, repliesToBot);
-        var typingAdmission = typing.Begin(
-            binding.BindingId,
-            () => message.Channel.EnterTypingState(),
-            startTypingImmediately);
-        if (!startTypingImmediately)
-            typing.ActivateAfter(typingAdmission, SelectiveTypingDelay);
+        // While a private discussion leads, the session's turn posts nothing, so typing here
+        // would promise a reply that is not coming. The sender gets a reaction instead.
+        var ownerLeads = await conversations.ActiveLeadAsync(binding) is not null;
+        DiscordTypingAdmission? typingAdmission = null;
+        if (!ownerLeads)
+        {
+            var startTypingImmediately = ShouldStartTypingImmediately(
+                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot);
+            typingAdmission = typing.Begin(
+                binding.BindingId,
+                () => message.Channel.EnterTypingState(),
+                startTypingImmediately);
+            if (!startTypingImmediately)
+                typing.ActivateAfter(typingAdmission.Value, SelectiveTypingDelay);
+        }
         try
         {
             var attachmentStarted = Stopwatch.GetTimestamp();
@@ -2587,7 +2594,7 @@ internal sealed class DiscordBotRuntime(
             var content = string.Join('\n', new[] { message.Content }.Concat(attachmentLines)).Trim();
             if (string.IsNullOrWhiteSpace(content))
             {
-                typing.Cancel(typingAdmission);
+                CancelTyping(typingAdmission);
                 return;
             }
             var guildContext = BuildGuildContext(message, config);
@@ -2600,33 +2607,38 @@ internal sealed class DiscordBotRuntime(
                 channelGap: ChannelGapSource(message, config));
             LogSlowMessageStep(message.Id, "Agent session admission", submitStarted);
             if (admission is null)
-                typing.Cancel(typingAdmission);
+                CancelTyping(typingAdmission);
             else if (admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
             {
                 // Kept for a later retry; the static notice (if any) goes out now.
-                typing.Cancel(typingAdmission);
+                CancelTyping(typingAdmission);
                 maintenance.RequestDrain(binding.BindingId);
             }
             else
             {
                 await commonsHostTurns.CompletePendingAsync(
                     binding, "human-joined");
-                typing.MarkAdmitted(typingAdmission, admission.MessageUid);
+                if (typingAdmission is { } admitted)
+                    typing.MarkAdmitted(admitted, admission.MessageUid);
                 maintenance.RequestFull(binding.BindingId);
-                // The Discord session answers on its own; this only tells any private
-                // discussion that messaged this binding that someone replied.
+                var lead = await conversations.ActiveLeadAsync(binding);
+                if (lead is not null
+                    && DiscordReplyNotifier.ShouldNotify(binding.Kind, mentioned, repliesToBot))
+                    await AcknowledgeLedMessageAsync(message, binding);
+                // Unless a private discussion leads, the Discord session answers on its own and
+                // this only tells any discussion that messaged this binding that someone replied.
                 await replyNotifier.NotifyAsync(
                     binding, message.Id.ToString(),
                     new ExternalRequestor(message.Author.Id.ToString(),
                         message.Author.GlobalName ?? message.Author.Username,
                         message.Author.Username),
                     message.Content ?? "", submittedAttachments.Count, admission.MessageUid,
-                    mentioned, repliesToBot, DateTimeOffset.UtcNow, message.Timestamp);
+                    mentioned, repliesToBot, DateTimeOffset.UtcNow, message.Timestamp, lead);
             }
         }
         catch (Exception ex)
         {
-            typing.Cancel(typingAdmission);
+            CancelTyping(typingAdmission);
             maintenance.RequestFull(binding.BindingId);
             logger.LogError(ex, "Discord message {MessageId} failed", message.Id);
             try
@@ -2640,6 +2652,28 @@ internal sealed class DiscordBotRuntime(
                 logger.LogError(noticeError,
                     "Discord failure notice could not be queued for message {MessageId}", message.Id);
             }
+        }
+    }
+
+    private void CancelTyping(DiscordTypingAdmission? admission)
+    {
+        if (admission is { } value) typing.Cancel(value);
+    }
+
+    /// <summary>Seen, and in hand: the leading discussion answers, not this session.</summary>
+    internal const string LedMessageAcknowledgement = "\U0001F440";
+
+    private async Task AcknowledgeLedMessageAsync(IUserMessage message, DiscordBinding binding)
+    {
+        try
+        {
+            await message.AddReactionAsync(new Emoji(LedMessageAcknowledgement));
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Discord message {MessageId} on {BindingId} could not be acknowledged while a discussion leads",
+                message.Id, binding.BindingId);
         }
     }
 
