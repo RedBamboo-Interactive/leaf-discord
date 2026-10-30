@@ -124,6 +124,8 @@ public sealed class DiscordReplySubscriptionStore(IEntityStore store)
 /// trust that only this plugin produced it. The kernel also mirrors every event into
 /// <c>os:events</c> and broadcasts it to every frontend socket, so the payload carries
 /// identifiers and never the message text; the receiver reads the binding transcript.
+/// A notice can reach a busy discussion long after the message was written, so it carries
+/// the message's own Discord send time, not only when the bridge admitted it.
 /// </summary>
 public sealed class DiscordReplyNotifier(
     DiscordReplySubscriptionStore subscriptions,
@@ -152,6 +154,7 @@ public sealed class DiscordReplyNotifier(
         bool mentioned,
         bool repliesToBot,
         DateTimeOffset now,
+        DateTimeOffset? discordSentAt = null,
         CancellationToken ct = default)
     {
         if (!ShouldNotify(binding.Kind, mentioned, repliesToBot)) return 0;
@@ -166,7 +169,8 @@ public sealed class DiscordReplyNotifier(
                 if (subscription.BindingEntityId != binding.EntityId) continue;
                 await events.PublishAsync(EventType, BuildPayload(
                     binding, subscription, discordMessageId, requestor,
-                    attachmentCount, admittedMessageUid, assessment, now), ct);
+                    attachmentCount, admittedMessageUid, assessment, now,
+                    discordSentAt), ct);
                 published++;
             }
             return published;
@@ -187,7 +191,8 @@ public sealed class DiscordReplyNotifier(
         int attachmentCount,
         string admittedMessageUid,
         InjectionAssessment assessment,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        DateTimeOffset? discordSentAt = null)
         => new()
         {
             ["discussion_id"] = subscription.DiscussionId,
@@ -206,5 +211,13 @@ public sealed class DiscordReplyNotifier(
             ["injection_suspected"] = assessment.Suspicious,
             ["subscription_expires_at"] = subscription.ExpiresAt.ToString("O"),
             ["received_at"] = now.ToString("O"),
+            // When the person wrote it, from Discord's own message timestamp, always in UTC.
+            ["discord_sent_at"] = discordSentAt?.ToUniversalTime().ToString("O"),
+            ["discord_sent_at_label"] = SentAtLabel(discordSentAt),
         };
+
+    /// <summary>The send time as a reader sees it, with its zone spelled out.</summary>
+    internal static string? SentAtLabel(DateTimeOffset? sentAt)
+        => sentAt?.ToUniversalTime().ToString(
+            "yyyy-MM-dd HH:mm:ss 'UTC'", System.Globalization.CultureInfo.InvariantCulture);
 }

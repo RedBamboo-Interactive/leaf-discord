@@ -134,6 +134,46 @@ public sealed class DiscordReplyCallbackTests
     }
 
     [Fact]
+    public async Task A_late_notice_carries_the_original_discord_send_time_in_utc_and_the_message_uid()
+    {
+        var store = new DiscordReplySubscriptionStore(new MemoryEntityStore());
+        var events = new RecordingEvents();
+        var binding = Binding("dm");
+        // Written at 20:28:41 Paris time (UTC+1); the bridge admits it twelve minutes later.
+        var sentAt = new DateTimeOffset(2026, 10, 28, 20, 28, 41, 250, TimeSpan.FromHours(1));
+        await store.SubscribeAsync(binding, "d1", "owner-1", "agent-1", "m1", sentAt);
+
+        await Notifier(store, events).NotifyAsync(
+            binding, "900000000000000009",
+            new ExternalRequestor("700000000000000007", "Takit"), "faut choisir", 0,
+            "admitted-7", false, false, sentAt.AddMinutes(12), sentAt);
+
+        var payload = Assert.Single(events.Published).Payload;
+        Assert.Equal("2026-10-28T19:28:41.2500000+00:00",
+            payload["discord_sent_at"]!.GetValue<string>());
+        Assert.Equal("2026-10-28 19:28:41 UTC", payload["discord_sent_at_label"]!.GetValue<string>());
+        Assert.Equal("admitted-7", payload["admitted_message_uid"]!.GetValue<string>());
+        Assert.Equal("900000000000000009", payload["discord_message_id"]!.GetValue<string>());
+        Assert.Equal(sentAt.AddMinutes(12).ToString("O"), payload["received_at"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_notice_without_a_known_send_time_says_so_instead_of_guessing()
+    {
+        var store = new DiscordReplySubscriptionStore(new MemoryEntityStore());
+        var events = new RecordingEvents();
+        var binding = Binding("dm");
+        await store.SubscribeAsync(binding, "d1", "owner-1", "agent-1", "m1", Now);
+
+        await Notifier(store, events).NotifyAsync(
+            binding, "1", new ExternalRequestor("7", "Alice"), "hi", 0, "a1", false, false, Now);
+
+        var payload = Assert.Single(events.Published).Payload;
+        Assert.Null(payload["discord_sent_at"]);
+        Assert.Null(payload["discord_sent_at_label"]);
+    }
+
+    [Fact]
     public async Task Guild_messages_notify_only_when_they_address_the_bot()
     {
         var store = new DiscordReplySubscriptionStore(new MemoryEntityStore());

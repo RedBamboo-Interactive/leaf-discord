@@ -581,7 +581,11 @@ interrupted, so it still receives the callback.
 
 Plugin events are mirrored into `os:events` and broadcast to frontend sockets, so the event
 carries identifiers (binding, Discord message, admitted transcript UID, requestor display name,
-attachment count, an injection-suspected flag), never the message text. The receiver reads the
+attachment count, an injection-suspected flag), never the message text. It also carries when the
+person wrote the message: `discord_sent_at` is Discord's own message timestamp in UTC (ISO 8601)
+and `discord_sent_at_label` is the same instant as `yyyy-MM-dd HH:mm:ss UTC`. `received_at` is
+when the bridge admitted it. A notice can wait behind a busy discussion turn, so a receiver
+should compare the send time with the present, not treat every notice as new. The receiver reads the
 reply from `GET /bindings/{entityId}/transcript`. Each send renews the subscription for 48
 hours, and a binding keeps at most 8 subscribers. Automation callers have no discussion and
 never subscribe. Send `"notifyReplies": false` to opt out for one message. The send response

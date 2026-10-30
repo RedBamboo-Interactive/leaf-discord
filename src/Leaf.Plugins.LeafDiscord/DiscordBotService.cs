@@ -2621,7 +2621,7 @@ internal sealed class DiscordBotRuntime(
                         message.Author.GlobalName ?? message.Author.Username,
                         message.Author.Username),
                     message.Content ?? "", submittedAttachments.Count, admission.MessageUid,
-                    mentioned, repliesToBot, DateTimeOffset.UtcNow);
+                    mentioned, repliesToBot, DateTimeOffset.UtcNow, message.Timestamp);
             }
         }
         catch (Exception ex)
