@@ -182,7 +182,7 @@ public sealed class PluginPackagingContractTests
         var entities = new MemoryEntityStore();
         var binding = await new DiscordBindingStore(entities).CreateAsync(new CreateDiscordBinding(
             "100000000000000001", "323456789012345678", "dm", null, null, "nova", "owner-1",
-            "nova-discord-external", "direct", "Takit"));
+            "nova-discord-external", "direct", "Tester"));
         await new DiscordConversationLeadStore(entities).ClaimAsync(
             binding, "d1", "owner-1", "agent-1", TimeSpan.FromMinutes(5), DateTimeOffset.UtcNow);
         var written = Assert.Single(await entities.QueryAsync(new Leaf.Sdk.EntityQuery

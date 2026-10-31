@@ -145,7 +145,7 @@ public sealed class DiscordReplyCallbackTests
 
         await Notifier(store, events).NotifyAsync(
             binding, "900000000000000009",
-            new ExternalRequestor("700000000000000007", "Takit"), "faut choisir", 0,
+            new ExternalRequestor("700000000000000007", "Tester"), "faut choisir", 0,
             "admitted-7", false, false, sentAt.AddMinutes(12), sentAt);
 
         var payload = Assert.Single(events.Published).Payload;

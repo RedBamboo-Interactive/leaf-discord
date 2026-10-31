@@ -21,12 +21,12 @@ public sealed class DiscordCommonsMembershipTests
     public async Task Pending_envoy_of_a_current_member_is_approved()
     {
         var gateway = new FakeGateway { Members = [MemberId] };
-        gateway.Envoys.Add(Envoy("envoy-takit", MemberId, "pending"));
+        gateway.Envoys.Add(Envoy("envoy-tester", MemberId, "pending"));
         var reconciler = Reconciler(gateway);
 
         await reconciler.ReconcileGuildAsync(Guild, CancellationToken.None);
 
-        Assert.Equal([(GuildId, "envoy-takit", "approve")], gateway.Calls);
+        Assert.Equal([(GuildId, "envoy-tester", "approve")], gateway.Calls);
         Assert.Equal("active", gateway.Envoys.Single().Status);
     }
 
@@ -310,7 +310,7 @@ public sealed class DiscordCommonsMembershipTests
             Members = [MemberId],
             StatusFailure = new HttpRequestException("relay down", null, HttpStatusCode.BadGateway),
         };
-        gateway.Envoys.Add(Envoy("envoy-takit", MemberId, "pending"));
+        gateway.Envoys.Add(Envoy("envoy-tester", MemberId, "pending"));
         var reconciler = Reconciler(gateway);
 
         var failed = await reconciler.RunOnceAsync(full: true, CancellationToken.None);
@@ -321,7 +321,7 @@ public sealed class DiscordCommonsMembershipTests
         gateway.StatusFailure = null;
         var recovered = await reconciler.RunOnceAsync(full: true, CancellationToken.None);
         Assert.True(recovered.Healthy);
-        Assert.Equal([(GuildId, "envoy-takit", "approve")], gateway.Calls);
+        Assert.Equal([(GuildId, "envoy-tester", "approve")], gateway.Calls);
     }
 
     [Fact]
@@ -333,7 +333,7 @@ public sealed class DiscordCommonsMembershipTests
             StatusFailure = new DiscordCommonsRelayException(
                 HttpStatusCode.TooManyRequests, TimeSpan.FromSeconds(7)),
         };
-        gateway.Envoys.Add(Envoy("envoy-takit", MemberId, "pending"));
+        gateway.Envoys.Add(Envoy("envoy-tester", MemberId, "pending"));
 
         var cycle = await Reconciler(gateway).RunOnceAsync(full: true, CancellationToken.None);
 
@@ -379,7 +379,7 @@ public sealed class DiscordCommonsMembershipTests
             Members = [MemberId],
             EnvoysFailure = new HttpRequestException("relay down"),
         };
-        gateway.Envoys.Add(Envoy("envoy-takit", MemberId, "pending"));
+        gateway.Envoys.Add(Envoy("envoy-tester", MemberId, "pending"));
         using var reconciler = Reconciler(gateway);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
@@ -392,7 +392,7 @@ public sealed class DiscordCommonsMembershipTests
         await cts.CancelAsync();
         await loop;
 
-        Assert.Equal([(GuildId, "envoy-takit", "approve")], gateway.Calls);
+        Assert.Equal([(GuildId, "envoy-tester", "approve")], gateway.Calls);
     }
 
     [Fact]

@@ -23,7 +23,7 @@ public sealed class DiscordConversationLeadTests
     private static readonly UntrustedContentVerdict Leak =
         new("high", ["personal-data"], "require_private_approval", true, UntrustedContentIsolation.VerifiedToolFree);
 
-    private static readonly ExternalRequestor Takit = new("700000000000000007", "Takit", "takit");
+    private static readonly ExternalRequestor Tester = new("700000000000000007", "Tester", "tester");
 
     [Fact]
     public async Task While_the_discussion_leads_the_session_hears_everything_and_posts_nothing()
@@ -38,7 +38,7 @@ public sealed class DiscordConversationLeadTests
         // The turn is the ordinary one, through the provider (Nova runs its inbound review there).
         var input = Assert.Single(h.Provider.Inputs);
         Assert.Equal("ok je lance", input.Content);
-        Assert.Equal(Takit, input.Requestor);
+        Assert.Equal(Tester, input.Requestor);
         Assert.True(input.Metadata!["untrusted"]!.GetValue<bool>());
         var lead = input.Metadata["discord_conversation_lead"]!.AsObject();
         Assert.Equal(DiscordConversationLeadStore.ContextSchema, lead["schema"]!.GetValue<string>());
@@ -89,7 +89,7 @@ public sealed class DiscordConversationLeadTests
 
         // As the gateway ingress does it: after admission, with the lead as it stands.
         var published = await notifier.NotifyAsync(
-            h.Binding, "1001", Takit, "2 / Smart Home", 0, admission!.MessageUid,
+            h.Binding, "1001", Tester, "2 / Smart Home", 0, admission!.MessageUid,
             false, false, DateTimeOffset.UtcNow, sentAt, await h.Coordinator.ActiveLeadAsync(h.Binding));
 
         Assert.Equal(2, published);
@@ -243,7 +243,7 @@ public sealed class DiscordConversationLeadTests
         var events = new RecordingEvents();
         await new DiscordReplyNotifier(subscriptions, events, new PromptInjectionDetector(),
                 NullLogger<DiscordReplyNotifier>.Instance)
-            .NotifyAsync(h.Binding, "1001", Takit, "salut", 0, "uid-1001", false, false, DateTimeOffset.UtcNow);
+            .NotifyAsync(h.Binding, "1001", Tester, "salut", 0, "uid-1001", false, false, DateTimeOffset.UtcNow);
         Assert.Equal("session", Assert.Single(events.Published).Payload["conversation_lead"]!["state"]!
             .GetValue<string>());
     }
@@ -561,7 +561,7 @@ public sealed class DiscordConversationLeadTests
         LeafDiscordConfig? config = null, DiscordBinding? binding = null,
         DiscordReplySubscriptionStore? subscriptions = null, string agentEntityId = "agent-1")
         => DiscordEndpoints.ClaimLeadAsync(
-            caller, binding ?? h.Binding, agentEntityId, config ?? BotConfig(Takit.ExternalId),
+            caller, binding ?? h.Binding, agentEntityId, config ?? BotConfig(Tester.ExternalId),
             minutes, h.Leads, subscriptions ?? new DiscordReplySubscriptionStore(h.Entities),
             NullLogger.Instance, h.Clock.GetUtcNow(), default);
 
@@ -785,7 +785,7 @@ public sealed class DiscordConversationLeadTests
             var bindings = new DiscordBindingStore(entities);
             var binding = await bindings.CreateAsync(new CreateDiscordBinding(
                 "100000000000000001", conversationId, "dm", null, null, "nova", "owner-1",
-                "nova-discord-external", "direct", "Takit", CounterpartyUserId: Takit.ExternalId));
+                "nova-discord-external", "direct", "Tester", CounterpartyUserId: Tester.ExternalId));
             var deliveries = new DiscordDeliveryStore(entities);
             var leads = new DiscordConversationLeadStore(entities);
             var provider = new ScriptedProvider();
@@ -827,7 +827,7 @@ public sealed class DiscordConversationLeadTests
         {
             await RefreshAsync();
             var admission = await Coordinator.SubmitAsync(
-                Binding, messageId, Takit, content, behaviorContext: new JsonObject());
+                Binding, messageId, Tester, content, behaviorContext: new JsonObject());
             await RefreshAsync();
             return admission;
         }
