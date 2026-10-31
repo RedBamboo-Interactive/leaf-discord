@@ -853,6 +853,16 @@ public sealed class DiscordCommonsIngestStore(IEntityStore store)
             ["next_attempt_at"] = null,
         }, ct: ct);
 
+    public async Task MarkDroppedAsync(
+        DiscordCommonsIngestDelivery delivery, string safeError, CancellationToken ct = default)
+        => _ = await store.PatchAsync(delivery.EntityId, new JsonObject
+        {
+            ["state"] = "dropped",
+            ["payload"] = null,
+            ["last_error"] = safeError.Length <= 200 ? safeError : safeError[..200],
+            ["next_attempt_at"] = null,
+        }, ct: ct);
+
     public async Task MarkRetryAsync(
         DiscordCommonsIngestDelivery delivery,
         string safeError,
@@ -1278,6 +1288,39 @@ public sealed class DiscordCommonsRelayService(
         return payload;
     }
 
+    /// <summary>
+    /// A native post in a Leaf Community text channel that is context only: the relay keeps it in
+    /// the channel's window as the host Agent's message and gives nobody a turn for it, whatever
+    /// it names. It carries no thread and no addresses.
+    /// </summary>
+    internal static JsonObject BuildHostContextPostPayload(
+        string messageId, string participantId, string content, string channel, string? channelId,
+        long timestamp, JsonArray? attachments)
+    {
+        var payload = new JsonObject
+        {
+            ["type"] = "host_context_post",
+            ["eventId"] = $"host-context:{messageId}",
+            ["participantId"] = participantId,
+            ["messageId"] = messageId,
+            ["content"] = content,
+            ["channel"] = channel,
+            ["channelId"] = channelId,
+            ["timestamp"] = timestamp,
+        };
+        if (attachments is { Count: > 0 }) payload["attachments"] = attachments.DeepClone();
+        return payload;
+    }
+
+    /// <summary>
+    /// Whether a refused ingest event is dropped rather than retried: only a context-only native
+    /// post that a relay predating it refuses (HTTP 400). It is best effort, and retrying it for
+    /// good would crowd the queue.
+    /// </summary>
+    internal static bool DropsRefusedIngest(int status, JsonObject? payload)
+        => status == 400 && payload is not null
+           && JsonRead.String(payload, "type") == "host_context_post";
+
     internal static JsonObject BuildAnnouncementPayload(
         string eventId,
         string messageId,
@@ -1351,6 +1394,12 @@ public sealed class DiscordCommonsRelayService(
                 if (response.IsSuccessStatusCode)
                 {
                     await deliveries.MarkSentAsync(delivery, ct);
+                    continue;
+                }
+                if (DropsRefusedIngest((int)response.StatusCode, delivery.Payload))
+                {
+                    await deliveries.MarkDroppedAsync(
+                        delivery, $"relay_http_{(int)response.StatusCode}", ct);
                     continue;
                 }
                 var seconds = Math.Min(300, Math.Pow(2, Math.Min(delivery.Attempts + 1, 8)));

@@ -183,19 +183,20 @@ public sealed class DiscordCommonsBroadcastTests
     [InlineData("Orion · Bea is switched off.", false)]
     [InlineData("<@&777000000000000099> some other role", false)]
     [InlineData("Good morning everyone.", false)]
-    public void Unprompted_text_channel_posts_are_reported_as_a_chain_only_when_they_invite_or_address_envoys(
+    public void Unprompted_text_channel_posts_are_a_chain_when_they_invite_or_address_envoys_and_context_otherwise(
         string content, bool reported)
     {
         var payload = DiscordBotRuntime.UnpromptedCommonsPostPayload(
             false, "general", "700000000000000007", null, "host:nova",
             "900000000000000009", content, null, NovasRoleId, [Atlas, Sleeper], 1234);
 
+        Assert.NotNull(payload);
         if (!reported)
         {
-            Assert.Null(payload);
+            AssertContextOnly(payload, content);
             return;
         }
-        Assert.NotNull(payload);
+        Assert.Equal("host_participant_post", payload["type"]!.GetValue<string>());
         Assert.Equal("message:900000000000000009", payload["threadRef"]!.GetValue<string>());
         Assert.Equal("700000000000000007", payload["channelId"]!.GetValue<string>());
         Assert.Equal("general", payload["channel"]!.GetValue<string>());
@@ -203,11 +204,75 @@ public sealed class DiscordCommonsBroadcastTests
         Assert.Equal(content, payload["content"]!.GetValue<string>());
     }
 
-    [Fact]
-    public void Native_announcements_are_never_reported_as_a_chain()
-        => Assert.Null(DiscordBotRuntime.UnpromptedCommonsPostPayload(
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Native_announcements_are_never_reported_as_a_chain_or_as_context(bool firstMessage)
+    {
+        Assert.Null(DiscordBotRuntime.UnpromptedCommonsPostPayload(
             false, "announcements", "700000000000000007", null, "host:nova",
-            "900000000000000009", $"<@&{NovasRoleId}> release notes", null, NovasRoleId, [Atlas], 1234));
+            "900000000000000009", $"<@&{NovasRoleId}> release notes", null, NovasRoleId, [Atlas], 1234,
+            firstMessage));
+        Assert.Null(DiscordBotRuntime.UnpromptedCommonsPostPayload(
+            false, "announcements", "700000000000000007", null, "host:nova",
+            "900000000000000009", "Release notes", null, NovasRoleId, [Atlas], 1234, firstMessage));
+    }
+
+    [Fact]
+    public void Later_messages_of_a_long_native_text_channel_post_are_context_only_whatever_they_name()
+    {
+        var attachments = new JsonArray(new JsonObject
+        {
+            ["id"] = "77", ["filename"] = "pumpkin.png", ["content_type"] = "image/png", ["size"] = 3,
+            ["url"] = "https://cdn.discordapp.com/attachments/1/77/pumpkin.png",
+        });
+        var content = $"<@&{NovasRoleId}> and Atlas · Ann, the rest of my answer.";
+
+        var payload = DiscordBotRuntime.UnpromptedCommonsPostPayload(
+            false, "general", "700000000000000007", null, "host:nova",
+            "900000000000000009", content, attachments, NovasRoleId, [Atlas], 1234, firstMessage: false);
+
+        Assert.NotNull(payload);
+        AssertContextOnly(payload, content);
+        Assert.Equal("https://cdn.discordapp.com/attachments/1/77/pumpkin.png",
+            payload["attachments"]![0]!["url"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Later_messages_of_a_native_thread_post_stay_unreported()
+        => Assert.Null(DiscordBotRuntime.UnpromptedCommonsPostPayload(
+            true, "agent-consult", "700000000000000007", "800000000000000008", "host:nova",
+            "900000000000000009", "The rest of it.", null, NovasRoleId, [Atlas], 1234, firstMessage: false));
+
+    [Theory]
+    [InlineData(400, "host_context_post", true)]
+    [InlineData(400, "host_participant_post", false)]
+    [InlineData(400, "human_message", false)]
+    [InlineData(429, "host_context_post", false)]
+    [InlineData(500, "host_context_post", false)]
+    [InlineData(404, "host_context_post", false)]
+    public void Only_context_a_relay_refuses_outright_is_dropped_instead_of_retried(
+        int status, string type, bool dropped)
+        => Assert.Equal(dropped, DiscordCommonsRelayService.DropsRefusedIngest(
+            status, new JsonObject { ["type"] = type }));
+
+    /// <summary>
+    /// What the relay keeps in the channel's window as the host's message and never turns into a
+    /// ping: no thread, no addresses, no unprompted post for the relay to address.
+    /// </summary>
+    private static void AssertContextOnly(JsonObject payload, string content)
+    {
+        Assert.Equal("host_context_post", payload["type"]!.GetValue<string>());
+        Assert.Equal("host-context:900000000000000009", payload["eventId"]!.GetValue<string>());
+        Assert.Equal("host:nova", payload["participantId"]!.GetValue<string>());
+        Assert.Equal("900000000000000009", payload["messageId"]!.GetValue<string>());
+        Assert.Equal("700000000000000007", payload["channelId"]!.GetValue<string>());
+        Assert.Equal("general", payload["channel"]!.GetValue<string>());
+        Assert.Equal(content, payload["content"]!.GetValue<string>());
+        Assert.False(payload.ContainsKey("threadRef"));
+        Assert.False(payload.ContainsKey("addresses"));
+        Assert.False(payload.ContainsKey("unprompted"));
+    }
 
     [Fact]
     public void Outbound_egress_keeps_the_broadcast_role_mention()

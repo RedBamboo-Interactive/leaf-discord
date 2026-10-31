@@ -4697,12 +4697,13 @@ internal sealed class DiscordBotRuntime(
                             ct);
                         await commonsHostTurns.CompleteAsync(hostTurn, "posted", ct);
                     }
-                    else if (delivery.ChunkIndex == 0)
+                    else
                     {
-                        // Later chunks continue a message already reported, or a host answer
-                        // whose turn completed with its first chunk.
+                        // A host answer's turn completed with its first chunk; its later chunks,
+                        // like those of any other native post, are reported as what they are.
                         await ReportUnpromptedCommonsPostAsync(
-                            binding, config, sentId, outbound.Content, sent.Attachments, ct);
+                            binding, config, sentId, outbound.Content, sent.Attachments,
+                            delivery.ChunkIndex == 0, ct);
                     }
                 }
                 catch (DiscordRestException ex) when ((int)ex.StatusCode == 429
@@ -4830,16 +4831,17 @@ internal sealed class DiscordBotRuntime(
     }
 
     /// <summary>
-    /// Reports a native post that answered no Envoy in Leaf Community, so the relay records it
-    /// and pings the Envoys it tags or names. In a thread every such post is reported, into the
-    /// thread's history. In a text channel only one that mentions the Novas role or an Envoy's
-    /// role, or names an Envoy by full persona, is reported, as a new <c>message:</c> chain
-    /// rooted at the post. The Discord message is already sent, so a failure here is logged
-    /// rather than retried as a delivery failure.
+    /// Reports a native post that answered no Envoy in Leaf Community, or a later message of a
+    /// long native post. In a thread a post's first message is reported into the thread's
+    /// history, where the relay pings the Envoys it tags or names. In a text channel a first
+    /// message that mentions the Novas role or an Envoy's role, or names an Envoy by full
+    /// persona, is reported as a new <c>message:</c> chain rooted at the post; every other native
+    /// message there is context only, for the channel's window. The Discord message is already
+    /// sent, so a failure here is logged rather than retried as a delivery failure.
     /// </summary>
     private async Task ReportUnpromptedCommonsPostAsync(
         DiscordBinding binding, LeafDiscordConfig config, string messageId, string content,
-        JsonArray? attachments, CancellationToken ct)
+        JsonArray? attachments, bool firstMessage, CancellationToken ct)
     {
         try
         {
@@ -4854,17 +4856,17 @@ internal sealed class DiscordBotRuntime(
                 || !scope.Contains(location.ChannelId, location.CategoryId))
                 return;
             var isThread = channel is SocketThreadChannel;
-            var envoys = isThread
+            var envoys = isThread || !firstMessage
                 ? []
                 : await CommonsEnvoyDirectoryAsync(location.GuildId, ct);
             var payload = UnpromptedCommonsPostPayload(
                 isThread, location.Channel, location.ChannelId, location.ThreadRef,
                 $"host:{config.ApplicationId}", messageId, content, attachments,
                 commonsConfig!.BroadcastRoleId(location.GuildId), envoys,
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), firstMessage);
             if (payload is null) return;
-            await commons.EnqueueAsync(configId, location.GuildId, $"host-post:{messageId}",
-                payload, ct);
+            await commons.EnqueueAsync(configId, location.GuildId,
+                payload["eventId"]!.GetValue<string>(), payload, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -4874,26 +4876,33 @@ internal sealed class DiscordBotRuntime(
     }
 
     /// <summary>
-    /// What to report for a native post that answered no Envoy, or null for nothing: a thread
-    /// post always, into its thread; a text-channel post (never <c>#announcements</c>) only when
-    /// it invites or addresses Envoys, as the chain <c>message:&lt;its id&gt;</c>.
+    /// What to report for a native message that answered no Envoy, or null for nothing. In a
+    /// thread: a post's first message, into its thread. In a text channel (never
+    /// <c>#announcements</c>, which has its own relay): a first message that invites or addresses
+    /// Envoys as the chain <c>message:&lt;its id&gt;</c>; every other message, later chunks
+    /// included, as context only, which the relay keeps in the channel's window and never turns
+    /// into a ping, an address or an open floor.
     /// </summary>
     internal static JsonObject? UnpromptedCommonsPostPayload(
         bool isThread, string channel, string channelId, string? threadRef,
         string participantId, string messageId, string content, JsonArray? attachments,
-        string? broadcastRoleId, IReadOnlyList<DiscordCommonsRelayEnvoy> envoys, long timestamp)
+        string? broadcastRoleId, IReadOnlyList<DiscordCommonsRelayEnvoy> envoys, long timestamp,
+        bool firstMessage = true)
     {
-        var reportedThread = isThread
-            ? threadRef
-            : !IsAnnouncements(channel)
-              && DiscordCommonsBroadcast.InvitesOrAddressesEnvoys(content, broadcastRoleId, envoys)
-                ? $"message:{messageId}"
+        if (isThread)
+            return firstMessage && threadRef is not null
+                ? DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+                    messageId, participantId, content, null, channel, channelId, threadRef,
+                    timestamp, attachments)
                 : null;
-        return reportedThread is null
-            ? null
-            : DiscordCommonsRelayService.BuildHostParticipantPostPayload(
-                messageId, participantId, content, null, channel, channelId, reportedThread,
-                timestamp, attachments);
+        if (IsAnnouncements(channel)) return null;
+        return firstMessage
+               && DiscordCommonsBroadcast.InvitesOrAddressesEnvoys(content, broadcastRoleId, envoys)
+            ? DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+                messageId, participantId, content, null, channel, channelId, $"message:{messageId}",
+                timestamp, attachments)
+            : DiscordCommonsRelayService.BuildHostContextPostPayload(
+                messageId, participantId, content, channel, channelId, timestamp, attachments);
     }
 
     private async Task<IReadOnlyList<DiscordCommonsRelayEnvoy>> CommonsEnvoyDirectoryAsync(
