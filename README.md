@@ -698,6 +698,14 @@ POST /bindings/{entityId}/messages
   while the owner in the Leaf UI can end any. While one discussion leads, another one that
   asks to lead gets `409 discord_conversation_led_elsewhere`. Messages sent without the flag
   are delivered and answered as before.
+- `POST /bindings/{entityId}/lead`, with an optional `{ "leadForMinutes": n }` body, takes
+  the lead without posting anything, under the same caller, Agent, owner, DM-allowlist, and
+  window rules as `leadConversation: true`. It subscribes the discussion to the replies, so a
+  discussion that only received reply notices can take over before it writes. The leading
+  discussion calling it again renews (a window it names replaces the current one); another
+  discussion gets the same `409` with the current lead. If the reply callback cannot be
+  recorded, a new claim is put back and an existing one hands back, with
+  `503 reply_callback_unavailable`.
 - While the discussion leads, inbound messages are admitted exactly as before: same inbound
   Sentinel review, same transcript, same reply callback. The session still runs its turn, so
   its own history stays complete and in order. Each turn carries a trusted
@@ -715,6 +723,9 @@ POST /bindings/{entityId}/messages
   handed_back`, `reply_policy: answer`, the leader's messages it has not yet heard, and the
   IDs of its replies that were never posted. From then on it answers on its own. A reply
   still being written for a led turn stays unposted.
+- A session reply that was already in the outbox when the lead was claimed (under outbound
+  review, or queued) is not posted either: it is taken off the outbox and listed as unposted.
+  Only a reply Discord already shows part of is finished, so nobody sees half a message.
 - `GET /bindings` items carry `conversationLead`, and so do `GET /bindings/{entityId}/lead`
   and the send response: `state` is `session` (the session answers), `owner` (a discussion
   leads, with `leadDiscussionId` and `expiresAt`), or `handing_back` (ended; the next turn

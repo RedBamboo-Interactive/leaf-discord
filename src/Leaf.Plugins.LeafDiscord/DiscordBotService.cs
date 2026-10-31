@@ -4536,6 +4536,11 @@ internal sealed class DiscordBotRuntime(
             {
                 var delivery = pending[index];
                 if (delivery.Generation != binding.Generation) continue;
+                // While a private discussion leads, it is the only voice, even for a reply the
+                // session wrote before the lead was claimed.
+                if (DiscordConversationCoordinator.IsSessionReply(delivery)
+                    && await conversations.WithholdForLeadAsync(binding, delivery, ct))
+                    continue;
                 if (delivery.State == DiscordDeliveryStore.ReviewingState)
                 {
                     // Nothing after a reply under review may overtake it. The review runs off

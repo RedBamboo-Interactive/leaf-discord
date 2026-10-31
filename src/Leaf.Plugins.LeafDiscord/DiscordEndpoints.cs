@@ -24,6 +24,9 @@ public sealed record DiscordBindingMessageRequest(
     int? LeadForMinutes = null,
     bool Announcement = false);
 
+/// <summary>Claims or renews a conversation lead without sending anything.</summary>
+public sealed record DiscordConversationLeadRequest(int? LeadForMinutes = null);
+
 public sealed record DiscordBindingOutputAssetRequest(
     string AssetId,
     string Description);
@@ -1244,6 +1247,32 @@ public static class DiscordEndpoints
                 conversationLead = DiscordConversationLeadStore.Project(
                     await leads.GetAsync(binding, ct), DateTimeOffset.UtcNow),
             });
+        });
+
+        group.MapPost("/bindings/{id:guid}/lead", async (
+            Guid id,
+            DiscordConversationLeadRequest? request,
+            HttpContext http,
+            DiscordBindingStore bindings,
+            DiscordAgentResolver agents,
+            DiscordBotConfigurationStore configurations,
+            DiscordReplySubscriptionStore replySubscriptions,
+            DiscordConversationLeadStore leads,
+            ILoggerFactory loggers,
+            CancellationToken ct) =>
+        {
+            var caller = ReadBindingMessageCaller(http);
+            if (caller is null)
+                return Forbidden("A signed private Nova Agent discussion or binding-authorized Nova automation is required.");
+            var binding = await bindings.GetAsync(id, ct);
+            if (binding is null) return Results.NotFound();
+            var agent = await agents.ResolveAsync(binding.AgentId, ct);
+            return await ClaimLeadAsync(
+                caller, binding, agent?.Id.ToString(),
+                await configurations.FindByApplicationIdAsync(binding.ApplicationId, ct),
+                request?.LeadForMinutes, leads, replySubscriptions,
+                loggers.CreateLogger("Leaf.Plugins.LeafDiscord.ConversationLeads"),
+                DateTimeOffset.UtcNow, ct);
         });
 
         group.MapDelete("/bindings/{id:guid}/lead", async (
@@ -2632,7 +2661,7 @@ public static class DiscordEndpoints
         bool notifyReplies,
         LeafAgentCaller caller,
         DiscordBinding binding,
-        string messageUid,
+        string? messageUid,
         DiscordReplySubscriptionStore replySubscriptions,
         ILogger logger,
         CancellationToken ct)
@@ -2686,6 +2715,109 @@ public static class DiscordEndpoints
                 message = "A leading discussion must receive the replies; leadConversation cannot be combined with notifyReplies: false.",
             });
         return null;
+    }
+
+    /// <summary>
+    /// Takes the lead of a Discord conversation without posting: the same authorization and
+    /// claim as <c>leadConversation: true</c> on the binding messages route. The discussion that
+    /// already leads renews (a window it names replaces the current one); another one gets 409
+    /// with the current lead. The leading discussion must hear the replies, so a claim whose
+    /// reply callback cannot be recorded is put back and reported as unavailable.
+    /// </summary>
+    internal static async Task<IResult> ClaimLeadAsync(
+        LeafAgentCaller caller,
+        DiscordBinding binding,
+        string? resolvedAgentEntityId,
+        LeafDiscordConfig? config,
+        int? leadForMinutes,
+        DiscordConversationLeadStore leads,
+        DiscordReplySubscriptionStore replySubscriptions,
+        ILogger logger,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        if (!binding.Enabled || binding.SessionId is null
+            || binding.ConversationHandleId is null || config is null)
+            return Results.Conflict(new
+            {
+                error = "discord_binding_session_unavailable",
+                message = "The Discord binding has no enabled existing Agent session",
+            });
+        if (!CanAddressBinding(caller, binding, resolvedAgentEntityId))
+            return Forbidden("This Agent cannot address that Discord binding.");
+        if (ValidateLeadRequest(
+                new DiscordBindingMessageRequest(
+                    "", "", LeadConversation: true, LeadForMinutes: leadForMinutes),
+                caller) is { } invalid)
+            return invalid;
+        try
+        {
+            DiscordBotService.ValidateExistingBindingTarget(binding, config.DmAllowlist);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Results.Json(new { error = "binding_not_allowed", message = ex.Message },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        var discussionId = caller.DiscussionId!;
+        var window = leadForMinutes is { } minutes ? TimeSpan.FromMinutes(minutes) : (TimeSpan?)null;
+        var renewing = LeadsNow(await leads.GetAsync(binding, ct), caller, now);
+        DiscordConversationLead? lead;
+        JsonObject? previous = null;
+        if (renewing)
+        {
+            lead = await leads.RenewAsync(binding, discussionId, window, now, ct);
+        }
+        else
+        {
+            try
+            {
+                (lead, previous) = await leads.ClaimAsync(
+                    binding, discussionId, caller.BeneficiaryId, caller.ActorEntityId,
+                    window ?? DiscordConversationLeadStore.DefaultWindow, now, ct);
+            }
+            catch (DiscordConversationLedElsewhereException ex)
+            {
+                return Results.Conflict(new
+                {
+                    error = "discord_conversation_led_elsewhere",
+                    message = ex.Message,
+                    conversationLead = DiscordConversationLeadStore.Project(ex.Lead, now),
+                });
+            }
+        }
+
+        var replyCallback = await SubscribeRepliesAsync(
+            true, caller, binding, null, replySubscriptions, logger, ct);
+        if (replyCallback is null)
+        {
+            if (renewing)
+                await leads.ReleaseAsync(
+                    binding, "reply_callback_unavailable", now, discussionId, CancellationToken.None);
+            else
+                await leads.RevertClaimAsync(binding, previous, CancellationToken.None);
+            return Results.Json(new
+            {
+                error = "reply_callback_unavailable",
+                message = "The leading discussion must receive the replies, and its reply callback could not be recorded.",
+                conversationLead = DiscordConversationLeadStore.Project(
+                    await leads.GetAsync(binding, CancellationToken.None), now),
+            }, statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        return Results.Ok(new
+        {
+            ok = true,
+            bindingId = binding.BindingId,
+            sessionId = binding.SessionId,
+            renewed = renewing,
+            replyCallback = new
+            {
+                discussionId = replyCallback.DiscussionId,
+                expiresAt = replyCallback.ExpiresAt,
+            },
+            conversationLead = DiscordConversationLeadStore.Project(lead, now),
+        });
     }
 
     /// <summary>

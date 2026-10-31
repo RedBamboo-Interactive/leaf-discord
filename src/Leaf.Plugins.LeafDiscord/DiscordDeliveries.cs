@@ -930,6 +930,38 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
         }, ct: ct);
     }
 
+    /// <summary>
+    /// Takes every chunk of one reply off the outbox before any of it reaches Discord: chunks
+    /// in review, queued, or waiting to retry become <c>cancelled</c>. Returns false, changing
+    /// nothing, when Discord already has part of the reply, so nobody sees half a message.
+    /// </summary>
+    public async Task<bool> WithholdUnsentMessageAsync(
+        DiscordBinding binding, string messageUid, string reason, CancellationToken ct = default)
+    {
+        var rows = (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["binding_id"] = binding.BindingId,
+                ["message_uid"] = messageUid,
+            },
+            Limit = 100,
+        }, ct)).Select(Map)
+            .Where(item => item.Generation == binding.Generation && item.Kind == MessageKind)
+            .ToList();
+        if (rows.Any(item => item.State is "sent" or "edited" or "deleted")) return false;
+        foreach (var row in rows.Where(item => item.State is ReviewingState or "queued" or "retry"))
+            _ = await store.PatchAsync(row.EntityId, new JsonObject
+            {
+                ["state"] = "cancelled",
+                ["payload"] = null,
+                ["last_error"] = reason,
+            }, ct: ct);
+        return true;
+    }
+
     public async Task CancelPendingOutboundAsync(
         string bindingId,
         long generation,

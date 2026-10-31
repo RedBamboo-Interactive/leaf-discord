@@ -70,6 +70,39 @@ public sealed class DiscordConversationCoordinator(
             ? lead
             : null;
 
+    /// <summary>Why a reply was taken off the outbox when a discussion took the lead.</summary>
+    internal const string WithheldForLeadReason = "conversation_lead";
+
+    /// <summary>
+    /// A reply the session itself wrote: not owner outreach, not a bridge notice, and not a
+    /// message delivered before its transcript copy existed.
+    /// </summary>
+    internal static bool IsSessionReply(DiscordDelivery delivery)
+        => delivery.Kind == DiscordDeliveryStore.MessageKind
+           && delivery.ReviewExempt is null
+           && delivery.MessageUid is { } messageUid
+           && !messageUid.StartsWith("discord-outreach-", StringComparison.Ordinal);
+
+    /// <summary>
+    /// A session reply already in the outbox when a private discussion took the lead (written
+    /// before the claim, or by a reconcile that raced it) is not posted while that discussion
+    /// leads: it is recorded as unposted, exactly like a reply written during the lead. A reply
+    /// Discord already shows part of is finished instead.
+    /// </summary>
+    public async Task<bool> WithholdForLeadAsync(
+        DiscordBinding binding, DiscordDelivery delivery, CancellationToken ct = default)
+    {
+        if (!IsSessionReply(delivery) || await ActiveLeadAsync(binding, ct) is null) return false;
+        if (!await deliveries.WithholdUnsentMessageAsync(
+                binding, delivery.MessageUid!, WithheldForLeadReason, ct))
+            return false;
+        await leadStore.RecordUnpostedReplyAsync(binding, delivery.MessageUid!, ct);
+        logger.LogInformation(
+            "Discord reply {MessageUid} on {BindingId} was not posted: a private discussion took the lead before it was sent",
+            delivery.MessageUid, binding.BindingId);
+        return true;
+    }
+
     internal DiscordConversationCoordinator(
         DiscordBindingStore bindings,
         DiscordDeliveryStore deliveries,
@@ -927,6 +960,12 @@ public sealed class DiscordConversationCoordinator(
             // mid-write is completed by the next settled read, which re-reads from the cursor.
             var expected = chunks.Max(item => item.ChunkCount ?? chunks.Count);
             if (chunks.Select(item => item.ChunkIndex).Distinct().Count() < expected) return progressed;
+            // A lead taken since the reply was written keeps it off Discord: no review needed.
+            if (await WithholdForLeadAsync(current, chunks[0], ct))
+            {
+                progressed = true;
+                continue;
+            }
             // A reply waiting to ask the Sentinel again also holds every later reply.
             if (chunks.Any(item => item.ReviewNextAt > clock.GetUtcNow())) return progressed;
             var review = chunks.Select(item => item.OutboundReview).FirstOrDefault(item => item is not null)

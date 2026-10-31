@@ -548,6 +548,209 @@ public sealed class DiscordConversationLeadTests
         Assert.Null(projected[1].Metadata?["discord"]);
     }
 
+    private static readonly LeafAgentCaller Leader =
+        new("agent-1", "owner-1") { DiscussionId = "d1" };
+
+    private static LeafDiscordConfig BotConfig(params string[] dmAllowlist)
+        => new("100000000000000001", new string('a', 64), "token", true, "nova", "deep-codex",
+            "nova-discord-external", "avatar", new HashSet<string>(dmAllowlist),
+            new HashSet<string>(), 1024);
+
+    private static Task<IResult> ClaimLeadAsync(
+        Harness h, LeafAgentCaller caller, int? minutes = null,
+        LeafDiscordConfig? config = null, DiscordBinding? binding = null,
+        DiscordReplySubscriptionStore? subscriptions = null, string agentEntityId = "agent-1")
+        => DiscordEndpoints.ClaimLeadAsync(
+            caller, binding ?? h.Binding, agentEntityId, config ?? BotConfig(Takit.ExternalId),
+            minutes, h.Leads, subscriptions ?? new DiscordReplySubscriptionStore(h.Entities),
+            NullLogger.Instance, h.Clock.GetUtcNow(), default);
+
+    private static int Status(IResult result)
+        => ((IStatusCodeHttpResult)result).StatusCode ?? StatusCodes.Status200OK;
+
+    private static JsonNode Body(IResult result)
+        => JsonSerializer.SerializeToNode(((IValueHttpResult)result).Value)!;
+
+    [Fact]
+    public async Task A_discussion_takes_the_lead_without_posting_anything()
+    {
+        var h = await Harness.CreateAsync();
+        var subscriptions = new DiscordReplySubscriptionStore(h.Entities);
+
+        var result = await ClaimLeadAsync(h, Leader, subscriptions: subscriptions);
+
+        Assert.Equal(StatusCodes.Status200OK, Status(result));
+        var body = Body(result);
+        Assert.False(body["renewed"]!.GetValue<bool>());
+        Assert.Equal("owner", body["conversationLead"]!["State"]!.GetValue<string>());
+        Assert.Equal("d1", body["replyCallback"]!["discussionId"]!.GetValue<string>());
+        var lead = (await h.Leads.GetAsync(h.Binding))!;
+        Assert.True(lead.IsActive(h.Clock.GetUtcNow()));
+        Assert.Equal("d1", lead.DiscussionId);
+        Assert.Equal(DiscordConversationLeadStore.DefaultWindow, lead.Window);
+        Assert.Empty(lead.OwnerMessages);
+        // Nothing was sent: no outbox row, no turn, no review.
+        Assert.Empty(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        Assert.Empty(h.Provider.Inputs);
+        Assert.Empty(h.Sentinel.Requests);
+        // The leader hears the replies.
+        Assert.Contains(await subscriptions.ActiveAsync(h.Binding.BindingId, DateTimeOffset.UtcNow),
+            subscription => subscription.DiscussionId == "d1");
+
+        // A session reply written now stays off Discord, as with a lead taken by a message.
+        await h.SubmitAsync("1001", "ça marche toujours pas");
+        h.Reply(1, "reply-1", "Mets à jour et relance.");
+        await h.ReconcileAsync();
+        Assert.Empty(await h.Rows("reply-1"));
+    }
+
+    [Fact]
+    public async Task The_leader_renews_idempotently_and_another_discussion_gets_the_current_lead()
+    {
+        var h = await Harness.CreateAsync();
+        Assert.Equal(StatusCodes.Status200OK, Status(await ClaimLeadAsync(h, Leader, minutes: 10)));
+        var started = (await h.Leads.GetAsync(h.Binding))!.StartedAt;
+        h.Clock.Advance(TimeSpan.FromMinutes(5));
+
+        // Again without a window: renewed with the window it already had.
+        var renewed = await ClaimLeadAsync(h, Leader);
+        Assert.Equal(StatusCodes.Status200OK, Status(renewed));
+        Assert.True(Body(renewed)["renewed"]!.GetValue<bool>());
+        var lead = (await h.Leads.GetAsync(h.Binding))!;
+        Assert.Equal(TimeSpan.FromMinutes(10), lead.Window);
+        Assert.Equal(h.Clock.GetUtcNow().AddMinutes(10), lead.ExpiresAt);
+        Assert.Equal(started, lead.StartedAt);
+
+        // With a window, that window replaces it.
+        await ClaimLeadAsync(h, Leader, minutes: 30);
+        Assert.Equal(TimeSpan.FromMinutes(30), (await h.Leads.GetAsync(h.Binding))!.Window);
+
+        var other = new LeafAgentCaller("agent-1", "owner-1") { DiscussionId = "d2" };
+        var conflict = await ClaimLeadAsync(h, other);
+        Assert.Equal(StatusCodes.Status409Conflict, Status(conflict));
+        Assert.Equal("discord_conversation_led_elsewhere", Body(conflict)["error"]!.GetValue<string>());
+        Assert.Equal("d1", Body(conflict)["conversationLead"]!["LeadDiscussionId"]!.GetValue<string>());
+        Assert.Equal("d1", (await h.Leads.GetAsync(h.Binding))!.DiscussionId);
+    }
+
+    [Fact]
+    public async Task The_lead_route_applies_the_messages_route_authorization()
+    {
+        var h = await Harness.CreateAsync();
+        var automation = new LeafAgentCaller("agent-1", "owner-1", "automation-1");
+        var stranger = new LeafAgentCaller("agent-1", "owner-2") { DiscussionId = "d1" };
+
+        // An automation must be authorized on the binding, and even then cannot lead.
+        Assert.Equal(StatusCodes.Status403Forbidden, Status(await ClaimLeadAsync(h, automation)));
+        Assert.Equal("lead_requires_discussion", Error(await ClaimLeadAsync(h, automation,
+            binding: h.Binding with { AuthorizedAutomationIds = new HashSet<string> { "automation-1" } })));
+        Assert.Equal("invalid_lead_window", Error(await ClaimLeadAsync(h, Leader, minutes: 0)));
+        Assert.Equal("invalid_lead_window", Error(await ClaimLeadAsync(
+            h, Leader, minutes: (int)DiscordConversationLeadStore.MaxWindow.TotalMinutes + 1)));
+        Assert.Equal(StatusCodes.Status403Forbidden, Status(await ClaimLeadAsync(h, stranger)));
+        Assert.Equal(StatusCodes.Status403Forbidden,
+            Status(await ClaimLeadAsync(h, Leader, agentEntityId: "agent-2")));
+        // A DM counterpart outside the allowlist cannot be led, exactly as it cannot be messaged.
+        var notAllowed = await ClaimLeadAsync(h, Leader, config: BotConfig());
+        Assert.Equal(StatusCodes.Status403Forbidden, Status(notAllowed));
+        Assert.Equal("binding_not_allowed", Error(notAllowed));
+        Assert.Equal(StatusCodes.Status409Conflict,
+            Status(await ClaimLeadAsync(h, Leader, binding: h.Binding with { Enabled = false })));
+
+        Assert.Null(await h.Leads.GetAsync(h.Binding));
+    }
+
+    [Fact]
+    public async Task A_claim_whose_discussion_cannot_hear_the_replies_is_put_back()
+    {
+        var h = await Harness.CreateAsync();
+        var broken = new DiscordReplySubscriptionStore(
+            FailingWritesStore.Create(h.Entities, DiscordReplySubscriptionStore.TypeSlug));
+
+        var result = await ClaimLeadAsync(h, Leader, subscriptions: broken);
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, Status(result));
+        Assert.Equal("reply_callback_unavailable", Error(result));
+        Assert.Null(await h.Leads.GetAsync(h.Binding));
+
+        // A leader already in place that loses its callback hands back rather than going deaf.
+        await ClaimLeadAsync(h, Leader);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable,
+            Status(await ClaimLeadAsync(h, Leader, subscriptions: broken)));
+        var lead = (await h.Leads.GetAsync(h.Binding))!;
+        Assert.False(lead.IsActive(h.Clock.GetUtcNow()));
+        Assert.Equal("reply_callback_unavailable", lead.ReleaseReason);
+    }
+
+    [Fact]
+    public async Task A_reply_in_review_when_the_lead_is_claimed_is_never_posted()
+    {
+        var h = await Harness.CreateAsync();
+        await h.SubmitAsync("1001", "ça marche toujours pas");
+        // The session's turn settles and its reply reaches the outbox before the claim...
+        h.Reply(1, "reply-1", "Mets à jour et relance.");
+        await h.ReconcileAsync();
+        Assert.NotEmpty(await h.Rows("reply-1"));
+
+        // ...then the discussion that is fixing the problem takes the lead.
+        await ClaimLeadAsync(h, Leader);
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+
+        Assert.Empty(await h.Rows("reply-1"));
+        Assert.Empty(h.Sentinel.Requests);
+        Assert.Equal(["reply-1"], (await h.Leads.GetAsync(h.Binding))!.UnpostedReplies);
+    }
+
+    [Fact]
+    public async Task A_reviewed_reply_queued_when_the_lead_is_claimed_is_withheld_at_send()
+    {
+        var h = await Harness.CreateAsync();
+        await h.SubmitAsync("1001", "ça marche toujours pas");
+        h.Reply(1, "reply-1", "Mets à jour et relance.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        var queued = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal("queued", queued.State);
+        Assert.False(await h.Coordinator.WithholdForLeadAsync(h.Binding, queued));
+
+        await ClaimLeadAsync(h, Leader);
+
+        // What the outbox drain asks just before sending.
+        Assert.True(await h.Coordinator.WithholdForLeadAsync(h.Binding, queued));
+        Assert.Empty(await h.Rows("reply-1"));
+        var lead = (await h.Leads.GetAsync(h.Binding))!;
+        Assert.Equal(["reply-1"], lead.UnpostedReplies);
+        // The session hears on its next turn that the reply was never posted.
+        await h.SubmitAsync("1002", "alors ?");
+        Assert.Equal("reply-1", h.Provider.Inputs[^1].Metadata!["discord_conversation_lead"]!
+            ["unposted_replies"]![0]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Owner_outreach_notices_and_partly_posted_replies_are_not_withheld()
+    {
+        var h = await Harness.CreateAsync();
+        var outreach = await h.Coordinator.SendExistingProactiveAsync(
+            h.Binding, "approve-1", "Je regarde, ne touche à rien pour l'instant.");
+        await h.Coordinator.EnqueueNoticeAsync(h.Binding, "1001", "I could not admit that message.");
+        var partial = new ExternalConversationMessage(
+            new ExternalConversationCursor("epoch-1", 9), "reply-2", "assistant", "text",
+            "first half / second half", DateTimeOffset.UtcNow);
+        var sentChunk = await h.Deliveries.EnqueueOutboundAsync(h.Binding, partial, 0, "first half");
+        var nextChunk = await h.Deliveries.EnqueueOutboundAsync(h.Binding, partial, 1, "second half");
+        await h.Deliveries.MarkSentAsync(sentChunk, "300000000000002000");
+
+        await ClaimLeadAsync(h, Leader);
+
+        var pending = await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId);
+        foreach (var row in pending)
+            Assert.False(await h.Coordinator.WithholdForLeadAsync(h.Binding, row));
+        Assert.Contains(pending, row => row.MessageUid == outreach.MessageUid);
+        Assert.Contains(pending, row => row.ReviewExempt == DiscordDeliveryStore.BridgeNoticeExemption);
+        Assert.Contains(pending, row => row.EntityId == nextChunk.EntityId);
+        Assert.Empty((await h.Leads.GetAsync(h.Binding))!.UnpostedReplies);
+    }
+
     private static DiscordBindingMessageRequest Request(
         bool? lead = null, int? minutes = null, bool notify = true)
         => new("hello", "key-1", NotifyReplies: notify, LeadConversation: lead, LeadForMinutes: minutes);
@@ -772,5 +975,36 @@ public sealed class DiscordConversationLeadTests
 
         public IDisposable Subscribe(string eventType, Func<PluginEvent, Task> handler)
             => throw new NotSupportedException();
+    }
+}
+
+/// <summary>An entity store whose writes of one type fail, like an unavailable database.</summary>
+public class FailingWritesStore : System.Reflection.DispatchProxy
+{
+    private Leaf.Sdk.Services.IEntityStore inner = null!;
+    private string failingType = "";
+
+    public static Leaf.Sdk.Services.IEntityStore Create(
+        Leaf.Sdk.Services.IEntityStore inner, string failingType)
+    {
+        var proxy = Create<Leaf.Sdk.Services.IEntityStore, FailingWritesStore>();
+        var store = (FailingWritesStore)(object)proxy;
+        store.inner = inner;
+        store.failingType = failingType;
+        return proxy;
+    }
+
+    protected override object? Invoke(System.Reflection.MethodInfo? targetMethod, object?[]? args)
+    {
+        if (targetMethod!.Name == "UpsertBySlugAsync" && Equals(args?[0], failingType))
+            throw new InvalidOperationException("The entity store is unavailable.");
+        try
+        {
+            return targetMethod.Invoke(inner, args);
+        }
+        catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw ex.InnerException;
+        }
     }
 }
