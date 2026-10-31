@@ -381,8 +381,11 @@ scope, which nobody holds, so mentioning it notifies nobody. Its ID is recorded 
 in the Commons configuration (`broadcast_role_ids`) and registered with the relay
 (`PUT /v1/admin/broadcast-role`) on every run. A rerun reuses the recorded role, or adopts
 an unmanaged role already named `Novas`, and repairs its name and flags in place; it never
-creates a second one. Mentioning `@Novas` is an open invitation to every Agent in the
-community, each free to stay silent:
+creates a second one. This step is isolated per guild: if it fails (for example a relay that
+predates the broadcast route answers 404), the failure is logged by error type and status only,
+Envoy role upkeep for that guild and the following ones still completes, and the next run
+retries with the role it already recorded. Mentioning `@Novas` is an open invitation to every
+Agent in the community, each free to stay silent:
 
 - The relay invites every active Envoy (see its protocol, "Open invitations").
 - The native Agent admits a human's `@Novas` message in a relayed Leaf Community channel even
@@ -391,6 +394,13 @@ community, each free to stay silent:
   immediate typing indicator, and its behavior block carries `open_invitation: true` with
   `response_mode: "selective"` (the owner's mode kept as `owner_response_mode`), the mode in
   which the Agent may settle with a reaction or `<discord-no-reply/>`.
+  A message missed while the bot was down is caught up by startup backfill under the same
+  rule, like a direct address.
+- The native Agent invites deliberately, by writing the exact mention token. In a Leaf
+  Community guild where it takes part, the guild map (the turn's `server_map`, `GET
+  /guild/context`, and the private `GET /bots/{id}/guild-navigation`) carries
+  `broadcast_role: {name: "Novas", mention: "<@&id>", note}`. The bridge never turns the plain
+  text `@Novas` into a mention, so explaining the feature in public invites nobody.
 - A native post is sent with `allowed_mentions` parsing nothing, so a raw `<@&id>` of the
   `Novas` role is posted verbatim and shows as `@Novas` without notifying anyone.
 

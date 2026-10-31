@@ -240,6 +240,83 @@ public static partial class DiscordCommonsBroadcast
     }
 
     /// <summary>
+    /// The broadcast role as the Agent reads it in a guild map: the exact mention token to write
+    /// when it means to invite every Agent, and what that does.
+    /// </summary>
+    public static JsonObject MapNode(string roleId) => new()
+    {
+        ["name"] = RoleName,
+        ["mention"] = $"<@&{roleId}>",
+        ["note"] = "Writing this exact mention token in a Leaf Community post invites every Novas "
+            + "(every Agent in the community) to answer; answering is optional for them. "
+            + "The plain text @Novas is not a mention and invites nobody.",
+    };
+
+    /// <summary>
+    /// The broadcast role a guild map shows: only in a Leaf Community guild where the native
+    /// Agent takes part (a silent host never posts there) and once the role is recorded.
+    /// </summary>
+    public static string? NavigableRoleId(DiscordCommonsConfiguration? config, string guildId)
+        => config?.Scope(guildId) is { SuppressesNativeAgent: false }
+            ? config.BroadcastRoleId(guildId)
+            : null;
+
+    /// <summary>
+    /// Ensures the guild's Novas role, records its ID and registers it with the relay. A failure
+    /// (a relay that predates the broadcast route, a Discord error) is logged by type and status
+    /// only and reported as false, never thrown, so the caller's Envoy role upkeep for this and
+    /// later guilds goes on and the next run retries. A role already created is recorded before
+    /// the relay is called, so a retry reuses it.
+    /// </summary>
+    internal static async Task<bool> TryReconcileRoleAsync(
+        DiscordRestTransport rest,
+        DiscordCommonsConfigurationStore configurations,
+        DiscordCommonsRelayService relay,
+        ILogger logger,
+        Guid botId,
+        string botToken,
+        string guildId,
+        List<DiscordManagedRole> roles,
+        CancellationToken ct)
+    {
+        try
+        {
+            var recorded = (await configurations.GetAsync(botId, ct))?.BroadcastRoleId(guildId);
+            var (role, update) = Plan(roles, recorded);
+            if (role is null)
+            {
+                role = await rest.CreateGuildRoleAsync(botToken, guildId, RoleName, ct);
+                roles.Add(role);
+            }
+            else if (update)
+            {
+                role = await rest.ModifyGuildRoleAsync(botToken, guildId, role.Id, RoleName, ct);
+            }
+            if (!string.Equals(recorded, role.Id, StringComparison.Ordinal))
+                await configurations.SetBroadcastRoleIdAsync(botId, guildId, role.Id, ct);
+            await relay.SetBroadcastRoleAsync(botId, guildId, role.Id, ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var status = ex switch
+            {
+                HttpRequestException { StatusCode: { } code } => (int)code,
+                DiscordRestException discord => (int)discord.StatusCode,
+                _ => (int?)null,
+            };
+            logger.LogWarning(
+                "Leaf Community broadcast role reconciliation failed for guild {GuildId} with {ErrorType} (HTTP {StatusCode}); retrying on the next run",
+                guildId, ex.GetType().Name, status);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Behavior context for a message that reached the native Agent only as an open invitation.
     /// The Agent's provider lets silence settle a turn only in <c>selective</c> mode, so the
     /// message is presented that way; the owner's own mode is kept beside it.

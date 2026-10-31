@@ -367,7 +367,7 @@ public sealed class DiscordBotService(
         var runtime = runtimes.TryGetValue(config.EntityId, out var current)
             ? current
             : throw new InvalidOperationException("Discord bot is not running.");
-        return runtime.ListGuildNavigation();
+        return await runtime.ListGuildNavigationAsync(ct);
     }
 
     public async Task<DiscordForumPostResult> CreateForumPostAsync(
@@ -837,14 +837,16 @@ internal sealed class DiscordBotRuntime(
             .ToArray();
     }
 
-    public IReadOnlyList<JsonObject> ListGuildNavigation()
+    public async Task<IReadOnlyList<JsonObject>> ListGuildNavigationAsync(CancellationToken ct = default)
     {
         var current = client
             ?? throw new InvalidOperationException("Discord bot is not connected.");
         var capturedAt = DateTimeOffset.UtcNow;
+        var commonsConfig = await commons.GetConfigurationAsync(configId, ct);
         return current.Guilds
             .OrderBy(guild => guild.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(guild => BuildGuildNavigation(guild, "", capturedAt))
+            .Select(guild => BuildGuildNavigation(guild, "", capturedAt,
+                DiscordCommonsBroadcast.NavigableRoleId(commonsConfig, guild.Id.ToString())))
             .ToArray();
     }
 
@@ -1451,14 +1453,20 @@ internal sealed class DiscordBotRuntime(
             guild.Id.ToString(), guild.Name, channel.Id.ToString(), channel.Name);
     }
 
-    public Task<JsonObject> GetGuildNavigationAsync(
+    public async Task<JsonObject> GetGuildNavigationAsync(
         DiscordBinding source, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         var guild = ResolveGuild(source);
-        return Task.FromResult(BuildGuildNavigation(
-            guild, source.ConversationId, DateTimeOffset.UtcNow));
+        return BuildGuildNavigation(
+            guild, source.ConversationId, DateTimeOffset.UtcNow,
+            await CommonsBroadcastRoleIdAsync(guild.Id.ToString(), ct));
     }
+
+    /// <summary>The broadcast role a guild map of this bot shows, if any.</summary>
+    private async Task<string?> CommonsBroadcastRoleIdAsync(string guildId, CancellationToken ct = default)
+        => DiscordCommonsBroadcast.NavigableRoleId(
+            await commons.GetConfigurationAsync(configId, ct), guildId);
 
     public async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
         DiscordBinding source, string channelId, int limit,
@@ -1636,7 +1644,8 @@ internal sealed class DiscordBotRuntime(
             }).ToArray());
 
     private static JsonObject BuildGuildNavigation(
-        SocketGuild guild, string currentChannelId, DateTimeOffset capturedAt)
+        SocketGuild guild, string currentChannelId, DateTimeOffset capturedAt,
+        string? broadcastRoleId)
     {
         var categories = guild.CategoryChannels
             .Where(category => guild.CurrentUser.GetPermissions(category).ViewChannel)
@@ -1654,7 +1663,7 @@ internal sealed class DiscordBotRuntime(
             .ToArray();
         return DiscordGuildNavigationBuilder.Build(
             guild.Id.ToString(), guild.Name, currentChannelId,
-            categories, channels, capturedAt);
+            categories, channels, capturedAt, broadcastRoleId);
     }
 
     private static DiscordGuildChannelSnapshot? ProjectGuildChannel(
@@ -2617,7 +2626,8 @@ internal sealed class DiscordBotRuntime(
                 CancelTyping(typingAdmission);
                 return;
             }
-            var guildContext = BuildGuildContext(message, config);
+            var guildContext = BuildGuildContext(message, config,
+                await CommonsBroadcastRoleIdAsync(binding.GuildId ?? ""));
             var submitStarted = Stopwatch.GetTimestamp();
             var admission = await conversations.SubmitAsync(binding, message.Id.ToString(),
                 new ExternalRequestor(message.Author.Id.ToString(),
@@ -2866,7 +2876,8 @@ internal sealed class DiscordBotRuntime(
             new ExternalRequestor($"envoy:{verified.EnvoyId}", verified.PersonaName),
             verified.Content,
             [],
-            guildContext: BuildGuildContext(message, config),
+            guildContext: BuildGuildContext(message, config,
+                await CommonsBroadcastRoleIdAsync(location.GuildId)),
             behaviorContext: behavior.ToTrustedMetadata(),
             relayContext: relayContext,
             channelGap: ChannelGapSource(message, config));
@@ -3662,16 +3673,39 @@ internal sealed class DiscordBotRuntime(
             ? new(DmStartupBackfillLimit, DmStartupBackfillMaxAge, false)
             : new(GuildStartupBackfillLimit, GuildStartupBackfillMaxAge, true);
 
+    /// <param name="openInvitation">The missed message mentions the Novas role: it is caught up
+    /// like a direct address, and the live path then admits it as an open invitation.</param>
     internal static bool ShouldAdmitStartupBackfillMessage(
         string bindingKind,
         DateTimeOffset messageTimestamp,
         DateTimeOffset observedAt,
         bool mentioned,
-        bool repliesToBot)
+        bool repliesToBot,
+        bool openInvitation = false)
     {
         var policy = GetStartupBackfillPolicy(bindingKind);
         if (messageTimestamp < observedAt - policy.MaxAge) return false;
-        return !policy.RequiresDirectAddress || mentioned || repliesToBot;
+        return !policy.RequiresDirectAddress || mentioned || repliesToBot || openInvitation;
+    }
+
+    /// <summary>
+    /// A human message that mentions the Novas role in a relayed Leaf Community channel: the same
+    /// test as live admission, for a message read back after a restart.
+    /// </summary>
+    private async Task<bool> MentionsCommonsBroadcastAsync(IUserMessage message)
+    {
+        if (message.Author.IsBot || message.Source == MessageSource.Webhook
+            || CommonsLocation(message.Channel) is not { } location
+            || IsAnnouncements(location.Channel)
+            || !CanPostInCommonsLocation(message.Channel))
+            return false;
+        var config = await commons.GetConfigurationAsync(configId);
+        return config?.Scope(location.GuildId) is { } scope
+            && scope.Contains(location.ChannelId, location.CategoryId)
+            && DiscordCommonsBroadcast.Mentions(
+                message.Content,
+                message.MentionedRoleIds.Select(id => id.ToString()),
+                config.BroadcastRoleId(location.GuildId));
     }
 
     internal static CreateDiscordBinding? BuildExistingDmBackfill(
@@ -3735,7 +3769,8 @@ internal sealed class DiscordBotRuntime(
                     var mentioned = MentionsBot(message, client.CurrentUser.Id);
                     var repliesToBot = message.ReferencedMessage?.Author.Id == client.CurrentUser.Id;
                     if (!ShouldAdmitStartupBackfillMessage(
-                            binding.Kind, message.Timestamp, observedAt, mentioned, repliesToBot))
+                            binding.Kind, message.Timestamp, observedAt, mentioned, repliesToBot,
+                            await MentionsCommonsBroadcastAsync(message)))
                         continue;
                     admitted++;
                     await ProcessMessageAsync(message);
@@ -4311,7 +4346,11 @@ internal sealed class DiscordBotRuntime(
                             configId, guildId, envoy.Id, role.Id, ct);
                 }
                 commonsEnvoys[guildId] = (DateTimeOffset.UtcNow, envoys);
-                await ReconcileBroadcastRoleAsync(botToken, guildId, roles, ct);
+                // Never throws: a relay without the broadcast route must not stop Envoy role
+                // upkeep here or in the guilds after this one.
+                await DiscordCommonsBroadcast.TryReconcileRoleAsync(
+                    rest, commonsConfigurations, commons, logger, configId, botToken, guildId,
+                    roles, ct);
             }
             await commonsConfigurations.SetRoleReconciliationAsync(
                 configId,
@@ -4338,33 +4377,6 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
-    /// <summary>
-    /// Keeps exactly one mentionable, permissionless <c>Novas</c> role in the guild, records its
-    /// ID, and registers it with the relay as the broadcast role. Reruns reuse the recorded role
-    /// (or adopt one already named Novas) and never create a second.
-    /// </summary>
-    private async Task ReconcileBroadcastRoleAsync(
-        string botToken, string guildId, List<DiscordManagedRole> roles, CancellationToken ct)
-    {
-        var config = await commonsConfigurations.GetAsync(configId, ct);
-        var recorded = config?.BroadcastRoleId(guildId);
-        var (role, update) = DiscordCommonsBroadcast.Plan(roles, recorded);
-        if (role is null)
-        {
-            role = await rest.CreateGuildRoleAsync(
-                botToken, guildId, DiscordCommonsBroadcast.RoleName, ct);
-            roles.Add(role);
-        }
-        else if (update)
-        {
-            role = await rest.ModifyGuildRoleAsync(
-                botToken, guildId, role.Id, DiscordCommonsBroadcast.RoleName, ct);
-        }
-        if (!string.Equals(recorded, role.Id, StringComparison.Ordinal))
-            await commonsConfigurations.SetBroadcastRoleIdAsync(configId, guildId, role.Id, ct);
-        await commons.SetBroadcastRoleAsync(configId, guildId, role.Id, ct);
-    }
-
     private async Task PublishOwnerPresenceAsync(
         DiscordSocketClient source,
         bool forceRefresh = false,
@@ -4386,7 +4398,7 @@ internal sealed class DiscordBotRuntime(
     }
 
     private static JsonObject? BuildGuildContext(
-        IUserMessage message, LeafDiscordConfig config)
+        IUserMessage message, LeafDiscordConfig config, string? broadcastRoleId)
     {
         if (message.Channel is not SocketGuildChannel channel)
             return null;
@@ -4419,7 +4431,7 @@ internal sealed class DiscordBotRuntime(
             channel.Guild.Users.Count >= channel.Guild.MemberCount,
             capturedAt,
             BuildGuildNavigation(
-                channel.Guild, channel.Id.ToString(), capturedAt));
+                channel.Guild, channel.Id.ToString(), capturedAt, broadcastRoleId));
     }
 
     internal static bool ShouldDeferLegacyOwnerMaintenance(

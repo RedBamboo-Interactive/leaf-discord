@@ -222,11 +222,142 @@ public sealed class DiscordCommonsBroadcastTests
         Assert.Equal([content], DiscordMessageChunker.Split(content));
     }
 
+    [Fact]
+    public async Task A_relay_without_the_broadcast_route_never_breaks_role_reconciliation()
+    {
+        var store = new MemoryEntityStore();
+        var botId = Guid.NewGuid();
+        var configurations = new DiscordCommonsConfigurationStore(store);
+        await configurations.SaveAsync(botId, new DiscordCommonsConfigurationUpdate("", null, false, null,
+        [
+            new DiscordCommonsGuildScopeUpdate(
+                GuildId, true, [], [], "https://relay.example.test", "host-secret-for-test"),
+        ]));
+        var relayHandler = new CaptureHandler { Status = HttpStatusCode.NotFound };
+        await using var relay = new DiscordCommonsRelayService(
+            configurations, new DiscordCommonsIngestStore(store),
+            NullLogger<DiscordCommonsRelayService>.Instance, relayHandler);
+        var discordHandler = new CaptureHandler
+        {
+            Body = $"{{\"id\":\"{NovasRoleId}\",\"name\":\"Novas\",\"permissions\":\"0\",\"mentionable\":true,\"managed\":false}}",
+        };
+        using var rest = new DiscordRestTransport(discordHandler);
+        var logger = new ListLogger();
+
+        // An old relay 404s the new route: the step reports failure instead of throwing, so the
+        // caller's loop carries on with Envoy roles here and in later guilds.
+        List<DiscordManagedRole> roles = [];
+        Assert.False(await DiscordCommonsBroadcast.TryReconcileRoleAsync(
+            rest, configurations, relay, logger, botId, "bot-token-for-test", GuildId, roles,
+            CancellationToken.None));
+        Assert.Single(discordHandler.Requests, request => request.Method == HttpMethod.Post);
+        Assert.Equal(NovasRoleId, (await configurations.GetAsync(botId))!.BroadcastRoleId(GuildId));
+        var warning = Assert.Single(logger.Messages);
+        Assert.Contains("HTTP 404", warning, StringComparison.Ordinal);
+        Assert.DoesNotContain("host-secret-for-test", warning, StringComparison.Ordinal);
+        Assert.DoesNotContain("bot-token-for-test", warning, StringComparison.Ordinal);
+
+        // The next run, relay still old: the recorded role is reused, never duplicated.
+        Assert.False(await DiscordCommonsBroadcast.TryReconcileRoleAsync(
+            rest, configurations, relay, logger, botId, "bot-token-for-test", GuildId,
+            [new DiscordManagedRole(NovasRoleId, "Novas", "0", true, false)], CancellationToken.None));
+        Assert.Single(discordHandler.Requests, request => request.Method == HttpMethod.Post);
+
+        // Once the relay is deployed, the same run registers the role.
+        relayHandler.Status = HttpStatusCode.OK;
+        Assert.True(await DiscordCommonsBroadcast.TryReconcileRoleAsync(
+            rest, configurations, relay, logger, botId, "bot-token-for-test", GuildId,
+            [new DiscordManagedRole(NovasRoleId, "Novas", "0", true, false)], CancellationToken.None));
+        Assert.Single(discordHandler.Requests, request => request.Method == HttpMethod.Post);
+        Assert.Equal(3, relayHandler.Requests.Count);
+        Assert.Equal(NovasRoleId,
+            JsonNode.Parse(relayHandler.Requests[^1].Body!)!["discordRoleId"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Guild_maps_carry_the_exact_mention_token_with_a_note()
+    {
+        var map = DiscordGuildNavigationBuilder.Build(
+            GuildId, "Leaf", "", [], [], DateTimeOffset.Parse("2026-10-31T10:00:00Z"), NovasRoleId);
+        var role = map["broadcast_role"]!.AsObject();
+        Assert.Equal("Novas", role["name"]!.GetValue<string>());
+        Assert.Equal($"<@&{NovasRoleId}>", role["mention"]!.GetValue<string>());
+        var note = role["note"]!.GetValue<string>();
+        Assert.Contains("invites every Novas", note, StringComparison.Ordinal);
+        Assert.Contains("optional", note, StringComparison.Ordinal);
+
+        // The turn's guild context carries the server map, so the session reads the same token.
+        var context = DiscordGuildContextBuilder.Build(
+            "off", GuildId, "Leaf", "700000000000000007", "general", [], false,
+            DateTimeOffset.Parse("2026-10-31T10:00:00Z"), map);
+        Assert.Equal($"<@&{NovasRoleId}>",
+            context!["server_map"]!["broadcast_role"]!["mention"]!.GetValue<string>());
+        Assert.False(DiscordGuildNavigationBuilder.Build(
+            GuildId, "Leaf", "", [], [], DateTimeOffset.Parse("2026-10-31T10:00:00Z"))
+            .ContainsKey("broadcast_role"));
+    }
+
+    [Fact]
+    public async Task Only_participant_community_guilds_with_a_recorded_role_show_it()
+    {
+        var store = new MemoryEntityStore();
+        var botId = Guid.NewGuid();
+        var configurations = new DiscordCommonsConfigurationStore(store);
+        await configurations.SaveAsync(botId, new DiscordCommonsConfigurationUpdate("", null, false, null,
+        [
+            new DiscordCommonsGuildScopeUpdate(
+                GuildId, true, [], [], "https://relay.example.test", "host-secret-for-test",
+                NativeAgentMode: DiscordCommonsNativeAgentModes.Participant),
+            new DiscordCommonsGuildScopeUpdate(
+                OtherGuildId, true, [], [], "https://lab.example.test", "lab-secret-for-test",
+                NativeAgentMode: DiscordCommonsNativeAgentModes.SilentHost),
+        ]));
+        Assert.Null(DiscordCommonsBroadcast.NavigableRoleId(await configurations.GetAsync(botId), GuildId));
+
+        await configurations.SetBroadcastRoleIdAsync(botId, GuildId, NovasRoleId);
+        await configurations.SetBroadcastRoleIdAsync(botId, OtherGuildId, "777000000000000011");
+        var config = await configurations.GetAsync(botId);
+
+        Assert.Equal(NovasRoleId, DiscordCommonsBroadcast.NavigableRoleId(config, GuildId));
+        Assert.Null(DiscordCommonsBroadcast.NavigableRoleId(config, OtherGuildId));
+        Assert.Null(DiscordCommonsBroadcast.NavigableRoleId(config, "600000000000000026"));
+        Assert.Null(DiscordCommonsBroadcast.NavigableRoleId(null, GuildId));
+    }
+
+    [Fact]
+    public void A_missed_novas_message_is_caught_up_after_a_restart_like_a_direct_address()
+    {
+        var now = DateTimeOffset.Parse("2026-10-31T10:00:00Z");
+
+        Assert.True(DiscordBotRuntime.ShouldAdmitStartupBackfillMessage(
+            "guild_channel", now.AddMinutes(-5), now, false, false, openInvitation: true));
+        Assert.True(DiscordBotRuntime.ShouldAdmitStartupBackfillMessage(
+            "thread", now.AddMinutes(-5), now, false, false, openInvitation: true));
+        Assert.False(DiscordBotRuntime.ShouldAdmitStartupBackfillMessage(
+            "guild_channel", now.AddMinutes(-5), now, false, false));
+        // The same age bound as any backfilled message.
+        Assert.False(DiscordBotRuntime.ShouldAdmitStartupBackfillMessage(
+            "guild_channel", now.AddHours(-1), now, false, false, openInvitation: true));
+    }
+
+    private sealed class ListLogger : Microsoft.Extensions.Logging.ILogger
+    {
+        public List<string> Messages { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Messages.Add(formatter(state, exception) + (exception is null ? "" : " " + exception));
+    }
+
     private sealed record CapturedRequest(HttpMethod Method, string Uri, string? Authorization, string? Body);
 
     private sealed class CaptureHandler : HttpMessageHandler
     {
         public List<CapturedRequest> Requests { get; } = [];
+        public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
+        public string Body { get; init; } = $"{{\"discordRoleId\":\"{NovasRoleId}\"}}";
 
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken cancellationToken)
@@ -234,9 +365,11 @@ public sealed class DiscordCommonsBroadcastTests
             Requests.Add(new(request.Method, request.RequestUri!.ToString(),
                 request.Headers.Authorization?.ToString(),
                 request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken)));
-            return new HttpResponseMessage(HttpStatusCode.OK)
+            return new HttpResponseMessage(Status)
             {
-                Content = new StringContent($"{{\"discordRoleId\":\"{NovasRoleId}\"}}", Encoding.UTF8, "application/json"),
+                Content = new StringContent(
+                    Status == HttpStatusCode.OK ? Body : "{\"error\":\"not_found\"}",
+                    Encoding.UTF8, "application/json"),
             };
         }
     }
