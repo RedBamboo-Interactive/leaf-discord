@@ -233,8 +233,13 @@ The gap is bounded by named constants in `DiscordChannelGaps`: at most 50 messag
 first turn reads a 50-message window; a thread or a known cursor reads back at most 200
 messages. The block states how many older unseen messages were omitted and whether earlier
 history was not read, so the Agent can use the guild history routes above. Each message
-carries the author display name and snowflake, timestamp, message ID, content, and attachment
-metadata. Up to 5 gap attachments per turn are ingested through the same quarantine
+carries the author display name and snowflake, whether the author is this bot, timestamp,
+message ID, content, and attachment metadata. When the author's authenticated snowflake
+uniquely matches a RedLeaf User's `discord_user_id`, the message also carries
+`verifiedLeafIdentity` (display name and whether that User owns the conversation), resolved
+exactly like the requestor's own identity. A reply carries `replyTo`: the referenced message ID,
+its author name, whether that author is this bot, and the author's verified identity under the
+same rule. Up to 5 gap attachments per turn are ingested through the same quarantine
 ingestor and size limit as the current message's attachments. The others are listed with the
 reason they were not ingested.
 
@@ -249,6 +254,18 @@ author wrote. If the history cannot be read, the turn is still admitted with a n
 DMs carry no gap because every DM is already admitted. Response modes, typing, and startup
 backfill are unchanged: backfill still re-admits only addressed messages, and the others appear
 in the next admitted turn's gap.
+
+Every admitted message also carries server-generated `addressing` transport metadata: whether
+it mentions the bot, replies to the bot, or only mentions the Leaf Community Novas role, and,
+for a reply, the referenced message ID, author name, whether that author is this bot, the
+author's verified identity, and an excerpt of at most 500 characters of its untrusted content.
+Only what Discord already resolved is used; an unresolved reference keeps its ID and leaves the
+rest null. Addressing is stored with the inbound delivery beside the gap, so a retry reuses it.
+
+`GET /api/apps/leaf-discord/status` (and each bot's status in `/bots`) reports
+`ownerDiscordLinked`: whether the bot's owner User has a `discord_user_id`. Without it the owner's
+own Discord messages arrive unverified, and the bridge logs one warning when it notices that,
+not one per message.
 
 ## Owner-created guild bindings
 

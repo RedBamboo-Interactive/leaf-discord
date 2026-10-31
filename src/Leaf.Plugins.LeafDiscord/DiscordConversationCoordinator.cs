@@ -118,7 +118,8 @@ public sealed class DiscordConversationCoordinator(
         JsonObject? guildContext = null,
         JsonObject? behaviorContext = null,
         JsonObject? relayContext = null,
-        DiscordChannelGapSource? channelGap = null)
+        DiscordChannelGapSource? channelGap = null,
+        DiscordAddressing? addressing = null)
     {
         var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
@@ -136,6 +137,16 @@ public sealed class DiscordConversationCoordinator(
                 ? existing.Payload?["channel_gap"]?.DeepClone() as JsonObject
                 : await ReadChannelGapAsync(binding, discordMessageId, channelGap, ct);
             var sessionContent = DiscordChannelGaps.Compose(channelGapRecord, content);
+            // Addressing is captured once with the gap, so a retry tells the session the same.
+            var addressingRecord = existing is not null
+                ? existing.Payload?["addressing"]?.DeepClone() as JsonObject
+                : addressing is null
+                    ? null
+                    : await DiscordAddressings.ToRecordAsync(
+                        addressing,
+                        (authorId, token) => userIdentities.ResolveAsync(
+                            authorId, binding.OwnerId, token),
+                        ct);
 
             if (behaviorContext is null)
             {
@@ -188,6 +199,7 @@ public sealed class DiscordConversationCoordinator(
                 ["behavior_context"] = behaviorContext.DeepClone(),
                 ["relay_context"] = relayContext?.DeepClone(),
                 ["channel_gap"] = channelGapRecord,
+                ["addressing"] = addressingRecord,
             };
             var (delivery, isNew) = await deliveries.ReceiveAsync(binding, discordMessageId, payload, ct);
             if (!isNew || delivery.State != "received") return null;
@@ -231,6 +243,7 @@ public sealed class DiscordConversationCoordinator(
                 ["injection_risk_score"] = assessment.Score,
                 ["untrusted"] = true,
                 ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
+                ["discord_addressing"] = addressingRecord?.DeepClone(),
                 ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
                 ["discord_behavior"] = behaviorContext.DeepClone(),
                 ["leaf_community_peer"] = relayContext?.DeepClone(),

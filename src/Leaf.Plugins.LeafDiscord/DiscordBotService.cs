@@ -28,6 +28,10 @@ public sealed record DiscordBotStatus(
     public string? AgentName { get; init; }
     public string? AgentAvatarUrl { get; init; }
     public string? ProfileWarning { get; init; }
+    /// <summary>
+    /// The bot's owner User carries a Discord link, so the owner's own messages are recognized.
+    /// </summary>
+    public bool OwnerDiscordLinked { get; init; }
 }
 
 public sealed record DiscordDirectMessageResult(
@@ -99,6 +103,8 @@ public sealed class DiscordBotService(
     DiscordCommonsMembershipSuspensionStore commonsMembershipSuspensions,
     DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
+    DiscordUserIdentityResolver userIdentities,
+    DiscordOwnerLinkMonitor ownerLinks,
     IAssets assets,
     ILoggerFactory loggerFactory,
     IEnumerable<IDiscordExplicitAction> explicitActions) : IAsyncDisposable
@@ -126,8 +132,13 @@ public sealed class DiscordBotService(
                     null,
                     config.Enabled ? DescribeConfigurationIssue(config) : null);
             var agent = await agents.ResolveAsync(config.AgentId, ct);
+            var ownerLinked = await ownerLinks.CheckAsync(
+                config.EntityId,
+                config.OwnerUserId ?? await agents.ResolveOwnerUserIdAsync(config.AgentId, ct),
+                ct);
             result.Add(status with
             {
+                OwnerDiscordLinked = ownerLinked,
                 BotId = config.EntityId,
                 ApplicationId = config.ApplicationId,
                 AgentId = config.AgentId,
@@ -616,6 +627,8 @@ public sealed class DiscordBotService(
             commonsMembershipSuspensions,
             gatewayInbox,
             replyNotifier,
+            userIdentities,
+            ownerLinks,
             assets,
             loggerFactory.CreateLogger<DiscordBotRuntime>(),
             explicitActions));
@@ -686,6 +699,8 @@ internal sealed class DiscordBotRuntime(
     DiscordCommonsMembershipSuspensionStore commonsMembershipSuspensions,
     DiscordGatewayInboxStore gatewayInbox,
     DiscordReplyNotifier replyNotifier,
+    DiscordUserIdentityResolver userIdentities,
+    DiscordOwnerLinkMonitor ownerLinks,
     IAssets assets,
     ILogger logger,
     IEnumerable<IDiscordExplicitAction> explicitActions) : IAsyncDisposable
@@ -2232,6 +2247,24 @@ internal sealed class DiscordBotRuntime(
         await BackfillBindingsAsync();
         await PublishOwnerPresenceAsync(source, forceRefresh: true);
         commonsMembership?.RequestFullReconcile();
+        await ObserveOwnerLinkAsync(fresh: true);
+    }
+
+    /// <summary>Notices an owner whose Discord link is missing, once rather than per message.</summary>
+    private async Task ObserveOwnerLinkAsync(bool fresh = false)
+    {
+        try
+        {
+            var config = await GetConfigAsync();
+            var ownerId = config.OwnerUserId
+                ?? await agents.ResolveOwnerUserIdAsync(config.AgentId);
+            if (fresh) await ownerLinks.CheckAsync(configId, ownerId);
+            else await ownerLinks.ObserveAsync(configId, ownerId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Discord owner link check failed for bot {BotId}", configId);
+        }
     }
 
     internal static DiscordSocketConfig CreateSocketConfig(
@@ -2561,6 +2594,7 @@ internal sealed class DiscordBotRuntime(
             return;
         }
         if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
+        await ObserveOwnerLinkAsync();
         // A mention of the Novas role in a relayed Leaf Community channel is an open invitation.
         var openInvitation = route.Forward && !announcements
             && DiscordCommonsBroadcast.Mentions(
@@ -2635,7 +2669,9 @@ internal sealed class DiscordBotRuntime(
                 content, submittedAttachments, guildContext: guildContext,
                 behaviorContext: InboundBehaviorContext(
                     behavior, mentioned, repliesToBot, openInvitation),
-                channelGap: ChannelGapSource(message, config));
+                channelGap: ChannelGapSource(message, config),
+                addressing: DiscordAddressings.From(
+                    message, current.Id, mentioned, repliesToBot, openInvitation));
             LogSlowMessageStep(message.Id, "Agent session admission", submitStarted);
             if (admission is null)
                 CancelTyping(typingAdmission);
@@ -2880,7 +2916,12 @@ internal sealed class DiscordBotRuntime(
                 await CommonsBroadcastRoleIdAsync(location.GuildId)),
             behaviorContext: behavior.ToTrustedMetadata(),
             relayContext: relayContext,
-            channelGap: ChannelGapSource(message, config));
+            channelGap: ChannelGapSource(message, config),
+            addressing: client?.CurrentUser is { } bot
+                ? DiscordAddressings.From(
+                    message, bot.Id, MentionsBot(message, bot.Id),
+                    message.ReferencedMessage?.Author.Id == bot.Id, false)
+                : null);
         if (admission is null
             || admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
         {
@@ -2903,6 +2944,7 @@ internal sealed class DiscordBotRuntime(
     {
         if (message.Channel is not IGuildChannel) return null;
         var channel = message.Channel;
+        var botUserId = client?.CurrentUser?.Id;
         return async (binding, ct) =>
         {
             var started = Stopwatch.GetTimestamp();
@@ -2916,7 +2958,7 @@ internal sealed class DiscordBotRuntime(
                                        CacheMode.AllowDownload,
                                        new RequestOptions { CancelToken = token }))
                     {
-                        read.AddRange(page.Select(item => (item.Id, ToGapMessage(item))));
+                        read.AddRange(page.Select(item => (item.Id, ToGapMessage(item, botUserId))));
                         if (cursor is { } delivered && page.Any(item => item.Id <= delivered))
                             break;
                     }
@@ -2926,18 +2968,19 @@ internal sealed class DiscordBotRuntime(
                 async (gapMessage, attachment, token) => (await attachmentIngestor.IngestAsync(
                     config, gapMessage.Id, [attachment], token)).Single(),
                 config.MaxAttachmentBytes,
-                ct);
+                ct,
+                userIdentities);
             LogSlowMessageStep(message.Id, "channel gap", started);
             return gap;
         };
     }
 
-    internal static DiscordGapMessage? ToGapMessage(IMessage message)
+    internal static DiscordGapMessage? ToGapMessage(IMessage message, ulong? botUserId = null)
     {
         // A thread started from a channel message shows it as a reference to that message.
         if (message.Type == MessageType.ThreadStarterMessage)
             return message is IUserMessage { ReferencedMessage: { } starter }
-                ? ToGapMessage(starter)
+                ? ToGapMessage(starter, botUserId)
                 : null;
         if (message.Type is not (MessageType.Default or MessageType.Reply)) return null;
         if (string.IsNullOrWhiteSpace(message.Content) && message.Attachments.Count == 0)
@@ -2952,7 +2995,9 @@ internal sealed class DiscordBotRuntime(
             message.Content ?? "",
             message.Attachments.Select(attachment => new DiscordAttachmentSource(
                 attachment.Id.ToString(), attachment.Filename, attachment.ContentType,
-                attachment.Size, attachment.Url)).ToArray());
+                attachment.Size, attachment.Url)).ToArray(),
+            botUserId is { } bot && message.Author.Id == bot,
+            DiscordAddressings.ReplyReference(message, botUserId));
     }
 
     private void LogSlowMessageStep(ulong messageId, string step, long started)

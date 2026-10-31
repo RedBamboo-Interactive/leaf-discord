@@ -61,6 +61,9 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         services.AddSingleton(sp => new DiscordUserIdentityResolver(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId),
             sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DiscordUserIdentityResolver>>()));
+        services.AddSingleton(sp => new DiscordOwnerLinkMonitor(
+            sp.GetRequiredService<DiscordUserIdentityResolver>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DiscordOwnerLinkMonitor>>()));
         services.AddSingleton(sp => new DiscordOwnerPresencePublisher(
             sp.GetRequiredKeyedService<IPluginEvents>(PluginId),
             sp.GetRequiredService<DiscordBindingStore>(),

@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
 using Leaf.Plugins.LeafDiscord;
+using Leaf.Sdk;
 using Leaf.Sdk.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -343,6 +344,242 @@ public sealed class DiscordChannelGapTests
         Assert.Equal("1000", DiscordChannelGaps.Summary(record)!["message_ids"]![0]!.GetValue<string>());
     }
 
+    private const string OwnerSnowflake = "300000000000000003";
+    private const string AskerSnowflake = "300000000000000004";
+
+    private static async Task<(MemoryEntityStore Entities, LeafEntity Owner)> LinkedOwnerAsync()
+    {
+        var entities = new MemoryEntityStore();
+        var owner = await entities.UpsertBySlugAsync("user", "owner", "Owner Example",
+            new JsonObject { [DiscordUserIdentityResolver.UserField] = OwnerSnowflake });
+        return (entities, owner);
+    }
+
+    [Fact]
+    public async Task Gap_lines_carry_verified_identity_reply_targets_and_the_own_bot_flag()
+    {
+        var (entities, owner) = await LinkedOwnerAsync();
+        var harness = await Harness.CreateAsync(
+            "guild_channel", "123456789012345678", store: entities, ownerId: owner.Id.ToString());
+        var channel = new FakeChannel();
+        var question = channel.Post("1000", AskerSnowflake, "Asker", "Can someone look at this?");
+        var answer = channel.Reply(
+            "1001", OwnerSnowflake, "Owner Display", "I will take care of it.", question);
+        channel.Post("1002", BotId, "Nova", "An earlier answer", isBot: true);
+        channel.Reply("1003", AskerSnowflake, "Asker", "Thanks!", answer);
+        var current = channel.Post("1004", AskerSnowflake, "Asker", "@Nova who is doing the work?");
+
+        await harness.SubmitAsync(current, channel);
+
+        var messages = GapBlock(harness.Provider.Inputs.Single().Content)["messages"]!.AsArray();
+        Assert.Null(messages[0]!["verifiedLeafIdentity"]);
+        Assert.Null(messages[0]!["replyTo"]);
+        Assert.False(messages[0]!["authorIsThisBot"]!.GetValue<bool>());
+
+        var ownerIdentity = messages[1]!["verifiedLeafIdentity"]!.AsObject();
+        Assert.Equal("Owner Example", ownerIdentity["displayName"]!.GetValue<string>());
+        Assert.True(ownerIdentity["isConversationOwner"]!.GetValue<bool>());
+        // The internal User ID stays out of the turn: only display identity and the owner flag.
+        Assert.Equal(["displayName", "isConversationOwner"],
+            ownerIdentity.Select(pair => pair.Key));
+        var ownerReply = messages[1]!["replyTo"]!.AsObject();
+        Assert.Equal("1000", ownerReply["messageId"]!.GetValue<string>());
+        Assert.Equal("Asker", ownerReply["authorName"]!.GetValue<string>());
+        Assert.False(ownerReply["authorIsThisBot"]!.GetValue<bool>());
+        Assert.Null(ownerReply["authorVerifiedLeafIdentity"]);
+
+        Assert.True(messages[2]!["authorIsThisBot"]!.GetValue<bool>());
+        Assert.Null(messages[2]!["verifiedLeafIdentity"]);
+
+        var askerReply = messages[3]!["replyTo"]!.AsObject();
+        Assert.Equal("1001", askerReply["messageId"]!.GetValue<string>());
+        Assert.True(askerReply["authorVerifiedLeafIdentity"]!["isConversationOwner"]!
+            .GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task Gap_identity_fails_closed_for_unknown_ambiguous_bot_and_webhook_authors()
+    {
+        var (entities, owner) = await LinkedOwnerAsync();
+        // Two Users claiming the same snowflake: neither is trusted.
+        await entities.UpsertBySlugAsync("user", "first", "First Claimant",
+            new JsonObject { [DiscordUserIdentityResolver.UserField] = "300000000000000005" });
+        await entities.UpsertBySlugAsync("user", "second", "Second Claimant",
+            new JsonObject { [DiscordUserIdentityResolver.UserField] = "300000000000000005" });
+        var harness = await Harness.CreateAsync(
+            "guild_channel", "123456789012345678", store: entities, ownerId: owner.Id.ToString());
+        var channel = new FakeChannel();
+        channel.Post("1000", "300000000000000005", "Claimant", "ambiguous");
+        // A display name equal to the owner's never links anyone.
+        channel.Post("1001", "300000000000000006", "Owner Example", "impersonation");
+        // Bot and webhook IDs are never resolved, even when a User claims them.
+        channel.Post("1002", OwnerSnowflake, "Bot", "bot", isBot: true);
+        channel.Post("1003", OwnerSnowflake, "Hook", "webhook", fromWebhook: true);
+        var current = channel.Post("1004", AskerSnowflake, "Asker", "@Nova hi");
+
+        await harness.SubmitAsync(current, channel);
+
+        var messages = GapBlock(harness.Provider.Inputs.Single().Content)["messages"]!.AsArray();
+        Assert.Equal(4, messages.Count);
+        Assert.All(messages, message => Assert.Null(message!["verifiedLeafIdentity"]));
+    }
+
+    [Fact]
+    public async Task Gap_resolves_each_human_author_once_and_never_a_bot()
+    {
+        var asked = new List<string>();
+        var messages = new[]
+        {
+            Message("1003", "again") with
+            {
+                AuthorId = AskerSnowflake,
+                ReplyTo = new DiscordReplyReference("1001", BotId, "Nova", true, true),
+            },
+            Message("1002", "answer") with
+            {
+                AuthorId = OwnerSnowflake,
+                ReplyTo = new DiscordReplyReference("1000", AskerSnowflake, "Asker"),
+            },
+            Message("1001", "note") with { AuthorId = BotId, AuthorIsBot = true },
+            Message("1000", "question") with { AuthorId = AskerSnowflake },
+        };
+
+        var gap = (await DiscordChannelGaps.BuildAsync(
+            new DiscordGapScan(messages, true), null, (_, _) => Task.FromResult(false),
+            (_, source, _) => Task.FromResult(Ingested(source)), 1_000, default,
+            (authorId, _) =>
+            {
+                asked.Add(authorId);
+                return Task.FromResult<DiscordVerifiedLeafUser?>(authorId == OwnerSnowflake
+                    ? new DiscordVerifiedLeafUser("user-1", "Owner Example", true)
+                    : null);
+            }))!;
+
+        Assert.Equal([AskerSnowflake, OwnerSnowflake], asked);
+        Assert.True(gap.Messages[2].Identity!.IsConversationOwner);
+        Assert.Null(gap.Messages[3].ReplyToIdentity);
+    }
+
+    [Fact]
+    public async Task Reply_targets_count_against_the_character_budget()
+    {
+        // Three plain messages fit; the same three as replies do not.
+        var content = new string('x', 3_700);
+        DiscordGapMessage[] Plain() => Enumerable.Range(1, 3)
+            .Select(i => Message((1000 + i).ToString(), content)).Reverse().ToArray();
+        var replies = Plain().Select(message => message with
+        {
+            ReplyTo = new DiscordReplyReference("999", AskerSnowflake, "Asker"),
+        }).ToArray();
+
+        var plain = (await BuildAsync(new DiscordGapScan(Plain(), true)))!;
+        var replied = (await BuildAsync(new DiscordGapScan(replies, true)))!;
+
+        Assert.Equal(3, plain.Messages.Count);
+        Assert.Equal(2, replied.Messages.Count);
+        Assert.Equal(1, replied.OmittedMessages);
+        var rendered = GapBlock(DiscordChannelGaps.Compose(DiscordChannelGaps.ToRecord(replied), ""));
+        Assert.All(rendered["messages"]!.AsArray(),
+            message => Assert.Equal("999", message!["replyTo"]!["messageId"]!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task Verified_identities_count_against_the_character_budget()
+    {
+        // Three unlinked messages fit; the same three from a linked author do not.
+        var messages = Enumerable.Range(1, 3)
+            .Select(i => Message((1000 + i).ToString(), new string('x', 3_750)))
+            .Reverse().ToArray();
+        Task<DiscordChannelGap?> Build(DiscordVerifiedLeafUser? identity)
+            => DiscordChannelGaps.BuildAsync(
+                new DiscordGapScan(messages, true), null, (_, _) => Task.FromResult(false),
+                (_, source, _) => Task.FromResult(Ingested(source)), 1_000, default,
+                (_, _) => Task.FromResult(identity));
+
+        var unlinked = (await Build(null))!;
+        var linked = (await Build(new DiscordVerifiedLeafUser("user-1", "Owner Example", true)))!;
+
+        Assert.Equal(3, unlinked.Messages.Count);
+        Assert.Equal(2, linked.Messages.Count);
+        Assert.All(linked.Messages, entry => Assert.True(entry.Identity!.IsConversationOwner));
+    }
+
+    [Fact]
+    public async Task Retried_delivery_keeps_gap_identity_and_addressing_bytes_after_the_link_changes()
+    {
+        var (entities, owner) = await LinkedOwnerAsync();
+        var harness = await Harness.CreateAsync(
+            "guild_channel", "123456789012345678", failFirstSend: true,
+            store: entities, ownerId: owner.Id.ToString());
+        var channel = new FakeChannel();
+        var answer = channel.Post("1000", OwnerSnowflake, "Owner Display", "On it.");
+        var current = channel.Reply("1001", AskerSnowflake, "Asker", "@Nova and then?", answer);
+        var addressing = new DiscordAddressing(true, false, false, current.ReplyTo);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.SubmitAsync(current, channel, addressing));
+        var first = harness.Provider.Inputs.Single();
+        // The owner's link disappears before the retry.
+        await entities.PatchAsync(owner.Id,
+            new JsonObject { [DiscordUserIdentityResolver.UserField] = null });
+
+        await harness.Coordinator.RetryPendingAsync(await harness.Binding());
+
+        var retried = harness.Provider.Inputs[^1];
+        Assert.Equal(2, harness.Provider.Inputs.Count);
+        Assert.Equal(first.Content, retried.Content);
+        Assert.Equal(
+            first.Metadata!["discord_addressing"]!.ToJsonString(),
+            retried.Metadata!["discord_addressing"]!.ToJsonString());
+        Assert.True(GapBlock(retried.Content)["messages"]![0]!["verifiedLeafIdentity"]!
+            ["isConversationOwner"]!.GetValue<bool>());
+        Assert.True(retried.Metadata["discord_addressing"]!["reply_to"]!
+            ["author_verified_leaf_identity"]!["is_conversation_owner"]!.GetValue<bool>());
+        Assert.Equal(1, channel.Reads);
+    }
+
+    [Fact]
+    public async Task Addressing_is_resolved_server_side_and_forwarded_as_transport_metadata()
+    {
+        var (entities, owner) = await LinkedOwnerAsync();
+        var harness = await Harness.CreateAsync(
+            "guild_channel", "123456789012345678", store: entities, ownerId: owner.Id.ToString());
+        var channel = new FakeChannel();
+        var question = channel.Post("1000", AskerSnowflake, "Asker", "Who handles this?");
+        var current = channel.Reply("1001", OwnerSnowflake, "Owner Display", "I will.", question);
+
+        await harness.SubmitAsync(current, channel,
+            new DiscordAddressing(false, false, false, current.ReplyTo));
+
+        var input = harness.Provider.Inputs.Single();
+        var addressing = input.Metadata!["discord_addressing"]!.AsObject();
+        Assert.Equal(DiscordAddressings.Schema, addressing["schema"]!.GetValue<string>());
+        Assert.False(addressing["mentioned"]!.GetValue<bool>());
+        Assert.False(addressing["replies_to_bot"]!.GetValue<bool>());
+        Assert.False(addressing["open_invitation"]!.GetValue<bool>());
+        var replyTo = addressing["reply_to"]!.AsObject();
+        Assert.Equal("1000", replyTo["message_id"]!.GetValue<string>());
+        Assert.Equal("Asker", replyTo["author_name"]!.GetValue<string>());
+        Assert.False(replyTo["author_is_this_bot"]!.GetValue<bool>());
+        Assert.Null(replyTo["author_verified_leaf_identity"]);
+        Assert.Equal("Who handles this?", replyTo["excerpt"]!.GetValue<string>());
+        // The requestor is the owner here; the reply target is someone else.
+        Assert.True(input.Metadata["verified_leaf_user"]!["is_conversation_owner"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task A_message_without_addressing_carries_none()
+    {
+        var harness = await Harness.CreateAsync("guild_channel", "123456789012345678");
+        var channel = new FakeChannel();
+        var current = channel.Post("1001", AskerSnowflake, "Asker", "@Nova hi");
+
+        await harness.SubmitAsync(current, channel);
+
+        Assert.Null(harness.Provider.Inputs.Single().Metadata!["discord_addressing"]);
+    }
+
+
     private static Task<DiscordChannelGap?> BuildAsync(
         DiscordGapScan scan,
         string? starter = null,
@@ -386,12 +623,14 @@ public sealed class DiscordChannelGapTests
         public required RecordingProvider Provider { get; init; }
         public required DiscordConversationCoordinator Coordinator { get; init; }
         public required Guid BindingEntityId { get; init; }
+        public required DiscordUserIdentityResolver Identities { get; init; }
         public List<string> Ingested { get; } = [];
 
         public static async Task<Harness> CreateAsync(
-            string kind, string conversationId, bool failFirstSend = false)
+            string kind, string conversationId, bool failFirstSend = false,
+            MemoryEntityStore? store = null, string ownerId = "owner-1")
         {
-            var entities = new MemoryEntityStore();
+            var entities = store ?? new MemoryEntityStore();
             _ = await entities.UpsertBySlugAsync(
                 "quality-mode", "deep-codex", "Deep (Codex)", new JsonObject
                 {
@@ -404,12 +643,14 @@ public sealed class DiscordChannelGapTests
                 ApplicationId, conversationId, kind,
                 kind == "dm" ? null : "1539243753775042630",
                 kind == "thread" ? "1539243753775042999" : null,
-                "nova", "owner-1", "nova-discord-external", "direct"));
+                "nova", ownerId, "nova-discord-external", "direct"));
             var provider = new RecordingProvider(failFirstSend);
+            var identities = new DiscordUserIdentityResolver(
+                entities, NullLogger<DiscordUserIdentityResolver>.Instance);
             var coordinator = new DiscordConversationCoordinator(
                 bindings, deliveries, new DiscordBotConfigurationStore(new LeafDiscordConfigStore(entities)),
                 new DiscordRuntimeOptionsResolver(entities),
-                new DiscordUserIdentityResolver(entities, NullLogger<DiscordUserIdentityResolver>.Instance),
+                identities,
                 new NoComputeGateway(), [provider], new PromptInjectionDetector(),
                 new DiscordEgressGuard(), new DiscordTypingLeases(),
                 NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
@@ -421,6 +662,7 @@ public sealed class DiscordChannelGapTests
                 Provider = provider,
                 Coordinator = coordinator,
                 BindingEntityId = binding.EntityId,
+                Identities = identities,
             };
         }
 
@@ -429,7 +671,7 @@ public sealed class DiscordChannelGapTests
 
         /// <summary>Submits like the runtime: the gap source reads the fake channel's history.</summary>
         public async Task<ExternalConversationAdmission?> SubmitAsync(
-            DiscordGapMessage message, FakeChannel channel)
+            DiscordGapMessage message, FakeChannel channel, DiscordAddressing? addressing = null)
             => await Coordinator.SubmitAsync(
                 await Binding(), message.Id,
                 new ExternalRequestor(message.AuthorId, message.AuthorName),
@@ -445,7 +687,9 @@ public sealed class DiscordChannelGapTests
                         return Task.FromResult(DiscordChannelGapTests.Ingested(attachment));
                     },
                     maxAttachmentBytes: 1_000,
-                    ct));
+                    ct,
+                    Identities),
+                addressing: addressing);
 
         public async Task RecordBotReplyAsync(string discordMessageId)
         {
@@ -476,10 +720,23 @@ public sealed class DiscordChannelGapTests
             string id, string authorId, string authorName, string content,
             bool isBot = false, bool fromWebhook = false,
             params DiscordAttachmentSource[] attachments)
-        {
-            var message = new DiscordGapMessage(
+            => Add(new DiscordGapMessage(
                 id, authorId, authorName, isBot, fromWebhook,
-                DateTimeOffset.UtcNow, content, attachments);
+                DateTimeOffset.UtcNow, content, attachments,
+                AuthorIsThisBot: isBot && authorId == BotId));
+
+        public DiscordGapMessage Reply(
+            string id, string authorId, string authorName, string content,
+            DiscordGapMessage target)
+            => Add(new DiscordGapMessage(
+                id, authorId, authorName, false, false, DateTimeOffset.UtcNow, content, [],
+                ReplyTo: new DiscordReplyReference(
+                    target.Id, target.AuthorId, target.AuthorName,
+                    target.AuthorIsBot || target.FromWebhook, target.AuthorIsThisBot,
+                    target.Content)));
+
+        private DiscordGapMessage Add(DiscordGapMessage message)
+        {
             messages.Add(message);
             return message;
         }
