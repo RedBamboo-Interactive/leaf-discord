@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Leaf.Sdk;
 using Leaf.Sdk.Services;
 using Microsoft.Extensions.Logging;
@@ -21,6 +22,14 @@ public sealed record DiscordCommonsConfiguration(
 {
     public IReadOnlySet<string> GuildAllowlist => GuildScopes.Keys.ToHashSet(StringComparer.Ordinal);
     public bool Ready => GuildScopes.Values.Any(scope => scope.Ready);
+
+    /// <summary>Per guild, the ID of the host-managed <c>Novas</c> broadcast role.</summary>
+    public IReadOnlyDictionary<string, string> BroadcastRoleIds { get; init; }
+        = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    public string? BroadcastRoleId(string? guildId)
+        => !string.IsNullOrWhiteSpace(guildId)
+           && BroadcastRoleIds.TryGetValue(guildId, out var roleId) ? roleId : null;
 
     public DiscordCommonsGuildScope? Scope(string? guildId)
         => !string.IsNullOrWhiteSpace(guildId)
@@ -173,6 +182,81 @@ public static class DiscordCommonsRolePolicy
            || !role.Mentionable;
 }
 
+/// <summary>
+/// The one mentionable role, <c>Novas</c>, that invites every Agent in a Leaf Community guild to
+/// answer. Nobody holds it, so mentioning it notifies nobody; the relay and the native Agent read
+/// its mention as an open invitation, where answering is optional.
+/// </summary>
+public static partial class DiscordCommonsBroadcast
+{
+    public const string RoleName = "Novas";
+
+    /// <summary>
+    /// Which existing role to keep as the broadcast role: the recorded one while it exists, else a
+    /// role the host already made with that name (a lost record or an earlier run), else none and
+    /// one is created. <c>Update</c> says whether it must be renamed or made mentionable.
+    /// </summary>
+    public static (DiscordManagedRole? Role, bool Update) Plan(
+        IReadOnlyList<DiscordManagedRole> roles, string? recordedRoleId)
+    {
+        var role = (string.IsNullOrWhiteSpace(recordedRoleId)
+                ? null
+                : roles.FirstOrDefault(candidate => candidate.Id == recordedRoleId && !candidate.Managed))
+            ?? roles.FirstOrDefault(candidate => !candidate.Managed
+                && string.Equals(candidate.Name, RoleName, StringComparison.Ordinal));
+        return (role, role is not null && DiscordCommonsRolePolicy.NeedsUpdate(role, RoleName));
+    }
+
+    /// <summary>A mention of the broadcast role, as Discord parsed it or written raw.</summary>
+    public static bool Mentions(
+        string? content, IEnumerable<string> mentionedRoleIds, string? broadcastRoleId)
+        => !string.IsNullOrWhiteSpace(broadcastRoleId)
+           && (mentionedRoleIds.Contains(broadcastRoleId, StringComparer.Ordinal)
+               || (content?.Contains($"<@&{broadcastRoleId}>", StringComparison.Ordinal) ?? false));
+
+    /// <summary>
+    /// Whether a native post in a Leaf Community text channel invites or addresses an Envoy, so it
+    /// is worth reporting: it mentions the broadcast role or an active Envoy's role, or names an
+    /// active Envoy by its full persona (<c>Atlas · Name</c> or <c>Atlas Name</c>). A bare Agent
+    /// name addresses nobody, since most Agents are called Nova. The relay decides again.
+    /// </summary>
+    public static bool InvitesOrAddressesEnvoys(
+        string content, string? broadcastRoleId, IReadOnlyList<DiscordCommonsRelayEnvoy> envoys)
+    {
+        if (Mentions(content, [], broadcastRoleId)) return true;
+        var mentionedRoles = RoleMention().Matches(content).Select(match => match.Groups[1].Value)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var envoy in envoys.Where(candidate => candidate.Status == "active"))
+        {
+            if (envoy.DiscordRoleId is { } roleId && mentionedRoles.Contains(roleId)) return true;
+            if (new[] { envoy.PersonaName, DiscordCommonsRolePolicy.RoleName(envoy) }.Any(name =>
+                    !string.IsNullOrWhiteSpace(name) && Regex.IsMatch(content,
+                        $@"(?<![\p{{L}}\p{{N}}_]){Regex.Escape(name.Trim())}(?![\p{{L}}\p{{N}}_])",
+                        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                        TimeSpan.FromMilliseconds(100))))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Behavior context for a message that reached the native Agent only as an open invitation.
+    /// The Agent's provider lets silence settle a turn only in <c>selective</c> mode, so the
+    /// message is presented that way; the owner's own mode is kept beside it.
+    /// </summary>
+    public static JsonObject InvitationBehavior(JsonObject behavior)
+    {
+        var context = (JsonObject)behavior.DeepClone();
+        context["owner_response_mode"] = context["response_mode"]?.DeepClone();
+        context["response_mode"] = DiscordResponseModes.Selective;
+        context["open_invitation"] = true;
+        return context;
+    }
+
+    [GeneratedRegex(@"<@&(\d{17,20})>")]
+    private static partial Regex RoleMention();
+}
+
 public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
 {
     public const string TypeSlug = "leaf-discord-commons-config";
@@ -278,6 +362,25 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
         return Map(entity);
     }
 
+    /// <summary>Records the guild's broadcast role, leaving every other field as it is.</summary>
+    public async Task<DiscordCommonsConfiguration> SetBroadcastRoleIdAsync(
+        Guid botId, string guildId, string roleId, CancellationToken ct = default)
+    {
+        guildId = RequiredSnowflake(guildId);
+        roleId = RequiredSnowflake(roleId);
+        var existing = await GetAsync(botId, ct)
+            ?? throw new InvalidOperationException("Discord Commons is not configured.");
+        var roles = new Dictionary<string, string>(existing.BroadcastRoleIds, StringComparer.Ordinal)
+        {
+            [guildId] = roleId,
+        };
+        var entity = await store.PatchAsync(existing.EntityId, new JsonObject
+        {
+            ["broadcast_role_ids"] = SerializeWebhookUrls(roles),
+        }, ct: ct);
+        return Map(entity);
+    }
+
     public static DiscordCommonsConfigurationView View(DiscordCommonsConfiguration config)
         => new(
             config.RelayUrl,
@@ -360,7 +463,10 @@ public sealed class DiscordCommonsConfigurationStore(IEntityStore store)
                 JsonRead.String(data, "role_reconciliation_state") ?? "not-run",
                 JsonRead.String(data, "role_reconciliation_error"),
                 roleAt == default ? null : roleAt,
-                (int)JsonRead.Long(data, "role_reconciliation_envoy_count", 0)));
+                (int)JsonRead.Long(data, "role_reconciliation_envoy_count", 0)))
+        {
+            BroadcastRoleIds = ParseWebhookUrls(JsonRead.String(data, "broadcast_role_ids")),
+        };
     }
 
     private static IReadOnlyDictionary<string, DiscordCommonsGuildScope> LegacyScopes(
@@ -803,6 +909,15 @@ public sealed class DiscordCommonsRelayService(
         using var response = await SendHostAsync(botId, guildId, HttpMethod.Put,
             $"/v1/admin/envoys/{Uri.EscapeDataString(envoyId)}/discord-role",
             new JsonObject { ["discordRoleId"] = roleId }, ct);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>Registers the guild's broadcast role with the relay; repeating it is a no-op there.</summary>
+    public async Task SetBroadcastRoleAsync(
+        Guid botId, string guildId, string roleId, CancellationToken ct = default)
+    {
+        using var response = await SendHostAsync(botId, guildId, HttpMethod.Put,
+            "/v1/admin/broadcast-role", new JsonObject { ["discordRoleId"] = roleId }, ct);
         response.EnsureSuccessStatusCode();
     }
 

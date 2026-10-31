@@ -707,6 +707,11 @@ internal sealed class DiscordBotRuntime(
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelEditGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> channelCreateGates = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> settledPeerTurns = new(StringComparer.Ordinal);
+    // Per guild, the relay's Envoys as role reconciliation last read them: whom a native
+    // text-channel post can tag or name.
+    private readonly ConcurrentDictionary<string, (DateTimeOffset At, IReadOnlyList<DiscordCommonsRelayEnvoy> Envoys)>
+        commonsEnvoys = new(StringComparer.Ordinal);
+    private static readonly TimeSpan CommonsEnvoyDirectoryMaxAge = TimeSpan.FromMinutes(5);
     // One outbound review runner per binding. A request while it runs makes it loop once more,
     // and the runner leaves only after seeing no request under the same lock, so none is lost.
     private readonly Dictionary<string, Task> outboundReviewRunners = new(StringComparer.Ordinal);
@@ -2547,6 +2552,13 @@ internal sealed class DiscordBotRuntime(
             return;
         }
         if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
+        // A mention of the Novas role in a relayed Leaf Community channel is an open invitation.
+        var openInvitation = route.Forward && !announcements
+            && DiscordCommonsBroadcast.Mentions(
+                message.Content,
+                message.MentionedRoleIds.Select(id => id.ToString()),
+                (await commons.GetConfigurationAsync(configId))
+                    ?.BroadcastRoleId(commonsLocation!.Value.GuildId));
         var current = client?.CurrentUser;
         if (current is null) return;
         var config = await GetConfigAsync();
@@ -2567,7 +2579,7 @@ internal sealed class DiscordBotRuntime(
         var mentioned = MentionsBot(message, current.Id);
         var repliesToBot = message.ReferencedMessage?.Author.Id == current.Id;
         if (!ShouldAdmitMessage(
-                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot))
+                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot, openInvitation))
         {
             await bindings.MarkReceivedAsync(binding, message.Id.ToString());
             return;
@@ -2580,7 +2592,7 @@ internal sealed class DiscordBotRuntime(
         if (!ownerLeads)
         {
             var startTypingImmediately = ShouldStartTypingImmediately(
-                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot);
+                binding.Kind, behavior.ResponseMode, mentioned, repliesToBot, openInvitation);
             typingAdmission = typing.Begin(
                 binding.BindingId,
                 () => message.Channel.EnterTypingState(),
@@ -2611,7 +2623,8 @@ internal sealed class DiscordBotRuntime(
                 new ExternalRequestor(message.Author.Id.ToString(),
                     message.Author.GlobalName ?? message.Author.Username, message.Author.Username),
                 content, submittedAttachments, guildContext: guildContext,
-                behaviorContext: behavior.ToTrustedMetadata(),
+                behaviorContext: InboundBehaviorContext(
+                    behavior, mentioned, repliesToBot, openInvitation),
                 channelGap: ChannelGapSource(message, config));
             LogSlowMessageStep(message.Id, "Agent session admission", submitStarted);
             if (admission is null)
@@ -3589,19 +3602,34 @@ internal sealed class DiscordBotRuntime(
             roleId => guild?.GetRole(roleId)?.Tags?.BotId);
     }
 
+    /// <param name="openInvitation">The message mentions the Novas role: it reaches the Agent
+    /// even in direct mode, as a turn it may leave unanswered. Context-only still never answers.</param>
     internal static bool ShouldAdmitMessage(
         string bindingKind,
         string responseMode,
         bool mentioned,
-        bool repliesToBot)
+        bool repliesToBot,
+        bool openInvitation = false)
     {
         if (responseMode == DiscordResponseModes.ContextOnly) return false;
         if (bindingKind == "dm") return true;
         return responseMode is DiscordResponseModes.Selective
                 or DiscordResponseModes.Participate
             || mentioned
-            || repliesToBot;
+            || repliesToBot
+            || openInvitation;
     }
+
+    /// <summary>
+    /// The behavior block for an admitted message. A message that only invites the Agent (the
+    /// Novas role, not a mention of the bot or a reply to it) says so, in the selective mode
+    /// under which the Agent may settle with silence or a reaction.
+    /// </summary>
+    internal static JsonObject InboundBehaviorContext(
+        DiscordBehavior behavior, bool mentioned, bool repliesToBot, bool openInvitation)
+        => openInvitation && !mentioned && !repliesToBot
+            ? DiscordCommonsBroadcast.InvitationBehavior(behavior.ToTrustedMetadata())
+            : behavior.ToTrustedMetadata();
 
     internal static async Task<bool> ApplyVerifiedPeerBindingPolicyAsync(
         DiscordBindingStore bindings,
@@ -3616,13 +3644,16 @@ internal sealed class DiscordBotRuntime(
         return false;
     }
 
+    /// <param name="openInvitation">An invitation alone promises no answer, so typing waits like a
+    /// selective turn's.</param>
     internal static bool ShouldStartTypingImmediately(
         string bindingKind,
         string responseMode,
         bool mentioned,
-        bool repliesToBot)
+        bool repliesToBot,
+        bool openInvitation = false)
         => bindingKind == "dm"
-           || responseMode == DiscordResponseModes.Participate
+           || (responseMode == DiscordResponseModes.Participate && !openInvitation)
            || mentioned
            || repliesToBot;
 
@@ -4279,6 +4310,8 @@ internal sealed class DiscordBotRuntime(
                         await commons.SetDiscordRoleAsync(
                             configId, guildId, envoy.Id, role.Id, ct);
                 }
+                commonsEnvoys[guildId] = (DateTimeOffset.UtcNow, envoys);
+                await ReconcileBroadcastRoleAsync(botToken, guildId, roles, ct);
             }
             await commonsConfigurations.SetRoleReconciliationAsync(
                 configId,
@@ -4303,6 +4336,33 @@ internal sealed class DiscordBotRuntime(
                 "Public Agent role reconciliation failed for {ConfigId}: {ErrorType}",
                 configId, ex.GetType().Name);
         }
+    }
+
+    /// <summary>
+    /// Keeps exactly one mentionable, permissionless <c>Novas</c> role in the guild, records its
+    /// ID, and registers it with the relay as the broadcast role. Reruns reuse the recorded role
+    /// (or adopt one already named Novas) and never create a second.
+    /// </summary>
+    private async Task ReconcileBroadcastRoleAsync(
+        string botToken, string guildId, List<DiscordManagedRole> roles, CancellationToken ct)
+    {
+        var config = await commonsConfigurations.GetAsync(configId, ct);
+        var recorded = config?.BroadcastRoleId(guildId);
+        var (role, update) = DiscordCommonsBroadcast.Plan(roles, recorded);
+        if (role is null)
+        {
+            role = await rest.CreateGuildRoleAsync(
+                botToken, guildId, DiscordCommonsBroadcast.RoleName, ct);
+            roles.Add(role);
+        }
+        else if (update)
+        {
+            role = await rest.ModifyGuildRoleAsync(
+                botToken, guildId, role.Id, DiscordCommonsBroadcast.RoleName, ct);
+        }
+        if (!string.Equals(recorded, role.Id, StringComparison.Ordinal))
+            await commonsConfigurations.SetBroadcastRoleIdAsync(configId, guildId, role.Id, ct);
+        await commons.SetBroadcastRoleAsync(configId, guildId, role.Id, ct);
     }
 
     private async Task PublishOwnerPresenceAsync(
@@ -4708,10 +4768,12 @@ internal sealed class DiscordBotRuntime(
     }
 
     /// <summary>
-    /// Reports a native post that answered no Envoy in a Leaf Community thread, so the relay
-    /// keeps it in the thread's history and pings the thread's Envoys it tags or names. The
-    /// Discord message is already sent, so a failure here is logged rather than retried as a
-    /// delivery failure.
+    /// Reports a native post that answered no Envoy in Leaf Community, so the relay records it
+    /// and pings the Envoys it tags or names. In a thread every such post is reported, into the
+    /// thread's history. In a text channel only one that mentions the Novas role or an Envoy's
+    /// role, or names an Envoy by full persona, is reported, as a new <c>message:</c> chain
+    /// rooted at the post. The Discord message is already sent, so a failure here is logged
+    /// rather than retried as a delivery failure.
     /// </summary>
     private async Task ReportUnpromptedCommonsPostAsync(
         DiscordBinding binding, LeafDiscordConfig config, string messageId, string content,
@@ -4720,25 +4782,67 @@ internal sealed class DiscordBotRuntime(
         try
         {
             if (!ulong.TryParse(binding.ConversationId, out var channelId)
-                || client?.GetChannel(channelId) is not SocketThreadChannel thread
-                || CommonsLocation(thread) is not { ThreadRef: { } threadRef } location)
+                || client?.GetChannel(channelId) is not SocketTextChannel channel
+                || channel is SocketVoiceChannel
+                || CommonsLocation(channel) is not { } location)
                 return;
-            var scope = await commons.GetScopeAsync(configId, location.GuildId, ct);
+            var commonsConfig = await commons.GetConfigurationAsync(configId, ct);
+            var scope = commonsConfig?.Scope(location.GuildId);
             if (scope is null || scope.SuppressesNativeAgent
                 || !scope.Contains(location.ChannelId, location.CategoryId))
                 return;
+            var isThread = channel is SocketThreadChannel;
+            var envoys = isThread
+                ? []
+                : await CommonsEnvoyDirectoryAsync(location.GuildId, ct);
+            var payload = UnpromptedCommonsPostPayload(
+                isThread, location.Channel, location.ChannelId, location.ThreadRef,
+                $"host:{config.ApplicationId}", messageId, content, attachments,
+                commonsConfig!.BroadcastRoleId(location.GuildId), envoys,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            if (payload is null) return;
             await commons.EnqueueAsync(configId, location.GuildId, $"host-post:{messageId}",
-                DiscordCommonsRelayService.BuildHostParticipantPostPayload(
-                    messageId, $"host:{config.ApplicationId}", content, null,
-                    location.Channel, location.ChannelId, threadRef,
-                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), attachments),
-                ct);
+                payload, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex,
                 "Leaf Community could not record native post {MessageId} for its thread", messageId);
         }
+    }
+
+    /// <summary>
+    /// What to report for a native post that answered no Envoy, or null for nothing: a thread
+    /// post always, into its thread; a text-channel post (never <c>#announcements</c>) only when
+    /// it invites or addresses Envoys, as the chain <c>message:&lt;its id&gt;</c>.
+    /// </summary>
+    internal static JsonObject? UnpromptedCommonsPostPayload(
+        bool isThread, string channel, string channelId, string? threadRef,
+        string participantId, string messageId, string content, JsonArray? attachments,
+        string? broadcastRoleId, IReadOnlyList<DiscordCommonsRelayEnvoy> envoys, long timestamp)
+    {
+        var reportedThread = isThread
+            ? threadRef
+            : !IsAnnouncements(channel)
+              && DiscordCommonsBroadcast.InvitesOrAddressesEnvoys(content, broadcastRoleId, envoys)
+                ? $"message:{messageId}"
+                : null;
+        return reportedThread is null
+            ? null
+            : DiscordCommonsRelayService.BuildHostParticipantPostPayload(
+                messageId, participantId, content, null, channel, channelId, reportedThread,
+                timestamp, attachments);
+    }
+
+    private async Task<IReadOnlyList<DiscordCommonsRelayEnvoy>> CommonsEnvoyDirectoryAsync(
+        string guildId, CancellationToken ct)
+    {
+        if (commonsEnvoys.TryGetValue(guildId, out var cached)
+            && DateTimeOffset.UtcNow - cached.At < CommonsEnvoyDirectoryMaxAge)
+            return cached.Envoys;
+        var envoys = await commons.GetEnvoysAsync(configId, guildId, ct);
+        commonsEnvoys[guildId] = (DateTimeOffset.UtcNow, envoys);
+        return envoys;
     }
 
     private async Task<bool> IsCommonsBindingAsync(

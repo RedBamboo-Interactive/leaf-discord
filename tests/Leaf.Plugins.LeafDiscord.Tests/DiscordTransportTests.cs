@@ -34,6 +34,26 @@ public sealed class DiscordTransportTests
     }
 
     [Fact]
+    public async Task A_role_mention_is_sent_verbatim_so_discord_renders_it_without_notifying()
+    {
+        const string content = "<@&777000000000000001> has anyone tried the new cache?";
+        var handler = new QueueHandler(Json("[]"), Json("{\"id\":\"9001\"}"), Json("{\"id\":\"9002\"}"));
+        using var transport = new DiscordRestTransport(handler);
+
+        await transport.SendIdempotentMessageAsync("secret", "123", content, "0123456789abcdef01234567", []);
+        await transport.SendWebhookMessageAsync("hook", "token", content, []);
+
+        foreach (var post in handler.Requests.Where(request => request.Method == HttpMethod.Post))
+        {
+            using var body = JsonDocument.Parse(post.Body!);
+            Assert.Equal(content, body.RootElement.GetProperty("content").GetString());
+            // Nobody holds the Novas role and nothing is parsed for pings: the pill shows, no one is notified.
+            Assert.Empty(body.RootElement.GetProperty("allowed_mentions").GetProperty("parse").EnumerateArray());
+        }
+        Assert.Equal(2, handler.Requests.Count(request => request.Method == HttpMethod.Post));
+    }
+
+    [Fact]
     public async Task Sent_messages_return_the_attachments_discord_created()
     {
         const string created = "{\"id\":\"9001\",\"attachments\":[{\"id\":\"77\",\"filename\":\"chart.png\",\"content_type\":\"image/png\",\"size\":3,\"url\":\"https://cdn.discordapp.com/attachments/1/77/chart.png\"}]}";
