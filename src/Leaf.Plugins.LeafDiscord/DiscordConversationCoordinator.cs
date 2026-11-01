@@ -1145,8 +1145,9 @@ public sealed class DiscordConversationCoordinator(
 
     /// <summary>
     /// An outgoing Asset as the Sentinel reviews it. The media type follows the stored filename's
-    /// extension, as the kernel derives it when the bytes are read; the Sentinel checks it against
-    /// the stored Asset and refuses anything else as unreadable.
+    /// extension; the Sentinel checks it against the bytes (and the stored Asset, which the kernel names
+    /// from the extension too) and refuses anything else as unreadable. A video it reviews is a sample
+    /// of frames, so a passed video is still delivered as the original file.
     /// </summary>
     internal static UntrustedContentImage ReviewImage(ExternalConversationOutputAsset asset)
     {
@@ -1163,6 +1164,10 @@ public sealed class DiscordConversationCoordinator(
             ".jpg" or ".jpeg" => "image/jpeg",
             ".webp" => "image/webp",
             ".gif" => "image/gif",
+            ".mp4" or ".m4v" => "video/mp4",
+            ".mov" => "video/quicktime",
+            ".webm" => "video/webm",
+            ".mkv" => "video/x-matroska",
             _ => "application/octet-stream",
         };
 

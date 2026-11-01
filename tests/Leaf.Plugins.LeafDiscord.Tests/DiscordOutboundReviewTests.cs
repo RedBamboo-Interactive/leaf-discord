@@ -645,6 +645,60 @@ public sealed class DiscordOutboundReviewTests
     }
 
     [Fact]
+    public async Task A_reply_with_a_video_is_reviewed_as_video_mp4_and_queued_with_its_asset()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        ImageReply(h, assets: new ExternalConversationOutputAsset("stable-clip.mp4", "A short harbour clip"));
+        await h.ReconcileAsync();
+
+        Assert.True(await h.Coordinator.ReviewPendingOutboundAsync(h.Binding));
+
+        var request = Assert.Single(h.Sentinel.Requests);
+        Assert.Equal(new UntrustedContentImage("stable-clip.mp4", "video/mp4", "A short harbour clip"),
+            Assert.Single(request.Images!));
+        var queued = Assert.Single(await h.Rows("reply-1"));
+        Assert.Equal("queued", queued.State);
+        Assert.Equal("delivered", queued.OutboundReview?["outcome"]?.GetValue<string>());
+        Assert.Equal(1, queued.OutboundReview?["images_reviewed"]?.GetValue<int>());
+        // The asset travels in the queued payload, to be attached as a file when it is delivered.
+        var pending = Assert.Single(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+        var asset = Assert.Single(pending.Payload!["assets"]!.AsArray());
+        Assert.Equal("stable-clip.mp4", asset!["asset_id"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_reply_whose_video_the_sentinel_holds_queues_nothing_to_send()
+    {
+        var h = await Harness.CreateAsync(request => request.Images is { Count: > 0 }
+            ? new UntrustedContentVerdict("high", ["image-credential"], "require_private_approval", true,
+                UntrustedContentIsolation.VerifiedToolFree)
+            : Clean);
+        ImageReply(h, assets: new ExternalConversationOutputAsset("stable-clip.mp4", "My screen recording"));
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal(DiscordDeliveryStore.HeldState, Assert.Single(await h.Rows("reply-1")).State);
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId), item => item.State == "queued");
+    }
+
+    [Fact]
+    public async Task A_reply_with_a_video_fails_closed_while_the_sentinel_is_unavailable()
+    {
+        var h = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable() with
+        {
+            Signals = ["verifier-unavailable", "media-tool-unavailable"],
+        });
+        ImageReply(h, assets: new ExternalConversationOutputAsset("stable-clip.mp4", "A short harbour clip"));
+        await h.ReconcileAsync();
+
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal(DiscordDeliveryStore.ReviewingState, Assert.Single(await h.Rows("reply-1")).State);
+        Assert.DoesNotContain(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId), item => item.State == "queued");
+    }
+
+    [Fact]
     public async Task A_reply_whose_image_the_sentinel_rates_high_is_held_and_rewritten()
     {
         var h = await Harness.CreateAsync(request => request.Images is { Count: > 0 }

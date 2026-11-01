@@ -173,9 +173,118 @@ public sealed class DiscordTransportTests
             delivery, Config(maxAttachmentBytes: 1024), assets);
 
         Assert.Empty(missing.Files);
-        Assert.Equal("[Image unavailable: Generated image]", missing.Content);
+        Assert.Equal("[Attachment unavailable: Generated image]", missing.Content);
         Assert.DoesNotContain("/api/assets/", missing.Content, StringComparison.Ordinal);
     }
+
+    private static DiscordDelivery AssetDelivery(params (string AssetId, string Description)[] assets)
+        => new(
+            Guid.NewGuid(), "outbound", DiscordDeliveryStore.MessageKind,
+            "binding-1", 1, "queued", null, "turn-1", 0, "hash",
+            new System.Text.Json.Nodes.JsonObject
+            {
+                ["content"] = "Here it is.",
+                ["assets"] = new System.Text.Json.Nodes.JsonArray(assets.Select(asset =>
+                    (System.Text.Json.Nodes.JsonNode?)new System.Text.Json.Nodes.JsonObject
+                    {
+                        ["asset_id"] = asset.AssetId,
+                        ["description"] = asset.Description,
+                    }).ToArray()),
+            },
+            0, null, null, DateTimeOffset.UtcNow);
+
+    [Theory]
+    [InlineData("clip.mp4", "video/mp4", "shared-file-1.mp4")]
+    [InlineData("clip.mov", "application/octet-stream", "shared-file-1.mov")]  // the kernel names only .mp4
+    [InlineData("clip.webm", "application/octet-stream", "shared-file-1.webm")]
+    [InlineData("clip.mkv", "application/octet-stream", "shared-file-1.mkv")]
+    [InlineData("anim.gif", "image/gif", "shared-image-1.gif")]
+    public async Task A_reviewed_video_resolves_to_a_real_file_with_its_content_type(
+        string assetId, string storedType, string filename)
+    {
+        var assets = new FakeAssets { ReadFile = new AssetFile([0, 0, 0, 0x18, 1, 2, 3], storedType) };
+
+        var resolved = await DiscordBotRuntime.ResolveOutboundPayloadAsync(
+            AssetDelivery((assetId, "Harbour at dusk")), Config(maxAttachmentBytes: 1024), assets);
+
+        var file = Assert.Single(resolved.Files);
+        Assert.Equal(filename, file.Filename);
+        Assert.Equal(DiscordConversationCoordinator.AssetMediaType(assetId), file.ContentType);
+        Assert.Equal("Harbour at dusk", file.Description);
+        Assert.Equal("Here it is.", resolved.Content);
+    }
+
+    [Fact]
+    public async Task A_passed_mp4_becomes_a_real_multipart_file_with_video_mp4()
+    {
+        var assets = new FakeAssets { ReadFile = new AssetFile([0, 0, 0, 0x18, 1, 2, 3], "video/mp4") };
+        var resolved = await DiscordBotRuntime.ResolveOutboundPayloadAsync(
+            AssetDelivery(("clip.mp4", "Harbour at dusk")), Config(maxAttachmentBytes: 1024), assets);
+        var handler = new QueueHandler(
+            Json("[]"), Json("{\"id\":\"9001\",\"attachments\":[{\"id\":\"0\"}]}"));
+        using var transport = new DiscordRestTransport(handler);
+
+        var sent = await transport.SendIdempotentMessageAsync(
+            "secret", "123", resolved.Content, "0123456789abcdef01234567", resolved.Files);
+
+        Assert.Equal("9001", sent.Id);
+        var post = Assert.Single(handler.Requests, request => request.Method == HttpMethod.Post);
+        Assert.StartsWith("multipart/form-data", post.ContentType, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("files[0]", post.Body, StringComparison.Ordinal);
+        Assert.Contains("shared-file-1.mp4", post.Body, StringComparison.Ordinal);
+        Assert.Contains("video/mp4", post.Body, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("notes.pdf", "application/pdf")]
+    [InlineData("data.zip", "application/zip")]
+    [InlineData("clip.avi", "video/x-msvideo")]
+    [InlineData("clip.mp4", "audio/mpeg")]
+    public async Task Anything_off_the_allowlist_is_named_unavailable_not_sent(string assetId, string storedType)
+    {
+        var assets = new FakeAssets { ReadFile = new AssetFile([1, 2, 3], storedType) };
+
+        var resolved = await DiscordBotRuntime.ResolveOutboundPayloadAsync(
+            AssetDelivery((assetId, "The file")), Config(maxAttachmentBytes: 1024), assets);
+
+        Assert.Empty(resolved.Files);
+        Assert.Equal("Here it is.\n\n[Attachment unavailable: The file]", resolved.Content);
+    }
+
+    [Fact]
+    public async Task A_video_over_the_configured_limit_is_named_unavailable_not_truncated()
+    {
+        var assets = new FakeAssets { ReadFile = new AssetFile(new byte[2048], "video/mp4") };
+
+        var resolved = await DiscordBotRuntime.ResolveOutboundPayloadAsync(
+            AssetDelivery(("clip.mp4", "Harbour at dusk")), Config(maxAttachmentBytes: 1024), assets);
+
+        Assert.Empty(resolved.Files);
+        Assert.Contains("[Attachment unavailable: Harbour at dusk]", resolved.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_server_side_413_degrades_to_the_text_with_each_file_named_unavailable()
+    {
+        var resolved = new DiscordBotRuntime.ResolvedOutboundPayload("Here it is.",
+            [new DiscordOutboundFile("shared-file-1.mp4", "video/mp4", "Harbour at dusk", [1])]);
+
+        var degraded = resolved.WithoutFilesTooLarge();
+
+        Assert.Empty(degraded.Files);
+        Assert.Equal("Here it is.\n\n[Attachment unavailable: Harbour at dusk]", degraded.Content);
+    }
+
+    [Theory]
+    [InlineData("a.mp4", "video/mp4")]
+    [InlineData("a.m4v", "video/mp4")]
+    [InlineData("a.MOV", "video/quicktime")]
+    [InlineData("a.webm", "video/webm")]
+    [InlineData("a.mkv", "video/x-matroska")]
+    [InlineData("a.gif", "image/gif")]
+    [InlineData("a.pdf", "application/octet-stream")]
+    public void The_review_names_a_video_by_its_extension(string assetId, string mediaType)
+        => Assert.Equal(mediaType, DiscordConversationCoordinator.AssetMediaType(assetId));
 
     [Theory]
     [InlineData("❤️", "❤")]

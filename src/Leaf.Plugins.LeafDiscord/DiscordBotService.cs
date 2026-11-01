@@ -4674,13 +4674,31 @@ internal sealed class DiscordBotRuntime(
                 }
                 try
                 {
-                    var sent = useWebhook
-                        ? await rest.SendWebhookMessageAsync(
-                            binding.WebhookId!, binding.WebhookToken!, outbound.Content,
-                            outbound.Files, ct)
-                        : await rest.SendIdempotentMessageAsync(config.BotToken,
-                            binding.ConversationId, outbound.Content,
-                            DiscordRestTransport.Nonce(delivery), outbound.Files, ct);
+                    async Task<DiscordRestMessage> SendOutboundAsync(ResolvedOutboundPayload payload)
+                        => useWebhook
+                            ? await rest.SendWebhookMessageAsync(
+                                binding.WebhookId!, binding.WebhookToken!, payload.Content,
+                                payload.Files, ct)
+                            : await rest.SendIdempotentMessageAsync(config.BotToken,
+                                binding.ConversationId, payload.Content,
+                                DiscordRestTransport.Nonce(delivery), payload.Files, ct);
+                    DiscordRestMessage sent;
+                    try
+                    {
+                        sent = await SendOutboundAsync(outbound);
+                    }
+                    catch (DiscordRestException ex) when (
+                        ex.StatusCode == System.Net.HttpStatusCode.RequestEntityTooLarge && outbound.Files.Count > 0)
+                    {
+                        // Discord refused the upload for this server's own size limit, which can be
+                        // below max_attachment_bytes. Nothing was posted: say what is missing instead
+                        // of losing the whole reply.
+                        logger.LogWarning(
+                            "Discord rejected the {Count} file(s) of {MessageUid} as too large; sending the text with an unavailable note",
+                            outbound.Files.Count, delivery.MessageUid);
+                        outbound = outbound.WithoutFilesTooLarge();
+                        sent = await SendOutboundAsync(outbound);
+                    }
                     var sentId = sent.Id;
                     await deliveries.MarkSentAsync(delivery, sentId, ct);
                     if (hostTurn is not null)
@@ -4956,29 +4974,33 @@ internal sealed class DiscordBotRuntime(
             }
 
             var file = await assetStore.ReadAsync(assetId, ct);
+            // The kernel names an Asset's type from its extension and knows only .mp4 among videos, so
+            // a .mov or .webm reads back as octet-stream; the bridge's own mapping (the one the
+            // Sentinel was given for this Asset) fills that gap. Anything not on the allowlist is unavailable.
+            var contentType = file is null ? "" : EffectiveContentType(file.ContentType, assetId);
             if (file is null
                 || file.Bytes.LongLength > config.MaxAttachmentBytes
-                || !TryImageExtension(file.ContentType, out var extension))
+                || !TryAttachmentExtension(contentType, out var extension))
             {
                 unavailable.Add(description);
                 continue;
             }
 
             files.Add(new DiscordOutboundFile(
-                $"shared-image-{index + 1}{extension}",
-                file.ContentType,
+                $"{(contentType.StartsWith("video/", StringComparison.Ordinal) ? "shared-file" : "shared-image")}-{index + 1}{extension}",
+                contentType,
                 description.Length <= 1024 ? description : description[..1024],
                 file.Bytes));
         }
 
         foreach (var description in unavailable)
-            content = AppendUnavailableImage(content, description);
+            content = AppendUnavailableAttachment(content, description);
         return new ResolvedOutboundPayload(content, files);
     }
 
-    private static string AppendUnavailableImage(string content, string description)
+    internal static string AppendUnavailableAttachment(string content, string description)
     {
-        var note = $"[Image unavailable: {description}]";
+        var note = $"[Attachment unavailable: {description}]";
         if (string.IsNullOrEmpty(content)) return note[..Math.Min(note.Length, 2_000)];
         var available = 2_000 - note.Length - 2;
         return available <= 0
@@ -4986,7 +5008,17 @@ internal sealed class DiscordBotRuntime(
             : $"{content[..Math.Min(content.Length, available)]}\n\n{note}";
     }
 
-    private static bool TryImageExtension(string contentType, out string extension)
+    private static string EffectiveContentType(string contentType, string assetId)
+    {
+        var stored = (contentType ?? "").Split(';')[0].Trim().ToLowerInvariant();
+        return stored is "" or "application/octet-stream"
+            ? DiscordConversationCoordinator.AssetMediaType(assetId)
+            : stored;
+    }
+
+    /// <summary>The allowlist for what a reply may attach: the image types and the video types the
+    /// Sentinel reviews. The extension follows the type, never the Asset's name.</summary>
+    private static bool TryAttachmentExtension(string contentType, out string extension)
     {
         extension = contentType.ToLowerInvariant() switch
         {
@@ -4994,13 +5026,25 @@ internal sealed class DiscordBotRuntime(
             "image/jpeg" => ".jpg",
             "image/gif" => ".gif",
             "image/webp" => ".webp",
+            "video/mp4" => ".mp4",
+            "video/quicktime" => ".mov",
+            "video/webm" => ".webm",
+            "video/x-matroska" => ".mkv",
             _ => "",
         };
         return extension.Length > 0;
     }
 
     internal sealed record ResolvedOutboundPayload(
-        string Content, IReadOnlyList<DiscordOutboundFile> Files);
+        string Content, IReadOnlyList<DiscordOutboundFile> Files)
+    {
+        /// <summary>
+        /// The same reply without its files, each named as unavailable. Discord's own upload limit
+        /// for this server is below ours; the participants get the text and are told what is missing.
+        /// </summary>
+        public ResolvedOutboundPayload WithoutFilesTooLarge()
+            => new(Files.Aggregate(Content, (text, file) => AppendUnavailableAttachment(text, file.Description)), []);
+    }
 
     private async Task DisposeClientAsync(DiscordSocketClient target)
     {
