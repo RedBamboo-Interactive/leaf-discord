@@ -527,6 +527,108 @@ public sealed class DiscordTransportTests
         Assert.Empty(handler.Requests);
     }
 
+    private const string CdnBase = "https://cdn.discordapp.com/attachments/1/2/";
+
+    private static DiscordAttachmentSource Source(string id, string name, long size, string type = "text/plain")
+        => new(id, name, type, size, CdnBase + name);
+
+    private static HttpResponseMessage Body(byte[] bytes, bool announceLength = true) => new(HttpStatusCode.OK)
+    {
+        Content = announceLength
+            ? new ByteArrayContent(bytes)
+            : new StreamContent(new NonSeekableStream(bytes)),
+    };
+
+    private sealed class NonSeekableStream(byte[] bytes) : MemoryStream(bytes)
+    {
+        public override bool CanSeek => false;
+    }
+
+    [Fact]
+    public async Task A_file_declared_over_the_limit_is_left_out_without_a_download_and_the_rest_is_taken_in()
+    {
+        var small = "small"u8.ToArray();
+        var handler = new QueueHandler(Body(small));
+        var assets = new FakeAssets();
+        using var ingestor = new DiscordAttachmentIngestor(assets, handler);
+
+        var result = await ingestor.IngestAvailableAsync(Config(maxAttachmentBytes: 100), "5001",
+            [Source("1", "huge.mov", 5_000_000, "video/quicktime"), Source("2", "note.txt", small.Length)]);
+
+        Assert.Equal("1", Assert.Single(result.TooLarge).Id);
+        Assert.Equal("2", Assert.Single(result.Ingested).Id);
+        Assert.Equal(small, assets.Bytes);
+        Assert.Equal(CdnBase + "note.txt", Assert.Single(handler.Requests).Uri); // huge.mov was never requested
+    }
+
+    [Theory]
+    [InlineData(true)]   // the CDN announces a length over the limit
+    [InlineData(false)]  // the declared size lied and the stream just keeps going
+    public async Task A_file_found_to_be_over_the_limit_while_downloading_is_left_out_and_never_stored(bool announceLength)
+    {
+        var handler = new QueueHandler(Body(new byte[500], announceLength));
+        var assets = new FakeAssets();
+        using var ingestor = new DiscordAttachmentIngestor(assets, handler);
+
+        var result = await ingestor.IngestAvailableAsync(Config(maxAttachmentBytes: 100), "5001",
+            [Source("1", "liar.bin", 10, "application/octet-stream")]);
+
+        Assert.Equal("1", Assert.Single(result.TooLarge).Id);
+        Assert.Empty(result.Ingested);
+        Assert.Null(assets.Bytes);
+    }
+
+    [Fact]
+    public async Task The_strict_ingest_still_throws_for_an_oversized_file()
+    {
+        using var ingestor = new DiscordAttachmentIngestor(new FakeAssets(), new QueueHandler(Body(new byte[500], false)));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ingestor.IngestAsync(
+            Config(maxAttachmentBytes: 100), "5001", [Source("1", "liar.bin", 10)]));
+    }
+
+    [Fact]
+    public async Task A_cdn_failure_or_an_out_of_boundary_url_still_throws_even_when_an_oversized_file_is_present()
+    {
+        using var failing = new DiscordAttachmentIngestor(
+            new FakeAssets(), new QueueHandler(new HttpResponseMessage(HttpStatusCode.InternalServerError)));
+        await Assert.ThrowsAsync<HttpRequestException>(() => failing.IngestAvailableAsync(
+            Config(maxAttachmentBytes: 100), "5001", [Source("1", "huge.bin", 5_000), Source("2", "a.txt", 3)]));
+
+        var handler = new QueueHandler();
+        using var outside = new DiscordAttachmentIngestor(new FakeAssets(), handler);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => outside.IngestAvailableAsync(
+            Config(maxAttachmentBytes: 100), "5001",
+            [new DiscordAttachmentSource("1", "a.txt", "text/plain", 3, "https://evil.example/a.txt")]));
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public void A_message_with_an_oversized_file_keeps_its_text_and_names_the_file_as_left_out()
+    {
+        var config = Config(maxAttachmentBytes: 1024);
+        var kept = new ExternalConversationAttachment("2", "notes.txt", "text/plain", 5, "abc", "/api/assets/q-2");
+        var result = new DiscordIngestResult([kept], [Source("1", "party.mp4", 50_000_000, "video/mp4")]);
+
+        var content = DiscordBotRuntime.ComposeMessageContent("look at this", result, config);
+
+        var lines = content.Split('\n');
+        Assert.Equal("look at this", lines[0]);
+        Assert.Equal("[Discord attachment: notes.txt, text/plain, 5 bytes, sha256 abc, quarantined asset /api/assets/q-2]", lines[1]);
+        Assert.Equal(
+            "[Discord attachment 1: party.mp4, video/mp4, 50000000 bytes declared: too large (limit 1024 bytes), " +
+            "not downloaded, not reviewed and not available to you]", lines[2]);
+    }
+
+    [Fact]
+    public void A_message_of_only_oversized_files_still_has_content_to_admit()
+    {
+        var result = new DiscordIngestResult([], [Source("1", "party.mp4", 50_000_000, "video/mp4")]);
+
+        Assert.False(string.IsNullOrWhiteSpace(
+            DiscordBotRuntime.ComposeMessageContent("", result, Config(maxAttachmentBytes: 1024))));
+    }
+
     private static LeafDiscordConfig Config(long maxAttachmentBytes) => new(
         "100000000000000001", new string('a', 64), "token", true,
         "nova", "deep-codex",

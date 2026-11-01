@@ -55,6 +55,10 @@ public sealed record DiscordChannelGap(
 /// Reads the gap for one admitted turn against the binding as the coordinator sees it under
 /// its per-binding gate. Returns null when the session has seen everything.
 /// </summary>
+/// <summary>An attachment turned out to be over the size limit while it was being read.</summary>
+public sealed class DiscordAttachmentTooLargeException(string attachmentId)
+    : InvalidOperationException($"Discord attachment {attachmentId} exceeds the configured size limit");
+
 public delegate Task<DiscordChannelGap?> DiscordChannelGapSource(
     DiscordBinding binding, CancellationToken ct);
 
@@ -267,6 +271,11 @@ internal static class DiscordChannelGaps
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
                     throw;
+                }
+                catch (DiscordAttachmentTooLargeException)
+                {
+                    // The declared size was within the limit and the file was not.
+                    attachments.Add(new(attachment, null, "exceeds the configured size limit"));
                 }
                 catch (Exception)
                 {

@@ -308,6 +308,37 @@ public sealed class DiscordChannelGapTests
     }
 
     [Fact]
+    public async Task A_gap_attachment_found_oversized_while_downloading_is_named_as_over_the_limit_not_as_a_failure()
+    {
+        // Declared small, actually 5 KiB against a 1 KiB limit: the same ingestor, the production wiring.
+        var assets = new RecordingAssets();
+        using var ingestor = new DiscordAttachmentIngestor(assets, new BytesHandler(new byte[5 * 1024]));
+        var config = new LeafDiscordConfig(
+            ApplicationId, new string('a', 64), "token", true,
+            "nova", "deep-codex",
+            "nova-discord-external", "avatar", new HashSet<string>(),
+            new HashSet<string>(), 1024);
+        var source = new DiscordAttachmentSource(
+            "78", "clip.mp4", "video/mp4", 10, "https://cdn.discordapp.com/attachments/1/2/clip.mp4");
+
+        var gap = (await DiscordChannelGaps.BuildAsync(
+            new DiscordGapScan([Message("5001", "see attached", source)], true),
+            null,
+            (_, _) => Task.FromResult(false),
+            async (message, attachment, ct) =>
+            {
+                var taken = await ingestor.IngestAvailableAsync(config, message.Id, [attachment], ct);
+                return taken.Ingested.Count == 1 ? taken.Ingested[0] : throw new DiscordAttachmentTooLargeException(attachment.Id);
+            },
+            config.MaxAttachmentBytes))!;
+
+        var entry = gap.Messages.Single();
+        Assert.Equal("see attached", entry.Message.Content);
+        Assert.Equal("exceeds the configured size limit", entry.Attachments.Single().NotIngestedReason);
+        Assert.Empty(assets.StableKeys);
+    }
+
+    [Fact]
     public async Task Delivered_cursor_only_moves_forward_within_one_generation()
     {
         var entities = new MemoryEntityStore();

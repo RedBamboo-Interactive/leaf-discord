@@ -16,6 +16,11 @@ public sealed record DiscordAttachmentSource(
 public sealed record DiscordOutboundFile(
     string Filename, string ContentType, string Description, byte[] Bytes);
 
+/// <summary>Attachments that were taken in, and the ones left out because they are over the size limit.</summary>
+public sealed record DiscordIngestResult(
+    IReadOnlyList<ExternalConversationAttachment> Ingested,
+    IReadOnlyList<DiscordAttachmentSource> TooLarge);
+
 public sealed class DiscordAttachmentIngestor : IDisposable
 {
     private static readonly HashSet<string> AllowedHosts = new(StringComparer.OrdinalIgnoreCase)
@@ -36,18 +41,43 @@ public sealed class DiscordAttachmentIngestor : IDisposable
         http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
     }
 
+    /// <summary>
+    /// Takes in every attachment or throws, including for one over the size limit. Callers that
+    /// would rather lose one file than the message use <see cref="IngestAvailableAsync"/>.
+    /// </summary>
     public async Task<IReadOnlyList<ExternalConversationAttachment>> IngestAsync(
         LeafDiscordConfig config,
         string discordMessageId,
         IReadOnlyCollection<DiscordAttachmentSource> attachments,
         CancellationToken ct = default)
     {
+        var result = await IngestAvailableAsync(config, discordMessageId, attachments, ct);
+        if (result.TooLarge.Count > 0)
+            throw new InvalidOperationException(
+                $"Discord attachment '{result.TooLarge[0].Filename}' exceeds the configured size limit");
+        return result.Ingested;
+    }
+
+    /// <summary>
+    /// As <see cref="IngestAsync"/>, except that a file over the size limit (declared, announced by
+    /// the CDN, or found while streaming) is left out and reported in <see cref="DiscordIngestResult.TooLarge"/>
+    /// instead of failing the rest. It is never stored. A CDN failure or an out-of-boundary URL still throws.
+    /// </summary>
+    public async Task<DiscordIngestResult> IngestAvailableAsync(
+        LeafDiscordConfig config,
+        string discordMessageId,
+        IReadOnlyCollection<DiscordAttachmentSource> attachments,
+        CancellationToken ct = default)
+    {
         var ingested = new List<ExternalConversationAttachment>(attachments.Count);
+        var tooLarge = new List<DiscordAttachmentSource>();
         foreach (var attachment in attachments)
         {
             if (attachment.Size > config.MaxAttachmentBytes)
-                throw new InvalidOperationException(
-                    $"Discord attachment '{attachment.Filename}' exceeds the configured size limit");
+            {
+                tooLarge.Add(attachment);
+                continue;
+            }
             if (!Uri.TryCreate(attachment.Url, UriKind.Absolute, out var uri)
                 || uri.Scheme != Uri.UriSchemeHttps || !AllowedHosts.Contains(uri.Host))
                 throw new InvalidOperationException("Discord attachment URL is outside the allowed CDN boundary");
@@ -60,23 +90,33 @@ public sealed class DiscordAttachmentIngestor : IDisposable
             response.EnsureSuccessStatusCode();
             if (response.Content.Headers.ContentLength is { } length
                 && length > config.MaxAttachmentBytes)
-                throw new InvalidOperationException(
-                    $"Discord attachment '{attachment.Filename}' exceeds the configured size limit");
+            {
+                tooLarge.Add(attachment);
+                continue;
+            }
 
             await using var source = await response.Content.ReadAsStreamAsync(ct);
             await using var buffer = new MemoryStream(capacity: checked((int)Math.Min(
                 config.MaxAttachmentBytes, response.Content.Headers.ContentLength ?? attachment.Size)));
             var block = new byte[64 * 1024];
             long total = 0;
+            var overLimit = false;
             while (true)
             {
                 var read = await source.ReadAsync(block, ct);
                 if (read == 0) break;
                 total += read;
                 if (total > config.MaxAttachmentBytes)
-                    throw new InvalidOperationException(
-                        $"Discord attachment '{attachment.Filename}' exceeds the configured size limit");
+                {
+                    overLimit = true;
+                    break;
+                }
                 await buffer.WriteAsync(block.AsMemory(0, read), ct);
+            }
+            if (overLimit)
+            {
+                tooLarge.Add(attachment);
+                continue;
             }
 
             var bytes = buffer.ToArray();
@@ -91,7 +131,7 @@ public sealed class DiscordAttachmentIngestor : IDisposable
             ingested.Add(new ExternalConversationAttachment(
                 attachment.Id, attachment.Filename, mediaType, total, sha256, asset.Url));
         }
-        return ingested;
+        return new DiscordIngestResult(ingested, tooLarge);
     }
 
     public void Dispose() => http.Dispose();

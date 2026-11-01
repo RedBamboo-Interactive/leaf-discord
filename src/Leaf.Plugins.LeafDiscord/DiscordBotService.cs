@@ -2646,15 +2646,15 @@ internal sealed class DiscordBotRuntime(
         try
         {
             var attachmentStarted = Stopwatch.GetTimestamp();
-            var submittedAttachments = await attachmentIngestor.IngestAsync(
+            // A file over the size limit is left out, not a reason to lose the person's message.
+            var ingestResult = await attachmentIngestor.IngestAvailableAsync(
                 config, message.Id.ToString(), message.Attachments.Select(attachment =>
                     new DiscordAttachmentSource(
                         attachment.Id.ToString(), attachment.Filename, attachment.ContentType,
                         attachment.Size, attachment.Url)).ToArray());
+            var submittedAttachments = ingestResult.Ingested;
             LogSlowMessageStep(message.Id, "attachment ingest", attachmentStarted);
-            var attachmentLines = submittedAttachments.Select(attachment =>
-                $"[Discord attachment: {attachment.Name}, {attachment.MediaType}, {attachment.Size} bytes, sha256 {attachment.Sha256}, quarantined asset {attachment.ScopeToken}]");
-            var content = string.Join('\n', new[] { message.Content }.Concat(attachmentLines)).Trim();
+            var content = ComposeMessageContent(message.Content, ingestResult, config);
             if (string.IsNullOrWhiteSpace(content))
             {
                 CancelTyping(typingAdmission);
@@ -2940,6 +2940,24 @@ internal sealed class DiscordBotRuntime(
     /// has not seen, bounded by <see cref="DiscordChannelGaps"/>. Gap attachments go through
     /// the same quarantine ingestor and size limit as the current message's attachments.
     /// </summary>
+    /// <summary>The message text followed by one line per attachment: taken in, or left out as too large.</summary>
+    internal static string ComposeMessageContent(string? text, DiscordIngestResult attachments, LeafDiscordConfig config)
+    {
+        var lines = attachments.Ingested.Select(attachment =>
+                $"[Discord attachment: {attachment.Name}, {attachment.MediaType}, {attachment.Size} bytes, sha256 {attachment.Sha256}, quarantined asset {attachment.ScopeToken}]")
+            .Concat(attachments.TooLarge.Select(attachment => TooLargeAttachmentLine(attachment, config)));
+        return string.Join('\n', new[] { text }.Concat(lines)).Trim();
+    }
+
+    /// <summary>
+    /// The line that tells the Agent a file was left out. The file name is participant text, as in
+    /// the line of an attachment that was taken in; the rest is written here.
+    /// </summary>
+    internal static string TooLargeAttachmentLine(DiscordAttachmentSource attachment, LeafDiscordConfig config)
+        => $"[Discord attachment {attachment.Id}: {attachment.Filename}, {attachment.ContentType ?? "application/octet-stream"}, " +
+           $"{attachment.Size} bytes declared: too large (limit {config.MaxAttachmentBytes} bytes), " +
+           "not downloaded, not reviewed and not available to you]";
+
     private DiscordChannelGapSource? ChannelGapSource(IUserMessage message, LeafDiscordConfig config)
     {
         if (message.Channel is not IGuildChannel) return null;
@@ -2965,8 +2983,14 @@ internal sealed class DiscordBotRuntime(
                     return read;
                 },
                 deliveries,
-                async (gapMessage, attachment, token) => (await attachmentIngestor.IngestAsync(
-                    config, gapMessage.Id, [attachment], token)).Single(),
+                async (gapMessage, attachment, token) =>
+                {
+                    var taken = await attachmentIngestor.IngestAvailableAsync(
+                        config, gapMessage.Id, [attachment], token);
+                    return taken.Ingested.Count == 1
+                        ? taken.Ingested[0]
+                        : throw new DiscordAttachmentTooLargeException(attachment.Id);
+                },
                 config.MaxAttachmentBytes,
                 ct,
                 userIdentities);
