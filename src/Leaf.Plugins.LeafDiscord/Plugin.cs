@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Leaf.Plugins.LeafDiscord;
 
@@ -26,6 +27,9 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
     public void ConfigureServices(IServiceCollection services, PluginContext ctx)
     {
         services.AddSingleton<PromptInjectionDetector>();
+        services.AddSingleton<DiscordChannelReadReviewer>(sp => new DiscordChannelReadReviewer(
+            sp.GetService<IUntrustedContentReview>(),
+            sp.GetService<ILogger<DiscordChannelReadReviewer>>()));
         services.AddSingleton<DiscordEgressGuard>();
         services.AddSingleton<DiscordTypingLeases>();
         services.AddSingleton(sp => new LeafDiscordConfigStore(

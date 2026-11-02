@@ -399,11 +399,13 @@ public static class DiscordEndpoints
             string guildId,
             string channelId,
             int? limit,
+            string? after,
             HttpContext http,
             DiscordBotConfigurationStore configurations,
             DiscordCommonsConfigurationStore commons,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordChannelReadReviewer reviewer,
             CancellationToken ct) =>
         {
             var caller = ReadPrivateLeafAgentCaller(http);
@@ -416,15 +418,58 @@ public static class DiscordEndpoints
                 return Forbidden("This Agent cannot address that Discord bot.");
             if (!await bot.IsCommonsChannelAsync(id, guildId, channelId, ct))
                 return Forbidden("That Discord channel is outside Leaf Community scope.");
+            ulong? afterId = null;
+            if (!string.IsNullOrEmpty(after))
+            {
+                if (!ulong.TryParse(after, out var parsedAfter))
+                    return Results.BadRequest(new
+                    {
+                        error = "discord_guild_read_invalid",
+                        message = "after must be a Discord message snowflake.",
+                    });
+                afterId = parsedAfter;
+            }
             try
             {
+                var messages = await bot.ReadGuildChannelMessagesAsync(
+                    id, guildId, channelId, limit ?? 50, ct, afterId);
+                // Nothing to read means nothing to review: a quiet channel ends here, cheaply.
+                if (messages.Count == 0)
+                    return Results.Ok(new
+                    {
+                        guildId,
+                        channelId,
+                        trust = "untrusted_discord_content",
+                        reviewed = false,
+                        messages = Array.Empty<DiscordReviewedMessageView>(),
+                    });
+                var provenance = await DiscordComputeProvenance.CreateAsync(
+                    configurations.EntityStore, caller.ActorEntityId, caller.BeneficiaryId,
+                    caller.DiscussionId is { } discussionId
+                        ? [new ComputeContextReference("discussion", discussionId),
+                           new ComputeContextReference("discord-channel", channelId)]
+                        : [new ComputeContextReference("discord-channel", channelId)],
+                    $"discord-read:{channelId}", ct);
+                var reviewed = await reviewer.ReviewAsync(
+                    messages, $"{guildId}:{channelId}", caller.BeneficiaryId,
+                    caller.ActorEntityId, provenance, ct);
+                // Fail closed: no verdict, no message text.
+                if (reviewed is null)
+                    return Results.Json(new
+                    {
+                        error = "sentinel_unavailable",
+                        message = "The Sentinel safety check is unavailable; no Discord message content is returned until it is back.",
+                    }, statusCode: StatusCodes.Status503ServiceUnavailable);
                 return Results.Ok(new
                 {
                     guildId,
                     channelId,
                     trust = "untrusted_discord_content",
-                    messages = await bot.ReadGuildChannelMessagesAsync(
-                        id, guildId, channelId, limit ?? 50, ct),
+                    reviewed = true,
+                    sentinel = reviewed.Sentinel,
+                    withheld = reviewed.Withheld,
+                    truncated = reviewed.Truncated,
+                    messages = reviewed.Messages,
                 });
             }
             catch (Exception ex) when (ex is ArgumentException

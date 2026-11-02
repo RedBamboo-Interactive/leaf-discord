@@ -545,12 +545,12 @@ public sealed class DiscordBotService(
 
     internal async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
         Guid botId, string guildId, string channelId, int limit,
-        CancellationToken ct = default)
+        CancellationToken ct = default, ulong? after = null)
     {
         var config = await configurations.GetAsync(botId, ct)
             ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
         return await (await ResolveRuntimeAsync(config.ApplicationId, ct))
-            .ReadGuildChannelMessagesAsync(guildId, channelId, limit, ct);
+            .ReadGuildChannelMessagesAsync(guildId, channelId, limit, ct, after);
     }
 
     internal async Task<IReadOnlyList<DiscordForumPostView>> ListForumPostsAsync(
@@ -1493,7 +1493,7 @@ internal sealed class DiscordBotRuntime(
 
     public async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
         string guildId, string channelId, int limit,
-        CancellationToken ct = default)
+        CancellationToken ct = default, ulong? after = null)
     {
         var current = client
             ?? throw new InvalidOperationException("Discord bot is not connected.");
@@ -1502,11 +1502,11 @@ internal sealed class DiscordBotRuntime(
         var guild = current.GetGuild(parsedGuildId)
             ?? throw new UnauthorizedAccessException(
                 "The requested guild is unavailable to this Discord bot.");
-        return await ReadGuildChannelMessagesAsync(guild, channelId, limit, ct);
+        return await ReadGuildChannelMessagesAsync(guild, channelId, limit, ct, after);
     }
 
     private static async Task<IReadOnlyList<DiscordGuildMessageView>> ReadGuildChannelMessagesAsync(
-        SocketGuild guild, string channelId, int limit, CancellationToken ct)
+        SocketGuild guild, string channelId, int limit, CancellationToken ct, ulong? after = null)
     {
         var target = ResolveActiveGuildChannel(guild, channelId);
         if (target is SocketForumChannel)
@@ -1515,7 +1515,7 @@ internal sealed class DiscordBotRuntime(
         if (target is not IMessageChannel messages)
             throw new ArgumentException("The selected Discord channel has no readable messages.");
         EnsureReadable(guild, target);
-        return await ReadMessagesAsync(messages, limit, ct);
+        return await ReadMessagesAsync(messages, limit, ct, after);
     }
 
     public async Task<IReadOnlyList<DiscordForumPostView>> ListForumPostsAsync(
@@ -1611,12 +1611,17 @@ internal sealed class DiscordBotRuntime(
     private static int BoundedReadLimit(int limit)
         => Math.Clamp(limit <= 0 ? 50 : limit, 1, 100);
 
-    private static async Task<IReadOnlyList<DiscordGuildMessageView>> ReadMessagesAsync(
-        IMessageChannel channel, int limit, CancellationToken ct)
+    internal static async Task<IReadOnlyList<DiscordGuildMessageView>> ReadMessagesAsync(
+        IMessageChannel channel, int limit, CancellationToken ct, ulong? after = null)
     {
         var options = new RequestOptions { CancelToken = ct };
-        var messages = await channel.GetMessagesAsync(
-            BoundedReadLimit(limit), CacheMode.AllowDownload, options).FlattenAsync();
+        // With a cursor, the oldest messages after it, so a reader pages forward without gaps.
+        var messages = after is { } cursor
+            ? await channel.GetMessagesAsync(
+                cursor, Direction.After, BoundedReadLimit(limit), CacheMode.AllowDownload, options)
+                .FlattenAsync()
+            : await channel.GetMessagesAsync(
+                BoundedReadLimit(limit), CacheMode.AllowDownload, options).FlattenAsync();
         return messages
             .OrderBy(message => message.Id)
             .Select(message => new DiscordGuildMessageView(

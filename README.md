@@ -159,6 +159,27 @@ inside the source binding's guild and are limited to history visible to the same
 other applications, and other guilds cannot use this path. Returned Discord structure and
 content are explicitly untrusted.
 
+A private Leaf Agent discussion (the owner's own Agent, for example a scheduled reader) reads
+a Leaf Community channel or thread through the owner-guarded route:
+
+```text
+GET /api/apps/leaf-discord/bots/{botEntityId}/guilds/{guildId}/channels/{channelId}/messages?limit=50&after={messageId}
+```
+
+Nothing Discord-authored reaches that session unreviewed. The returned text, author names and
+attachment filenames are reviewed by the shared Sentinel (`cap-sentinel`, the same
+`IUntrustedContentReview` capability inbound turns and Mail use), once per response rather than
+once per message, and hidden content is stripped from what is returned. The response carries
+`sentinel` (`risk`, `signals`, `handling`, `isolation`), `reviewed`, `withheld` and `truncated`.
+It fails closed like Mail: when the Sentinel is unavailable or gives no verdict the route answers
+`503 sentinel_unavailable` with no message text. On a `high` risk verdict, or
+`require_private_approval` handling, `withheld` is true and each message keeps only its ID,
+timestamps, author ID, bot flag, source, and attachment IDs, types and sizes. `after` returns
+only messages newer than that ID, oldest first, so a reader can keep a cursor; an empty result
+is returned without any review call. `limit` is at most 100. A response too large for one review
+is cut at the review bound with `truncated: true`; continue from the last returned ID.
+The external-session routes above are unchanged.
+
 The same signed session can react to the current turn's admitted inbound message:
 
 ```http
