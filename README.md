@@ -413,6 +413,13 @@ Agent in the community, each free to stay silent:
   which the Agent may settle with a reaction or `<discord-no-reply/>`.
   A message missed while the bot was down is caught up by startup backfill under the same
   rule, like a direct address.
+- Startup backfill walks every enabled binding, treating one with no recorded cursor as having
+  read nothing. It also lists the active threads of each guild the bot is in and reads the
+  recent messages of those with no binding, such as a post a relayed Leaf Community message
+  created during the outage. The guild policy is unchanged (25 messages, 15 minutes, direct
+  address only), and admission goes through the normal message path, so routing, review and
+  per-message delivery idempotency apply. A thread with nothing to admit gets no binding, and
+  one the bot cannot read, or whose listing fails, is skipped without stopping the others.
 - The native Agent invites deliberately, by writing the exact mention token. In a Leaf
   Community guild where it takes part, the guild map (the turn's `server_map`, `GET
   /guild/context`, and the private `GET /bots/{id}/guild-navigation`) carries

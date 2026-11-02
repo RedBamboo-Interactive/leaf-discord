@@ -3805,20 +3805,137 @@ internal sealed class DiscordBotRuntime(
             existing.SessionQualityMode);
     }
 
+    /// <summary>
+    /// The cursor a binding backfills from. A binding that has never recorded a message has read
+    /// nothing, so everything inside the policy window counts as unread.
+    /// </summary>
+    internal static ulong BackfillCursor(string? lastReceivedSnowflake)
+        => ulong.TryParse(lastReceivedSnowflake, out var cursor) ? cursor : 0;
+
+    /// <summary>
+    /// The active threads backfill must look at beyond the bindings: those with no binding for
+    /// this application. A bound thread, enabled or not, is the binding loop's business.
+    /// </summary>
+    internal static IReadOnlyList<ulong> SelectUnboundBackfillThreads(
+        IEnumerable<ulong> activeThreadIds, IEnumerable<string> boundConversationIds)
+    {
+        var bound = boundConversationIds
+            .Select(id => ulong.TryParse(id, out var parsed) ? parsed : 0UL)
+            .Where(id => id != 0)
+            .ToHashSet();
+        return activeThreadIds.Where(id => !bound.Contains(id)).Distinct().ToArray();
+    }
+
+    /// <summary>
+    /// Replays the unread messages a policy admits through <see cref="ProcessMessageAsync"/>.
+    /// Replaying a message already processed is harmless: its inbound delivery is keyed by
+    /// application and Discord message ID, so a repeat is not admitted a second time.
+    /// </summary>
+    private async Task<int> AdmitBackfillMessagesAsync(
+        string bindingKind, IEnumerable<IMessage> batch, DateTimeOffset observedAt)
+    {
+        var admitted = 0;
+        foreach (var message in batch.OfType<IUserMessage>())
+        {
+            var mentioned = MentionsBot(message, client!.CurrentUser.Id);
+            var repliesToBot = message.ReferencedMessage?.Author.Id == client.CurrentUser.Id;
+            if (!ShouldAdmitStartupBackfillMessage(
+                    bindingKind, message.Timestamp, observedAt, mentioned, repliesToBot,
+                    await MentionsCommonsBroadcastAsync(message)))
+                continue;
+            admitted++;
+            await ProcessMessageAsync(message);
+        }
+        return admitted;
+    }
+
+    /// <summary>
+    /// A thread created while the bot was away (a relayed Leaf Community post, say) has no
+    /// binding until a live message reaches it, so the binding loop never sees what was said
+    /// there. This reads the recent messages of active threads without a binding and admits
+    /// the addressed ones under the guild policy; a thread with nothing to admit stays unbound.
+    /// </summary>
+    private async Task BackfillUnboundThreadsAsync(
+        LeafDiscordConfig config, IReadOnlyCollection<DiscordBinding> known)
+    {
+        if (client is null) return;
+        var boundIds = known
+            .Where(binding => string.Equals(
+                binding.ApplicationId, config.ApplicationId, StringComparison.Ordinal))
+            .Select(binding => binding.ConversationId)
+            .ToArray();
+        var policy = GetStartupBackfillPolicy("thread");
+        foreach (var guildId in client.Guilds.Select(guild => guild.Id).ToArray())
+        {
+            IReadOnlyCollection<Discord.Rest.RestThreadChannel> active;
+            try
+            {
+                var guild = await client.Rest.GetGuildAsync(guildId);
+                if (guild is null) continue;
+                active = await guild.GetThreadChannelsAsync();
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex, "Discord startup backfill could not list active threads for guild {GuildId}",
+                    guildId);
+                continue;
+            }
+
+            foreach (var threadId in SelectUnboundBackfillThreads(
+                         active.Select(thread => thread.Id), boundIds))
+            {
+                try
+                {
+                    // Binding creation needs the gateway thread; one not cached is left to live traffic.
+                    if (client.GetChannel(threadId) is not SocketThreadChannel thread) continue;
+                    var permissions = thread.Guild.CurrentUser.GetPermissions(thread);
+                    if (!permissions.ViewChannel || !permissions.ReadMessageHistory) continue;
+
+                    var observedAt = DateTimeOffset.UtcNow;
+                    // Only the policy window is requested, so a quiet thread costs one empty read.
+                    var floor = SnowflakeUtils.ToSnowflake(observedAt - policy.MaxAge);
+                    var batch = (await ((IMessageChannel)thread).GetMessagesAsync(
+                                floor, Direction.After, policy.MessageLimit,
+                                CacheMode.AllowDownload).FlattenAsync())
+                        .OrderBy(message => message.Id)
+                        .ToArray();
+                    if (batch.Length == 0) continue;
+
+                    var admitted = await AdmitBackfillMessagesAsync("thread", batch, observedAt);
+                    if (admitted == 0) continue;
+                    if (await bindings.FindAsync(config.ApplicationId, threadId.ToString())
+                        is { } created)
+                        await bindings.MarkReceivedAsync(created, batch[^1].Id.ToString());
+                    logger.LogInformation(
+                        "Discord startup backfill admitted {AdmittedCount} of {InspectedCount} recent messages for unbound thread {ConversationId}",
+                        admitted, batch.Length, threadId);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(
+                        ex, "Discord startup backfill failed for unbound thread {ConversationId}",
+                        threadId);
+                }
+            }
+        }
+    }
+
     private async Task BackfillBindingsAsync()
     {
         if (client is null) return;
         var config = await GetConfigAsync();
-        foreach (var binding in await bindings.ListAsync())
+        var known = await bindings.ListAsync();
+        foreach (var binding in known)
         {
             try
             {
                 if (!string.Equals(
                         binding.ApplicationId, config.ApplicationId, StringComparison.Ordinal)
                     || !binding.Enabled
-                    || !ulong.TryParse(binding.LastReceivedSnowflake, out var cursor)
                     || !ulong.TryParse(binding.ConversationId, out var channelId))
                     continue;
+                var cursor = BackfillCursor(binding.LastReceivedSnowflake);
                 var channel = client.GetChannel(channelId) as IMessageChannel
                     ?? await client.GetChannelAsync(channelId) as IMessageChannel;
                 if (channel is null) continue;
@@ -3832,18 +3949,7 @@ internal sealed class DiscordBotRuntime(
                     .ToArray();
                 if (batch.Length == 0) continue;
 
-                var admitted = 0;
-                foreach (var message in batch.OfType<IUserMessage>())
-                {
-                    var mentioned = MentionsBot(message, client.CurrentUser.Id);
-                    var repliesToBot = message.ReferencedMessage?.Author.Id == client.CurrentUser.Id;
-                    if (!ShouldAdmitStartupBackfillMessage(
-                            binding.Kind, message.Timestamp, observedAt, mentioned, repliesToBot,
-                            await MentionsCommonsBroadcastAsync(message)))
-                        continue;
-                    admitted++;
-                    await ProcessMessageAsync(message);
-                }
+                var admitted = await AdmitBackfillMessagesAsync(binding.Kind, batch, observedAt);
 
                 await bindings.MarkReceivedAsync(binding, batch[^1].Id.ToString());
                 logger.LogInformation(
@@ -3855,6 +3961,8 @@ internal sealed class DiscordBotRuntime(
                 logger.LogWarning(ex, "Discord startup backfill failed for {BindingId}", binding.BindingId);
             }
         }
+
+        await BackfillUnboundThreadsAsync(config, known);
     }
 
     private async Task OnSlashCommandAsync(SocketSlashCommand command)

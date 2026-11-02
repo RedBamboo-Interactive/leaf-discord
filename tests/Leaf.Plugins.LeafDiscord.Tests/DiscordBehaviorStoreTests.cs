@@ -175,6 +175,46 @@ public sealed class DiscordBehaviorStoreTests
             kind, now.AddMinutes(minutesFromNow), now, mentioned, repliesToBot));
     }
 
+    [Fact]
+    public void Startup_backfill_considers_active_threads_that_have_no_binding()
+    {
+        var selected = DiscordBotRuntime.SelectUnboundBackfillThreads(
+            [101UL, 102UL, 103UL, 102UL], ["102", "not-a-snowflake"]);
+
+        Assert.Equal([101UL, 103UL], selected);
+    }
+
+    [Fact]
+    public void Startup_backfill_does_not_handle_an_already_bound_thread_twice()
+    {
+        Assert.Empty(DiscordBotRuntime.SelectUnboundBackfillThreads([101UL], ["101"]));
+    }
+
+    [Theory]
+    [InlineData(null, 0UL)]
+    [InlineData("", 0UL)]
+    [InlineData("garbage", 0UL)]
+    [InlineData("12345", 12345UL)]
+    public void Startup_backfill_treats_a_binding_without_a_cursor_as_having_read_nothing(
+        string? lastReceived, ulong expected)
+    {
+        Assert.Equal(expected, DiscordBotRuntime.BackfillCursor(lastReceived));
+    }
+
+    [Theory]
+    [InlineData(-1, true, false, true)]
+    [InlineData(-1, false, false, false)]
+    [InlineData(-1, false, true, true)]
+    [InlineData(-16, true, false, false)]
+    public void Startup_backfill_admits_only_recent_addressed_messages_of_an_unbound_thread(
+        int minutesFromNow, bool mentioned, bool repliesToBot, bool expected)
+    {
+        var now = new DateTimeOffset(2026, 9, 27, 9, 0, 0, TimeSpan.Zero);
+
+        Assert.Equal(expected, DiscordBotRuntime.ShouldAdmitStartupBackfillMessage(
+            "thread", now.AddMinutes(minutesFromNow), now, mentioned, repliesToBot));
+    }
+
     private static LeafDiscordConfig Config(Guid id) => new(
         "10", new string('a', 64), "token", true, "nova",
         "deep-codex", "leaf-discord-external", "",
