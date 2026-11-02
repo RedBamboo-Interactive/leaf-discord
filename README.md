@@ -159,6 +159,15 @@ inside the source binding's guild and are limited to history visible to the same
 other applications, and other guilds cannot use this path. Returned Discord structure and
 content are explicitly untrusted.
 
+The same review covers these external-session routes. Channel and post messages (text, author
+names, attachment filenames) and forum post listings (titles and tag names) are reviewed by the
+shared Sentinel once per response before any of it is returned, using the signed external
+session's identity for provenance, and hidden content is stripped. Responses keep their existing
+fields and add `reviewed`, `sentinel`, `withheld` and `truncated`; the rules below for the
+owner route apply unchanged: `503 sentinel_unavailable` and no text when the Sentinel gives no
+verdict, metadata only when the verdict is high risk, and no review call for an empty result.
+Who may call these routes and what they can see are unchanged.
+
 A private Leaf Agent discussion (the owner's own Agent, for example a scheduled reader) reads
 a Leaf Community channel or thread through the owner-guarded route:
 
@@ -178,7 +187,9 @@ timestamps, author ID, bot flag, source, and attachment IDs, types and sizes. `a
 only messages newer than that ID, oldest first, so a reader can keep a cursor; an empty result
 is returned without any review call. `limit` is at most 100. A response too large for one review
 is cut at the review bound with `truncated: true`; continue from the last returned ID.
-The external-session routes above are unchanged.
+All of these routes first check, as Mail does, that the cap-sentinel plugin is enabled (the
+answer is cached for a few seconds), so a disabled or missing Sentinel answers `503
+sentinel_unavailable` before any Discord read.
 
 The same signed session can react to the current turn's admitted inbound message:
 

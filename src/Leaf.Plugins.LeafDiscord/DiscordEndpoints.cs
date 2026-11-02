@@ -418,6 +418,7 @@ public static class DiscordEndpoints
                 return Forbidden("This Agent cannot address that Discord bot.");
             if (!await bot.IsCommonsChannelAsync(id, guildId, channelId, ct))
                 return Forbidden("That Discord channel is outside Leaf Community scope.");
+            if (!await reviewer.IsAvailableAsync(ct)) return SentinelUnavailable();
             ulong? afterId = null;
             if (!string.IsNullOrEmpty(after))
             {
@@ -441,6 +442,8 @@ public static class DiscordEndpoints
                         channelId,
                         trust = "untrusted_discord_content",
                         reviewed = false,
+                        withheld = false,
+                        truncated = false,
                         messages = Array.Empty<DiscordReviewedMessageView>(),
                     });
                 var provenance = await DiscordComputeProvenance.CreateAsync(
@@ -453,13 +456,7 @@ public static class DiscordEndpoints
                 var reviewed = await reviewer.ReviewAsync(
                     messages, $"{guildId}:{channelId}", caller.BeneficiaryId,
                     caller.ActorEntityId, provenance, ct);
-                // Fail closed: no verdict, no message text.
-                if (reviewed is null)
-                    return Results.Json(new
-                    {
-                        error = "sentinel_unavailable",
-                        message = "The Sentinel safety check is unavailable; no Discord message content is returned until it is back.",
-                    }, statusCode: StatusCodes.Status503ServiceUnavailable);
+                if (reviewed is null) return SentinelUnavailable();
                 return Results.Ok(new
                 {
                     guildId,
@@ -469,7 +466,7 @@ public static class DiscordEndpoints
                     sentinel = reviewed.Sentinel,
                     withheld = reviewed.Withheld,
                     truncated = reviewed.Truncated,
-                    messages = reviewed.Messages,
+                    messages = reviewed.Items,
                 });
             }
             catch (Exception ex) when (ex is ArgumentException
@@ -1934,23 +1931,37 @@ public static class DiscordEndpoints
             int? limit,
             HttpContext http,
             DiscordBindingStore bindings,
+            DiscordBotConfigurationStore configurations,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordChannelReadReviewer reviewer,
             CancellationToken ct) =>
         {
             var scope = await ResolveDiscordGuildScopeAsync(http, bindings, agents, ct);
             if (scope is null)
                 return Forbidden("A signed external Discord conversation session is required.");
+            if (!await reviewer.IsAvailableAsync(ct)) return SentinelUnavailable();
             try
             {
                 var messages = await bot.ReadGuildChannelMessagesAsync(
                     scope.Binding, channelId, limit ?? 50, ct);
+                var reviewed = messages.Count == 0
+                    ? await reviewer.ReviewAsync(messages, "", null, "", null, ct)
+                    : await reviewer.ReviewAsync(
+                        messages, $"{scope.Binding.GuildId}:{channelId}", scope.Caller.BeneficiaryId,
+                        scope.Caller.ActorEntityId,
+                        await ExternalReadProvenanceAsync(configurations, scope, channelId, ct), ct);
+                if (reviewed is null) return SentinelUnavailable();
                 return Results.Ok(new
                 {
                     guildId = scope.Binding.GuildId,
                     channelId,
                     trust = "untrusted_discord_content",
-                    messages,
+                    reviewed = messages.Count > 0,
+                    sentinel = messages.Count > 0 ? reviewed.Sentinel : null,
+                    withheld = reviewed.Withheld,
+                    truncated = reviewed.Truncated,
+                    messages = reviewed.Items,
                 });
             }
             catch (Exception ex) when (ex is ArgumentException
@@ -1975,23 +1986,37 @@ public static class DiscordEndpoints
             bool? includeArchived,
             HttpContext http,
             DiscordBindingStore bindings,
+            DiscordBotConfigurationStore configurations,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordChannelReadReviewer reviewer,
             CancellationToken ct) =>
         {
             var scope = await ResolveDiscordGuildScopeAsync(http, bindings, agents, ct);
             if (scope is null)
                 return Forbidden("A signed external Discord conversation session is required.");
+            if (!await reviewer.IsAvailableAsync(ct)) return SentinelUnavailable();
             try
             {
                 var posts = await bot.ListForumPostsAsync(
                     scope.Binding, forumId, limit ?? 50, includeArchived ?? true, ct);
+                var reviewed = posts.Count == 0
+                    ? await reviewer.ReviewPostsAsync(posts, "", null, "", null, ct)
+                    : await reviewer.ReviewPostsAsync(
+                        posts, $"{scope.Binding.GuildId}:{forumId}", scope.Caller.BeneficiaryId,
+                        scope.Caller.ActorEntityId,
+                        await ExternalReadProvenanceAsync(configurations, scope, forumId, ct), ct);
+                if (reviewed is null) return SentinelUnavailable();
                 return Results.Ok(new
                 {
                     guildId = scope.Binding.GuildId,
                     forumId,
                     trust = "untrusted_discord_content",
-                    posts,
+                    reviewed = posts.Count > 0,
+                    sentinel = posts.Count > 0 ? reviewed.Sentinel : null,
+                    withheld = reviewed.Withheld,
+                    truncated = reviewed.Truncated,
+                    posts = reviewed.Items,
                 });
             }
             catch (Exception ex) when (ex is ArgumentException
@@ -2016,24 +2041,38 @@ public static class DiscordEndpoints
             int? limit,
             HttpContext http,
             DiscordBindingStore bindings,
+            DiscordBotConfigurationStore configurations,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordChannelReadReviewer reviewer,
             CancellationToken ct) =>
         {
             var scope = await ResolveDiscordGuildScopeAsync(http, bindings, agents, ct);
             if (scope is null)
                 return Forbidden("A signed external Discord conversation session is required.");
+            if (!await reviewer.IsAvailableAsync(ct)) return SentinelUnavailable();
             try
             {
                 var messages = await bot.ReadForumPostMessagesAsync(
                     scope.Binding, forumId, postId, limit ?? 50, ct);
+                var reviewed = messages.Count == 0
+                    ? await reviewer.ReviewAsync(messages, "", null, "", null, ct)
+                    : await reviewer.ReviewAsync(
+                        messages, $"{scope.Binding.GuildId}:{postId}", scope.Caller.BeneficiaryId,
+                        scope.Caller.ActorEntityId,
+                        await ExternalReadProvenanceAsync(configurations, scope, postId, ct), ct);
+                if (reviewed is null) return SentinelUnavailable();
                 return Results.Ok(new
                 {
                     guildId = scope.Binding.GuildId,
                     forumId,
                     postId,
                     trust = "untrusted_discord_content",
-                    messages,
+                    reviewed = messages.Count > 0,
+                    sentinel = messages.Count > 0 ? reviewed.Sentinel : null,
+                    withheld = reviewed.Withheld,
+                    truncated = reviewed.Truncated,
+                    messages = reviewed.Items,
                 });
             }
             catch (Exception ex) when (ex is ArgumentException
@@ -2691,6 +2730,28 @@ public static class DiscordEndpoints
                StringComparison.OrdinalIgnoreCase)
            && string.Equals(resolvedAgentEntityId, caller.ActorEntityId,
                StringComparison.OrdinalIgnoreCase);
+
+    private static IResult SentinelUnavailable()
+        => Results.Json(new
+        {
+            error = "sentinel_unavailable",
+            message = "The Sentinel safety check is unavailable; no Discord message content is returned until it is back.",
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+
+    /// <summary>
+    /// Review provenance for a history read by an external session: the signed caller's Agent
+    /// and owner, with the session's binding and the target channel or post as context.
+    /// </summary>
+    private static Task<ComputeProvenance> ExternalReadProvenanceAsync(
+        DiscordBotConfigurationStore configurations,
+        DiscordGuildAgentScope scope,
+        string target,
+        CancellationToken ct)
+        => DiscordComputeProvenance.CreateAsync(
+            configurations.EntityStore, scope.Caller.ActorEntityId, scope.Caller.BeneficiaryId,
+            [new ComputeContextReference("external-conversation", scope.Binding.BindingId),
+             new ComputeContextReference("discord-channel", target)],
+            $"discord-read:{scope.Binding.BindingId}:{target}", ct);
 
     internal static IResult Forbidden(string message)
         => Results.Json(new { error = "forbidden", message },

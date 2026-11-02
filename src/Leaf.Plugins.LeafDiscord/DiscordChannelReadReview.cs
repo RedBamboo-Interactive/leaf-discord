@@ -23,31 +23,100 @@ internal sealed record DiscordReviewedMessageView(
 internal sealed record DiscordReviewedAttachmentView(
     string Id, string? Filename, string? ContentType, int Size);
 
+/// <summary>A forum post as the reviewed listing returns it. Title and tag names are null when withheld.</summary>
+internal sealed record DiscordReviewedPostView(
+    string Id,
+    string? Name,
+    DateTimeOffset CreatedAt,
+    bool Archived,
+    bool Locked,
+    int MessageCount,
+    IReadOnlyList<DiscordReviewedTagView> Tags);
+
+internal sealed record DiscordReviewedTagView(string Id, string? Name, string? Emoji, bool Moderated);
+
 /// <param name="Sentinel">The verdict object returned to the caller, shaped like Mail's <c>sentinel</c>.</param>
-/// <param name="Truncated">Messages after <paramref name="Messages"/> were left out to keep the
-/// review within the Sentinel's bound; read on from the last returned message ID.</param>
-internal sealed record DiscordReviewedRead(
-    IReadOnlyList<DiscordReviewedMessageView> Messages,
+/// <param name="Truncated">Items after <paramref name="Items"/> were left out to keep the
+/// review within the Sentinel's bound; read on from the last returned ID.</param>
+internal sealed record DiscordReviewedItems<T>(
+    IReadOnlyList<T> Items,
     JsonObject Sentinel,
     bool Withheld,
     bool Truncated);
 
 /// <summary>
-/// Reviews the Discord text a private Agent session reads through the shared Sentinel
+/// Reviews the Discord text a Leaf session reads through the shared Sentinel
 /// (<see cref="IUntrustedContentReview"/>) before any of it is returned, the way Mail reviews
 /// what it returns. One review covers the whole response. Fail closed: with no Sentinel, no
-/// verdict, or text the deterministic screen could not cover, nothing is returned
-/// (<see cref="ReviewAsync"/> yields null and the route answers 503 <c>sentinel_unavailable</c>).
-/// A high-risk verdict (or <c>require_private_approval</c>) returns message metadata only.
+/// verdict, or text the deterministic screen could not cover, nothing is returned (the
+/// methods yield null and the route answers 503 <c>sentinel_unavailable</c>). A high-risk
+/// verdict (or <c>require_private_approval</c>) returns metadata only.
 /// </summary>
 internal sealed class DiscordChannelReadReviewer(
-    IUntrustedContentReview? review, ILogger<DiscordChannelReadReviewer>? logger = null)
+    IUntrustedContentReview? review,
+    ILogger<DiscordChannelReadReviewer>? logger = null,
+    IEntityStore? entities = null)
 {
     /// <summary>The Sentinel reviews at most this many characters (its own review bound).</summary>
     internal const int ReviewBound = 200_000;
 
-    public async Task<DiscordReviewedRead?> ReviewAsync(
+    internal const string SentinelPluginId = "cap-sentinel";
+
+    internal TimeSpan AvailabilityCache { get; init; } = TimeSpan.FromSeconds(5);
+    private (bool Value, long At)? availability;
+
+    /// <summary>
+    /// Whether the Sentinel can be used now: the review service is registered and, as Mail
+    /// checks, cap-sentinel's plugin entity has status <c>enabled</c> (the kernel still
+    /// registers a disabled plugin's services). Any doubt is unavailable.
+    /// </summary>
+    public async Task<bool> IsAvailableAsync(CancellationToken ct)
+    {
+        if (review is null) return false;
+        if (entities is null) return true;
+        if (availability is { } cached
+            && System.Diagnostics.Stopwatch.GetElapsedTime(cached.At) < AvailabilityCache)
+            return cached.Value;
+        bool value;
+        try
+        {
+            var plugin = await entities.GetBySlugAsync("plugin", SentinelPluginId, ct);
+            var statusRef = plugin is null ? null : JsonRead.String(plugin.Data, "status");
+            var status = Guid.TryParse(statusRef, out var statusId)
+                ? await entities.GetAsync(statusId, ct)
+                : null;
+            value = status?.Slug == "enabled";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogWarning("Sentinel status could not be read ({Type})", ex.GetType().Name);
+            value = false;
+        }
+        availability = (value, System.Diagnostics.Stopwatch.GetTimestamp());
+        return value;
+    }
+
+    public Task<DiscordReviewedItems<DiscordReviewedMessageView>?> ReviewAsync(
         IReadOnlyList<DiscordGuildMessageView> messages,
+        string sourceRef, string? ownerUserId, string agentRef,
+        ComputeProvenance? provenance, CancellationToken ct)
+        => ReviewCoreAsync(
+            messages, Section, Project, "Discord channel read review",
+            sourceRef, ownerUserId, agentRef, provenance, ct);
+
+    public Task<DiscordReviewedItems<DiscordReviewedPostView>?> ReviewPostsAsync(
+        IReadOnlyList<DiscordForumPostView> posts,
+        string sourceRef, string? ownerUserId, string agentRef,
+        ComputeProvenance? provenance, CancellationToken ct)
+        => ReviewCoreAsync(
+            posts, Section, Project, "Discord forum read review",
+            sourceRef, ownerUserId, agentRef, provenance, ct);
+
+    private async Task<DiscordReviewedItems<TOut>?> ReviewCoreAsync<TIn, TOut>(
+        IReadOnlyList<TIn> items,
+        Func<TIn, string> section,
+        Func<TIn, bool, Func<string?, string?>, TOut> project,
+        string jobName,
         string sourceRef,
         string? ownerUserId,
         string agentRef,
@@ -55,19 +124,20 @@ internal sealed class DiscordChannelReadReviewer(
         CancellationToken ct)
     {
         // Nothing to read means nothing to review: no Sentinel call, and none needed to answer.
-        if (messages.Count == 0)
-            return new DiscordReviewedRead([], new JsonObject { ["reviewed"] = false }, false, false);
+        if (items.Count == 0)
+            return new DiscordReviewedItems<TOut>(
+                [], new JsonObject { ["reviewed"] = false }, false, false);
         if (review is null) return null;
 
-        var included = new List<DiscordGuildMessageView>();
+        var included = new List<TIn>();
         var block = new StringBuilder();
-        foreach (var message in messages)
+        foreach (var item in items)
         {
-            var section = Section(message);
-            if (included.Count > 0 && block.Length + section.Length > ReviewBound) break;
-            if (section.Length > ReviewBound) return null;
-            block.Append(section);
-            included.Add(message);
+            var text = section(item);
+            if (included.Count > 0 && block.Length + text.Length > ReviewBound) break;
+            if (text.Length > ReviewBound) return null;
+            block.Append(text);
+            included.Add(item);
         }
         var content = block.ToString();
 
@@ -82,12 +152,12 @@ internal sealed class DiscordChannelReadReviewer(
                 AgentRef = agentRef,
                 ComputeProvenance = provenance,
                 IdempotencyKey = $"discord-read-{Hash(content)}",
-                JobName = "Discord channel read review",
+                JobName = jobName,
             }, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
         {
-            logger?.LogWarning("Discord channel read review failed ({Type})", ex.GetType().Name);
+            logger?.LogWarning("Discord read review failed ({Type})", ex.GetType().Name);
             return null;
         }
         var verdict = result.Verdict;
@@ -102,15 +172,15 @@ internal sealed class DiscordChannelReadReviewer(
             ["isolation"] = verdict.Isolation,
             ["jobId"] = result.JobId,
         };
-        var truncated = included.Count < messages.Count;
+        var truncated = included.Count < items.Count;
 
         if (string.Equals(verdict.Risk, "high", StringComparison.OrdinalIgnoreCase)
             || string.Equals(verdict.Handling, "require_private_approval", StringComparison.OrdinalIgnoreCase))
         {
             sentinel["withheld"] = true;
             sentinel["reason"] = "high_risk";
-            return new DiscordReviewedRead(
-                included.Select(message => Project(message, withheld: true, Identity)).ToArray(),
+            return new DiscordReviewedItems<TOut>(
+                included.Select(item => project(item, true, static text => text)).ToArray(),
                 sentinel, Withheld: true, truncated);
         }
 
@@ -130,18 +200,16 @@ internal sealed class DiscordChannelReadReviewer(
 
         try
         {
-            var projected = included.Select(message => Project(message, withheld: false, Visible)).ToArray();
+            var projected = included.Select(item => project(item, false, Visible)).ToArray();
             sentinel["screening"] = new JsonObject { ["hiddenContent"] = hidden };
-            return new DiscordReviewedRead(projected, sentinel, Withheld: false, truncated);
+            return new DiscordReviewedItems<TOut>(projected, sentinel, Withheld: false, truncated);
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not OutOfMemoryException)
         {
-            logger?.LogWarning("Discord channel read screening failed ({Type})", ex.GetType().Name);
+            logger?.LogWarning("Discord read screening failed ({Type})", ex.GetType().Name);
             return null;
         }
     }
-
-    private static string? Identity(string? value) => value;
 
     private static DiscordReviewedMessageView Project(
         DiscordGuildMessageView message, bool withheld, Func<string?, string?> text)
@@ -157,6 +225,18 @@ internal sealed class DiscordChannelReadReviewer(
                 attachment.ContentType,
                 attachment.Size)).ToArray());
 
+    private static DiscordReviewedPostView Project(
+        DiscordForumPostView post, bool withheld, Func<string?, string?> text)
+        => new(
+            post.Id,
+            withheld ? null : text(post.Name),
+            post.CreatedAt, post.Archived, post.Locked, post.MessageCount,
+            post.Tags.Select(tag => new DiscordReviewedTagView(
+                tag.Id,
+                withheld ? null : text(tag.Name),
+                withheld ? null : text(tag.Emoji),
+                tag.Moderated)).ToArray());
+
     private static string Section(DiscordGuildMessageView message)
     {
         var text = new StringBuilder()
@@ -165,6 +245,15 @@ internal sealed class DiscordChannelReadReviewer(
             .Append(message.Content).Append('\n');
         foreach (var attachment in message.Attachments)
             text.Append("Attachment: ").Append(attachment.Filename).Append('\n');
+        return text.Append('\n').ToString();
+    }
+
+    private static string Section(DiscordForumPostView post)
+    {
+        var text = new StringBuilder()
+            .Append("Forum post ").Append(post.Id).Append(": ").Append(post.Name).Append('\n');
+        foreach (var tag in post.Tags)
+            text.Append("Tag: ").Append(tag.Name).Append(' ').Append(tag.Emoji).Append('\n');
         return text.Append('\n').ToString();
     }
 

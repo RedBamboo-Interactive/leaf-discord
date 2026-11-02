@@ -29,7 +29,8 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         services.AddSingleton<PromptInjectionDetector>();
         services.AddSingleton<DiscordChannelReadReviewer>(sp => new DiscordChannelReadReviewer(
             sp.GetService<IUntrustedContentReview>(),
-            sp.GetService<ILogger<DiscordChannelReadReviewer>>()));
+            sp.GetService<ILogger<DiscordChannelReadReviewer>>(),
+            sp.GetRequiredService<DiscordBotConfigurationStore>().EntityStore));
         services.AddSingleton<DiscordEgressGuard>();
         services.AddSingleton<DiscordTypingLeases>();
         services.AddSingleton(sp => new LeafDiscordConfigStore(
