@@ -1045,6 +1045,109 @@ public sealed class DiscordCoordinatorTests
         Assert.True(linked["is_conversation_owner"]?.GetValue<bool>());
     }
 
+    private const string OwnerDiscordId = "200000000000000002";
+    private const string OtherDiscordId = "200000000000000003";
+
+    private static async Task<(DiscordConversationCoordinator Coordinator, FlakyProvider Provider, DiscordBinding Binding)>
+        CauseHarnessAsync()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var owner = await entities.UpsertBySlugAsync("user", "owner", "Owner Example",
+            new System.Text.Json.Nodes.JsonObject
+            {
+                [DiscordUserIdentityResolver.UserField] = OwnerDiscordId,
+            });
+        await entities.UpsertBySlugAsync("user", "other", "Other Example",
+            new System.Text.Json.Nodes.JsonObject
+            {
+                [DiscordUserIdentityResolver.UserField] = OtherDiscordId,
+            });
+        var bindings = new DiscordBindingStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", owner.Id.ToString(),
+            "nova-discord-external", "participate"));
+        var provider = new FlakyProvider(false);
+        var coordinator = new DiscordConversationCoordinator(
+            bindings, new DiscordDeliveryStore(entities), await SeedBotConfigurationAsync(entities),
+            new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
+            new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
+            new DiscordEgressGuard(), new DiscordTypingLeases(),
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+        return (coordinator, provider, binding);
+    }
+
+    [Theory]
+    [InlineData(OwnerDiscordId, ComputeCauses.Beneficiary)] // the owner, verified
+    [InlineData(OtherDiscordId, ComputeCauses.OtherPerson)] // verified, but someone else
+    [InlineData("200000000000000004", ComputeCauses.OtherPerson)] // nobody linked
+    [InlineData("envoy:leaf-1", ComputeCauses.OtherPerson)] // a Commons envoy
+    public async Task A_message_that_opens_the_session_records_who_wrote_it(string author, string cause)
+    {
+        var (coordinator, provider, binding) = await CauseHarnessAsync();
+        using var _ = coordinator;
+
+        await coordinator.SubmitAsync(binding, "1002", new ExternalRequestor(author, "Someone"), "Hello");
+
+        Assert.Equal(1, provider.OpenAttempts);
+        Assert.Equal(cause, provider.LastOpen?.Cause);
+    }
+
+    [Fact]
+    public async Task A_session_opened_with_no_message_behind_it_states_no_cause()
+    {
+        var (coordinator, provider, binding) = await CauseHarnessAsync();
+        using var _ = coordinator;
+
+        await coordinator.EnsureReadyAsync(binding);
+
+        Assert.Equal(1, provider.OpenAttempts);
+        Assert.Null(provider.LastOpen?.Cause);
+    }
+
+    [Fact]
+    public async Task Clearing_a_conversation_does_not_borrow_a_cause()
+    {
+        var (coordinator, provider, binding) = await CauseHarnessAsync();
+        using var _ = coordinator;
+        await coordinator.SubmitAsync(binding, "1002", new ExternalRequestor(OwnerDiscordId, "Owner"), "Hello");
+        Assert.Equal(ComputeCauses.Beneficiary, provider.LastOpen?.Cause);
+
+        await coordinator.ClearAsync(binding, "clear-1");
+
+        Assert.Equal(2, provider.OpenAttempts);
+        Assert.Null(provider.LastOpen?.Cause);
+    }
+
+    [Fact]
+    public async Task A_later_message_does_not_reopen_a_session_it_did_not_start()
+    {
+        var (coordinator, provider, binding) = await CauseHarnessAsync();
+        using var _ = coordinator;
+        await coordinator.EnsureReadyAsync(binding);
+
+        await coordinator.SubmitAsync(binding, "1002", new ExternalRequestor(OwnerDiscordId, "Owner"), "Hello");
+
+        Assert.Equal(1, provider.OpenAttempts);
+        Assert.Null(provider.LastOpen?.Cause);
+    }
+
+    [Fact]
+    public async Task A_retried_message_that_opens_the_session_still_records_its_author()
+    {
+        var (coordinator, provider, binding) = await CauseHarnessAsync();
+        using var _ = coordinator;
+        provider.FailOpens = 1;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.SubmitAsync(
+            binding, "1002", new ExternalRequestor(OwnerDiscordId, "Owner"), "Hello"));
+
+        await coordinator.RetryPendingAsync(binding);
+
+        Assert.Equal(2, provider.OpenAttempts);
+        Assert.Equal(ComputeCauses.Beneficiary, provider.LastOpen?.Cause);
+    }
+
     private static DiscordUserIdentityResolver IdentityResolver(MemoryEntityStore entities)
         => new(entities, NullLogger<DiscordUserIdentityResolver>.Instance);
 
@@ -1096,11 +1199,15 @@ public sealed class DiscordCoordinatorTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public string ProviderId => "test";
         public bool CanHandle(string agentSlugOrId) => agentSlugOrId == "nova";
+        public ExternalConversationOpenRequest? LastOpen { get; private set; }
+        public int FailOpens { get; set; }
 
         public Task<ExternalConversationHandle> OpenAsync(
             ExternalConversationOpenRequest request, CancellationToken ct = default)
         {
             OpenAttempts++;
+            LastOpen = request;
+            if (OpenAttempts <= FailOpens) throw new InvalidOperationException("session unavailable");
             return Task.FromResult(new ExternalConversationHandle(
                 ProviderId, request.BindingId, request.Generation, "conversation", "session"));
         }

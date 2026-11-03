@@ -254,7 +254,8 @@ public sealed class DiscordConversationCoordinator(
                 return RefusedAdmission(delivery);
             }
 
-            var (provider, handle, attached) = await EnsureConversationAsync(binding, ct);
+            var (provider, handle, attached) = await EnsureConversationAsync(
+                binding, ct, MessageCause(verifiedUser));
             binding = attached;
             // The delivery payload keeps the full captured map so a retry re-plans against
             // whatever the session actually holds; only the session-bound turn is compacted.
@@ -1332,20 +1333,29 @@ public sealed class DiscordConversationCoordinator(
 
     private async Task<(IExternalAgentConversationProvider Provider,
         ExternalConversationHandle Handle, DiscordBinding Binding)> EnsureConversationAsync(
-        DiscordBinding binding, CancellationToken ct)
+        DiscordBinding binding, CancellationToken ct, string? cause = null)
     {
         var provider = ResolveProvider(binding.AgentId);
         if (binding.SessionId is not null && binding.ConversationHandleId is not null)
             return (provider, ToHandle(binding, provider.ProviderId), binding);
 
         var handle = await provider.OpenAsync(await OpenRequestAsync(binding, binding.Generation,
-            $"discord-open:{binding.BindingId}:{binding.Generation}"), ct);
+            $"discord-open:{binding.BindingId}:{binding.Generation}", cause), ct);
         var attached = await bindings.AttachConversationAsync(binding, handle, ct);
         return (provider, handle, attached);
     }
 
+    /// <summary>
+    /// Who caused a session that a Discord message opens: the owner only when the author is linked
+    /// to them, and otherwise someone else, including anyone unlinked and a Commons envoy.
+    /// </summary>
+    internal static string MessageCause(DiscordVerifiedLeafUser? author)
+        => author?.IsConversationOwner == true ? ComputeCauses.Beneficiary : ComputeCauses.OtherPerson;
+
+    // With no message behind the session the cause stays null: the bridge cannot say who decided
+    // it. The kernel records an Agent's signed execution as the Agent and otherwise nothing.
     private async Task<ExternalConversationOpenRequest> OpenRequestAsync(
-        DiscordBinding binding, long generation, string idempotencyKey)
+        DiscordBinding binding, long generation, string idempotencyKey, string? cause = null)
     {
         var session = await ResolveComputeAsync(binding.SessionQualityMode);
         return new(
@@ -1359,7 +1369,10 @@ public sealed class DiscordConversationCoordinator(
                 binding.GuildId, binding.ParentConversationId),
             idempotencyKey,
             // The Sentinel chooses its own compute (its configured tier on the default provider).
-            session);
+            session)
+        {
+            Cause = cause,
+        };
     }
 
     private async Task<ExternalConversationComputeSelection> ResolveComputeAsync(string modeId)
