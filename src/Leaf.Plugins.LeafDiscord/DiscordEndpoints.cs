@@ -76,7 +76,8 @@ public static class DiscordEndpoints
                     message = "Add a Discord bot configuration first.",
                 })
                 : Results.Ok(await ProjectConfigAsync(config, agents, ct));
-        });
+        })
+            .WithSummary("Returns the Discord bot configuration with secrets withheld. Owner or administrator only; reads the first configured bot, so use GET /bots when several exist.");
 
         group.MapPut("/config", async (
             LeafDiscordConfigUpdate update,
@@ -120,10 +121,12 @@ public static class DiscordEndpoints
             {
                 return Results.BadRequest(new { error = "invalid_config", message = ex.Message });
             }
-        });
+        })
+            .WithSummary("Updates the first configured Discord bot's settings, validating the Agent and session quality mode. Owner or administrator only; prefer PUT /bots/{id} to target a specific bot.");
 
         group.MapGet("/status", async (DiscordBotService bot, CancellationToken ct) =>
-            Results.Ok(await bot.GetStatusAsync(ct)));
+            Results.Ok(await bot.GetStatusAsync(ct)))
+            .WithSummary("Returns the connection status of the Discord bot service.");
 
         group.MapGet("/bots", async (
             IAuthContext auth,
@@ -147,7 +150,8 @@ public static class DiscordEndpoints
                     status = statuses.GetValueOrDefault(config.EntityId),
                 }));
             return Results.Ok(new { items });
-        });
+        })
+            .WithSummary("Lists every configured Discord bot with its settings (secrets withheld) and live connection status. Owner or administrator only.");
 
         group.MapPost("/bots", async (
             LeafDiscordConfigUpdate update,
@@ -181,7 +185,8 @@ public static class DiscordEndpoints
             {
                 return Results.BadRequest(new { error = "invalid_config", message = ex.Message });
             }
-        });
+        })
+            .WithSummary("Creates a Discord bot configuration for one Leaf Agent, seeds its default behaviors and starts it. Owner or administrator only.");
 
         group.MapPut("/bots/{id:guid}", async (
             Guid id,
@@ -217,7 +222,8 @@ public static class DiscordEndpoints
             {
                 return Results.BadRequest(new { error = "invalid_config", message = ex.Message });
             }
-        });
+        })
+            .WithSummary("Updates one Discord bot's configuration and restarts that bot. Owner or administrator only; the caller must be allowed to manage this bot.");
 
         group.MapPost("/restart", async (
             IAuthContext auth, DiscordBotService bot, IHostApplicationLifetime lifetime,
@@ -227,7 +233,8 @@ public static class DiscordEndpoints
                 return Forbidden("Owner or administrator access is required.");
             await bot.RestartAsync(lifetime.ApplicationStopping);
             return Results.Ok(await bot.GetStatusAsync(ct));
-        });
+        })
+            .WithSummary("Restarts the Discord bot service and returns its status. Owner or administrator only; disconnects the gateway briefly.");
 
         group.MapPost("/bots/{id:guid}/restart", async (
             Guid id,
@@ -249,7 +256,8 @@ public static class DiscordEndpoints
             {
                 return Results.NotFound();
             }
-        });
+        })
+            .WithSummary("Restarts one Discord bot and returns its status. Owner or administrator only; disconnects that bot's gateway briefly.");
 
         group.MapPut("/bots/{id:guid}/avatar", async (
             Guid id, DiscordAvatarRequest request, IAuthContext auth,
@@ -257,7 +265,8 @@ public static class DiscordEndpoints
             DiscordAgentResolver agents, DiscordBotService bot,
             CancellationToken ct) =>
             await ApplyBotAvatarAsync(
-                id, request.AssetId, auth, configurations, agents, bot, ct));
+                id, request.AssetId, auth, configurations, agents, bot, ct))
+            .WithSummary("Sets the Discord bot's profile avatar from a RedLeaf Asset ID in the body (assetId). Owner or administrator only.");
 
         group.MapDelete("/bots/{id:guid}/avatar", async (
             Guid id, IAuthContext auth,
@@ -265,7 +274,8 @@ public static class DiscordEndpoints
             DiscordAgentResolver agents, DiscordBotService bot,
             CancellationToken ct) =>
             await ApplyBotAvatarAsync(
-                id, null, auth, configurations, agents, bot, ct));
+                id, null, auth, configurations, agents, bot, ct))
+            .WithSummary("Clears the Discord bot's profile avatar override. Owner or administrator only.");
 
         group.MapPut("/bots/{id:guid}/guilds/{guildId}/avatar", async (
             Guid id, string guildId, DiscordAvatarRequest request, IAuthContext auth,
@@ -274,7 +284,8 @@ public static class DiscordEndpoints
             CancellationToken ct) =>
             await ApplyGuildAvatarAsync(
                 id, guildId, request.AssetId, auth,
-                configurations, agents, bot, ct));
+                configurations, agents, bot, ct))
+            .WithSummary("Sets the bot's avatar in one Discord server from a RedLeaf Asset ID in the body (assetId). Owner or administrator only.");
 
         group.MapDelete("/bots/{id:guid}/guilds/{guildId}/avatar", async (
             Guid id, string guildId, IAuthContext auth,
@@ -283,12 +294,14 @@ public static class DiscordEndpoints
             CancellationToken ct) =>
             await ApplyGuildAvatarAsync(
                 id, guildId, null, auth,
-                configurations, agents, bot, ct));
+                configurations, agents, bot, ct))
+            .WithSummary("Clears the bot's avatar override in one Discord server. Owner or administrator only.");
 
         group.MapGet("/bots/{id:guid}/commands", async (
             Guid id, IAuthContext auth, DiscordBotConfigurationStore configurations,
             DiscordBotService bot, CancellationToken ct) =>
-            await ReadBotCommandsAsync(id, auth, configurations.GetAsync, bot.GetCommandsAsync, ct));
+            await ReadBotCommandsAsync(id, auth, configurations.GetAsync, bot.GetCommandsAsync, ct))
+            .WithSummary("Reports the global application commands registered for a Discord bot. Owner or administrator only.");
 
         group.MapGet("/bots/{id:guid}/guild-channels", async (
             Guid id, IAuthContext auth,
@@ -322,7 +335,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "discord_bot_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Lists the text channels the bot can see across its servers and whether each is already bound to a conversation. Owner or administrator only; use it to find a channel before POST /bots/{id}/bindings.");
 
         group.MapGet("/bots/{id:guid}/guild-navigation", async (
             Guid id,
@@ -356,7 +370,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Returns the servers, categories and channels the bot can see, as untrusted Discord content. Requires a signed private Agent discussion of the Agent that owns this bot.");
 
         group.MapGet("/bots/{id:guid}/guilds/{guildId}/permissions", async (
             Guid id,
@@ -392,7 +407,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "discord_bot_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Reports which Discord permissions the bot holds in one server and which features they enable. Requires a signed private Agent discussion of the Agent that owns this bot.");
 
         group.MapGet("/bots/{id:guid}/guilds/{guildId}/channels/{channelId}/messages", async (
             Guid id,
@@ -483,7 +499,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Reads recent messages of a Leaf Community channel, reviewed by the Sentinel and returned as untrusted content; optional limit and after (a message ID). Requires a signed private Agent discussion of the bot's Agent, and the channel must be inside Leaf Community scope.");
 
         group.MapGet("/bots/{id:guid}/behaviors", async (
             Guid id,
@@ -540,7 +557,8 @@ public static class DiscordEndpoints
                     binding.Enabled,
                 }),
             });
-        });
+        })
+            .WithSummary("Lists a bot's behavior settings (response mode and prompt per scope), its server navigation and its DM bindings. Owner or administrator only.");
 
         group.MapPut("/bots/{id:guid}/behaviors", async (
             Guid id,
@@ -577,7 +595,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 });
             }
-        });
+        })
+            .WithSummary("Creates or updates a bot's behavior for one scope (scope and responseMode are required; optional instructions, guildId, conversationId). Owner or administrator only.");
 
         group.MapDelete("/bots/{id:guid}/behaviors/{scope}", async (
             Guid id,
@@ -617,7 +636,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 });
             }
-        });
+        })
+            .WithSummary("Disables a bot's behavior for a scope, optionally narrowed by guildId or conversationId query values. Owner or administrator only.");
 
         group.MapPost("/bots/{id:guid}/forum-posts", async (
             Guid id,
@@ -692,7 +712,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Creates a post in a Discord forum channel and opens a thread binding for it, sending the first message. Requires a signed private Agent discussion of the bot's Agent; idempotencyKey makes retries safe.");
 
         group.MapGet("/bots/{id:guid}/application-emojis", async (
             Guid id,
@@ -702,7 +723,8 @@ public static class DiscordEndpoints
             DiscordBotService bot,
             CancellationToken ct) =>
             await ListApplicationEmojisAsync(
-                id, http, configurations, agents, bot.ListApplicationEmojisAsync, ct));
+                id, http, configurations, agents, bot.ListApplicationEmojisAsync, ct))
+            .WithSummary("Lists the bot application's own custom emojis. Requires a signed private Agent discussion of the bot's Agent.");
 
         group.MapPost("/bots/{id:guid}/application-emojis", async (
             Guid id,
@@ -715,7 +737,8 @@ public static class DiscordEndpoints
             CancellationToken ct) =>
             await CreateApplicationEmojiAsync(
                 id, request, http, configurations, agents, assets,
-                bot.ListApplicationEmojisAsync, bot.CreateApplicationEmojiAsync, ct));
+                bot.ListApplicationEmojisAsync, bot.CreateApplicationEmojiAsync, ct))
+            .WithSummary("Uploads one application emoji from a RedLeaf image Asset (name and assetId). Returns 409 with the existing emoji if the name is taken. Requires a signed private Agent discussion of the bot's Agent.");
 
         group.MapDelete("/bots/{id:guid}/application-emojis/{emojiId}", async (
             Guid id,
@@ -727,7 +750,8 @@ public static class DiscordEndpoints
             CancellationToken ct) =>
             await DeleteApplicationEmojiAsync(
                 id, emojiId, http, configurations, agents,
-                bot.ListApplicationEmojisAsync, bot.DeleteApplicationEmojiAsync, ct));
+                bot.ListApplicationEmojisAsync, bot.DeleteApplicationEmojiAsync, ct))
+            .WithSummary("Deletes one of the bot application's own emojis by snowflake ID so it can be replaced. Requires a signed private Agent discussion of the bot's Agent.");
 
         group.MapGet("/bots/{id:guid}/commons", async (
             Guid id,
@@ -746,7 +770,8 @@ public static class DiscordEndpoints
             return config is null
                 ? Results.NotFound()
                 : Results.Ok(DiscordCommonsConfigurationStore.View(config));
-        });
+        })
+            .WithSummary("Returns the Leaf Community configuration for a bot. Owner or administrator only; 404 when none is set.");
 
         group.MapPut("/bots/{id:guid}/commons", async (
             Guid id,
@@ -775,7 +800,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 });
             }
-        });
+        })
+            .WithSummary("Saves the Leaf Community configuration for a bot. Owner or administrator only.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/channels", async (
             Guid id,
@@ -840,7 +866,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Creates a text channel in a Discord server. Requires a signed private Agent discussion of the bot's Agent and the Manage Channels permission.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/categories", async (
             Guid id,
@@ -887,7 +914,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "discord_category_create_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Creates a channel category in a Discord server. Requires a signed private Agent discussion of the bot's Agent and the Manage Channels permission.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/forums", async (
             Guid id,
@@ -957,7 +985,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Creates a forum channel in a Discord server. Requires a signed private Agent discussion of the bot's Agent, and the parent category must be inside Leaf Community scope.");
 
         // Moderation of Leaf Community Envoys in a guild this bot hosts: list them, and suspend,
         // unsuspend or approve one with the bot's host credential. Before this, a host suspension
@@ -984,7 +1013,8 @@ public static class DiscordEndpoints
             {
                 return Results.Problem(ex.Message, statusCode: StatusCodes.Status502BadGateway);
             }
-        });
+        })
+            .WithSummary("Lists the Leaf Community Envoys known to the host in one server. Owner or administrator only.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/commons/envoys/{envoyId}/{action}", async (
             Guid id,
@@ -1022,7 +1052,8 @@ public static class DiscordEndpoints
             {
                 return Results.Problem(ex.Message, statusCode: StatusCodes.Status502BadGateway);
             }
-        });
+        })
+            .WithSummary("Approves, suspends or unsuspends one Leaf Community Envoy; action must be approve, suspend or unsuspend. Owner or administrator only; suspension takes effect on the Community relay.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/channels/{channelId}/commons-webhook", async (
             Guid id,
@@ -1087,7 +1118,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Creates or reuses the Leaf Community webhook of a channel. Requires a signed private Agent discussion of the bot's Agent and the Manage Webhooks permission.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/channels/{channelId}/commons-webhook/install-secret", async (
             Guid id,
@@ -1140,7 +1172,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status502BadGateway);
             }
-        });
+        })
+            .WithSummary("Installs a Leaf Community secret on a channel's webhook. Requires a signed private Agent discussion of the bot's Agent, and the channel must be inside Leaf Community scope.");
 
         group.MapPatch("/bots/{id:guid}/guilds/{guildId}/channels/{channelId}", async (
             Guid id,
@@ -1206,7 +1239,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Edits an existing Discord channel's settings. Requires a signed private Agent discussion of the bot's Agent and the Manage Channels permission.");
 
         group.MapPost("/bots/{id:guid}/bindings", async (
             Guid id, DiscordGuildBindingRequest request, IAuthContext auth,
@@ -1244,7 +1278,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "discord_bot_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Binds one server channel to an isolated Agent conversation (guildId and channelId), or returns the existing binding. Owner or administrator only; channels come from GET /bots/{id}/guild-channels.");
 
         group.MapGet("/bindings", async (
             string? agentId,
@@ -1264,7 +1299,8 @@ public static class DiscordEndpoints
                         await leads.GetAsync(binding, ct), now),
                 }));
             return Results.Ok(new { items = projected });
-        });
+        })
+            .WithSummary("Lists Discord bindings with their icon and any conversation lead, optionally filtered by agentId.");
 
         group.MapGet("/bindings/{id:guid}/lead", async (
             Guid id, HttpContext http, IAuthContext auth,
@@ -1289,7 +1325,8 @@ public static class DiscordEndpoints
                 conversationLead = DiscordConversationLeadStore.Project(
                     await leads.GetAsync(binding, ct), DateTimeOffset.UtcNow),
             });
-        });
+        })
+            .WithSummary("Returns whether a private discussion currently leads this Discord conversation. Callable by the binding's Agent discussion or by an owner or administrator.");
 
         group.MapPost("/bindings/{id:guid}/lead", async (
             Guid id,
@@ -1315,7 +1352,8 @@ public static class DiscordEndpoints
                 request?.LeadForMinutes, leads, replySubscriptions,
                 loggers.CreateLogger("Leaf.Plugins.LeafDiscord.ConversationLeads"),
                 DateTimeOffset.UtcNow, ct);
-        });
+        })
+            .WithSummary("Claims or renews the conversation lead for this binding without sending anything; optional leadForMinutes sets the window. Requires a signed private Agent discussion or binding-authorized automation; fails with 409 if another discussion leads.");
 
         group.MapDelete("/bindings/{id:guid}/lead", async (
             Guid id, HttpContext http, IAuthContext auth,
@@ -1356,7 +1394,8 @@ public static class DiscordEndpoints
                 released = released is not null,
                 conversationLead = DiscordConversationLeadStore.Project(released ?? current, now),
             });
-        });
+        })
+            .WithSummary("Ends the conversation lead on this binding so the Discord session answers again. A discussion can end only its own lead; an owner or administrator can end any.");
 
         group.MapGet("/bindings/{id:guid}/transcript", async (
             Guid id,
@@ -1414,7 +1453,8 @@ public static class DiscordEndpoints
                 (messageUid, token) => deliveries.FindOutboundReviewAsync(binding, messageUid, token),
                 (await leads.GetAsync(binding, ct))?.UnpostedHistory.ToHashSet(StringComparer.Ordinal));
             return Results.Ok(new { binding, messages, nextCursor = page.NextCursor });
-        });
+        })
+            .WithSummary("Returns the binding's settled conversation transcript with Discord author attribution. Owner or administrator only.");
 
         group.MapPut("/bindings/{id:guid}/avatar", async (
             Guid id, DiscordAvatarRequest request, IAuthContext auth,
@@ -1422,7 +1462,8 @@ public static class DiscordEndpoints
             DiscordBotConfigurationStore configurations,
             DiscordBotService bot, CancellationToken ct) =>
             await ApplyChannelAvatarAsync(
-                id, request.AssetId, auth, bindings, configurations, bot, ct));
+                id, request.AssetId, auth, bindings, configurations, bot, ct))
+            .WithSummary("Sets the avatar the Agent uses in one bound channel from a RedLeaf Asset ID in the body (assetId). Owner or administrator only, and only for bindings you own.");
 
         group.MapDelete("/bindings/{id:guid}/avatar", async (
             Guid id, IAuthContext auth,
@@ -1430,7 +1471,8 @@ public static class DiscordEndpoints
             DiscordBotConfigurationStore configurations,
             DiscordBotService bot, CancellationToken ct) =>
             await ApplyChannelAvatarAsync(
-                id, null, auth, bindings, configurations, bot, ct));
+                id, null, auth, bindings, configurations, bot, ct))
+            .WithSummary("Clears the per-channel avatar of a binding. Owner or administrator only, and only for bindings you own.");
 
         group.MapPost("/bindings/{id:guid}/clear", async (
             Guid id,
@@ -1445,7 +1487,8 @@ public static class DiscordEndpoints
             if (binding is null) return Results.NotFound();
             return Results.Ok(await conversations.ClearAsync(
                 binding, $"leaf-owner:{Guid.NewGuid():N}", ct));
-        });
+        })
+            .WithSummary("Starts a fresh conversation generation for this binding, ending the current context. Owner or administrator only; the previous context is not carried over.");
 
         group.MapPost("/bindings/{id:guid}/messages", async (
             Guid id,
@@ -1570,7 +1613,8 @@ public static class DiscordEndpoints
                 if (!sent && claimed is not null)
                     await leads.RevertClaimAsync(binding, previousLead, CancellationToken.None);
             }
-        });
+        })
+            .WithSummary("Sends a message from the Agent into an existing Discord binding (content and idempotencyKey required), optionally taking the conversation lead. Requires a signed private Agent discussion or binding-authorized automation, and an enabled binding with a session. This is the right way to post into a bound channel.");
 
         group.MapPost("/bindings/{id:guid}/messages/{messageUid}/edit", async (
             Guid id,
@@ -1641,7 +1685,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "delivery_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Edits a message the bridge previously sent in this binding. Requires a signed private Agent discussion or binding-authorized automation.");
 
         group.MapDelete("/bindings/{id:guid}/messages/{messageUid}", async (
             Guid id,
@@ -1704,7 +1749,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "delivery_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Deletes a message the bridge previously sent in this binding from Discord. Destructive. Requires a signed private Agent discussion or binding-authorized automation.");
 
         group.MapPost("/bindings/{id:guid}/messages/pin", async (
             Guid id,
@@ -1756,7 +1802,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "delivery_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Pins a message the bridge previously sent in this binding (messageUid required). Requires a signed private Agent discussion or binding-authorized automation, and the Manage Messages permission.");
 
         group.MapPost("/outreach/dm", async (
             DiscordDirectMessageRequest request,
@@ -1808,7 +1855,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "outreach_unavailable", message = ex.Message },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Sends a direct message to another allowlisted user from the current Discord conversation (recipientUserId, content, idempotencyKey). Callable only from a signed external Discord session; the recipient must be on the DM allowlist.");
 
         group.MapPost("/bots/{id:guid}/dms", async (
             Guid id,
@@ -1836,7 +1884,8 @@ public static class DiscordEndpoints
                             loggers.CreateLogger("Leaf.Plugins.LeafDiscord.ReplyCallbacks"), token);
                     return result;
                 },
-                ct));
+                ct))
+            .WithSummary("Sends the bot owner a direct message, opening the DM binding if needed (recipientUserId, content, idempotencyKey), and optionally subscribes to replies. Requires a signed private Agent discussion of the bot's Agent; the recipient must be on the DM allowlist.");
 
         group.MapPost("/reactions", async (
             DiscordReactionRequest request,
@@ -1888,7 +1937,8 @@ public static class DiscordEndpoints
                 return Results.Json(new { error = "discord_reaction_failed", message = ex.Message },
                     statusCode: StatusCodes.Status502BadGateway);
             }
-        });
+        })
+            .WithSummary("Adds an emoji reaction to an inbound message of the current Discord conversation (messageId, emoji). Callable only from a signed external Discord session; blocked while a private discussion leads.");
 
         group.MapGet("/guild/context", async (
             HttpContext http,
@@ -1924,7 +1974,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Returns the server map and current channel for the calling Discord conversation. Callable only from a signed external Discord session in a server channel.");
 
         group.MapGet("/guild/channels/{channelId}/messages", async (
             string channelId,
@@ -1978,7 +2029,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Reads recent messages of another channel in the same server, reviewed by the Sentinel and returned as untrusted content; optional limit. Callable only from a signed external Discord session in a server channel.");
 
         group.MapGet("/guild/forums/{forumId}/posts", async (
             string forumId,
@@ -2033,7 +2085,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Lists posts of a forum channel in the same server, reviewed by the Sentinel and returned as untrusted content; optional limit and includeArchived. Callable only from a signed external Discord session in a server channel.");
 
         group.MapGet("/guild/forums/{forumId}/posts/{postId}/messages", async (
             string forumId,
@@ -2089,7 +2142,8 @@ public static class DiscordEndpoints
                     message = ex.Message,
                 }, statusCode: StatusCodes.Status503ServiceUnavailable);
             }
-        });
+        })
+            .WithSummary("Reads messages of one forum post in the same server, reviewed by the Sentinel and returned as untrusted content; optional limit. Callable only from a signed external Discord session in a server channel.");
 
         group.MapGet("/privacy", () => Results.Ok(new
         {
@@ -2106,7 +2160,8 @@ public static class DiscordEndpoints
             crossChannelRead = "current-external-session-same-application-and-guild-only",
             forumPosts = "human-created-posts-use-independent-thread-bindings",
             textChannelReaderPresence = "not-available-from-discord",
-        }));
+        }))
+            .WithSummary("Describes the privacy and authority policy that governs Discord conversations.");
     }
 
     private static async Task ValidateBehaviorTargetAsync(
