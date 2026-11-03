@@ -577,6 +577,14 @@ internal sealed class MemoryEntityStore(
         IEnumerable<LeafEntity> result = items.Where(item => item.TypeSlug == query.TypeSlug);
         if (query.DataEquals is not null)
             result = result.Where(item => query.DataEquals.All(pair => Equal(item.Data[pair.Key], pair.Value)));
+        if (query.AfterId is { } after)
+            result = result.Where(item => item.Id.CompareTo(after) > 0);
+        if (query.BeforeUpdatedAt is { } beforeUpdatedAt && query.BeforeUpdatedId is { } beforeUpdatedId)
+            result = result.Where(item => item.UpdatedAt < beforeUpdatedAt
+                || (item.UpdatedAt == beforeUpdatedAt && item.Id.CompareTo(beforeUpdatedId) > 0));
+        result = query.OrderById
+            ? result.OrderBy(item => item.Id)
+            : result.OrderByDescending(item => item.UpdatedAt).ThenBy(item => item.Id);
         return Task.FromResult<IReadOnlyList<LeafEntity>>(
             result.Skip(query.Offset).Take(query.Limit).Select(item => Hydrate(item)!).ToArray());
     }

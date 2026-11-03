@@ -781,6 +781,11 @@ POST /bindings/{entityId}/messages
   replies. Reply notices carry `conversation_lead` (`state`, `lead_discussion_id`,
   `this_discussion_leads`, `expires_at`).
 
+The Discord tab reads bindings in recent-activity pages. `GET /bindings?limit=24` returns
+`items`, `hasMore`, and an opaque `nextCursor`; pass that cursor to read the next stable page,
+and combine either request with `agentId`. Page sizes are limited to 1-100. Existing callers
+that omit both `limit` and `cursor` retain the legacy unpaged response.
+
 ### Owner messages reach the session
 
 An outreach message is a transcript injection, and an injection never reaches the session's

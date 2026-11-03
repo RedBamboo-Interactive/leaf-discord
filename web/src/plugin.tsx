@@ -1,5 +1,5 @@
 // Canonical RedLeaf chat application surface.
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { ChatPanel, ChatStatusLine, type MessageBlock } from "@redbamboo/chat"
 import {
   Button,
@@ -15,6 +15,7 @@ import {
 import type { LeafAppPlugin } from "@redbamboo/utility"
 import { DiscordSettingsPanel } from "./DiscordSettingsPanel"
 import { DiscordBehaviorPanel } from "./DiscordBehaviorPanel"
+import { discordBindingsRequestPath } from "./discord-bindings"
 import {
   projectDiscordTranscript,
   type DiscordAuthor,
@@ -88,6 +89,12 @@ type Binding = {
   iconUrl?: string
 }
 
+type BindingPage = {
+  items: Binding[]
+  nextCursor?: string | null
+  hasMore: boolean
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/apps/leaf-discord${path}`, {
     ...init,
@@ -101,6 +108,10 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export function Page() {
   const [bots, setBots] = useState<Bot[]>([])
   const [bindings, setBindings] = useState<Binding[]>([])
+  const [bindingCursor, setBindingCursor] = useState<string | null>(null)
+  const [bindingCursorHistory, setBindingCursorHistory] = useState<Array<string | null>>([])
+  const [bindingNextCursor, setBindingNextCursor] = useState<string | null>(null)
+  const [bindingsLoading, setBindingsLoading] = useState(true)
   const [selectedBindingId, setSelectedBindingId] = useState<string | null>(null)
   const [publicThreads, setPublicThreads] = useState<PublicNovaThread[] | null>(null)
   const [selectedPublicRef, setSelectedPublicRef] = useState<string | null>(null)
@@ -114,11 +125,13 @@ export function Page() {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const refreshGeneration = useRef(0)
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current
     const [botResult, bindingResult] = await Promise.all([
       api<{ items: Bot[] }>("/bots"),
-      api<{ items: Binding[] }>("/bindings"),
+      api<BindingPage>(discordBindingsRequestPath(agentFilter, bindingCursor)),
     ])
     const publicAgentId = effectivePublicAgentId(
       agentFilter,
@@ -129,17 +142,28 @@ export function Page() {
         if (!response.ok) throw new Error(`Leaf Community HTTP ${response.status}`)
         return await response.json() as { items: PublicNovaThread[] }
       }).catch(() => null)
+    if (generation !== refreshGeneration.current) return
     setBots(botResult.items)
     setBindings(bindingResult.items)
+    setBindingNextCursor(bindingResult.nextCursor ?? null)
     setPublicThreads(publicResult
       ? publicThreadsForAgent(publicResult.items, publicAgentId)
       : null)
-  }, [agentFilter])
+  }, [agentFilter, bindingCursor])
 
   useEffect(() => {
-    void refresh().catch((reason) => setError(String(reason.message ?? reason)))
+    let active = true
+    setBindingsLoading(true)
+    void refresh()
+      .catch((reason) => setError(String(reason.message ?? reason)))
+      .finally(() => {
+        if (active) setBindingsLoading(false)
+      })
     const timer = window.setInterval(() => void refresh().catch(() => {}), 5000)
-    return () => window.clearInterval(timer)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
   }, [refresh])
 
   const loadTranscript = useCallback(async (bindingId: string, showSpinner = false) => {
@@ -212,11 +236,33 @@ export function Page() {
     setAgentFilterState(id)
     setPublicThreads(null)
     setSelectedPublicRef(null)
+    setBindings([])
+    setBindingCursor(null)
+    setBindingCursorHistory([])
+    setBindingNextCursor(null)
     setMessages([])
     setAuthors({})
     if (id) window.localStorage.setItem("leaf-discord-agent-filter", id)
     else window.localStorage.removeItem("leaf-discord-agent-filter")
   }, [])
+
+  const showNextBindingPage = useCallback(() => {
+    if (!bindingNextCursor) return
+    setBindingCursorHistory((history) => [...history, bindingCursor])
+    setBindingCursor(bindingNextCursor)
+    setBindingNextCursor(null)
+    setBindings([])
+    setSelectedBindingId(null)
+  }, [bindingCursor, bindingNextCursor])
+
+  const showPreviousBindingPage = useCallback(() => {
+    if (bindingCursorHistory.length === 0) return
+    setBindingCursor(bindingCursorHistory[bindingCursorHistory.length - 1])
+    setBindingCursorHistory(bindingCursorHistory.slice(0, -1))
+    setBindingNextCursor(null)
+    setBindings([])
+    setSelectedBindingId(null)
+  }, [bindingCursorHistory])
 
   const visibleBindings = agentFilter
     ? bindings.filter((binding) => binding.agentId === agentFilter)
@@ -413,7 +459,9 @@ export function Page() {
             <ItemList
               items={visibleBindings}
               keyFn={(binding) => binding.entityId}
-              emptyMessage="A discussion appears after its first eligible Discord message."
+              emptyMessage={bindingsLoading
+                ? "Loading Discord discussions…"
+                : "A discussion appears after its first eligible Discord message."}
               renderItem={(binding) => (
                 <ItemListRow
                   selected={binding.entityId === selectedBindingId}
@@ -429,6 +477,31 @@ export function Page() {
                 />
               )}
             />
+            {(bindingCursorHistory.length > 0 || bindingNextCursor) && (
+              <div className="flex items-center justify-between border-t border-border px-3 py-2">
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={bindingsLoading || bindingCursorHistory.length === 0}
+                  onClick={showPreviousBindingPage}
+                >
+                  <i className="ph-bold ph-caret-left" aria-hidden="true" />
+                  Previous
+                </Button>
+                <span className="text-[11px] text-text-disabled">
+                  Page {bindingCursorHistory.length + 1}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={bindingsLoading || !bindingNextCursor}
+                  onClick={showNextBindingPage}
+                >
+                  Next
+                  <i className="ph-bold ph-caret-right" aria-hidden="true" />
+                </Button>
+              </div>
+            )}
           </section>
         </div>
       </div>

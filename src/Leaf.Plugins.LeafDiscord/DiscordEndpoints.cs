@@ -1283,13 +1283,43 @@ public static class DiscordEndpoints
 
         group.MapGet("/bindings", async (
             string? agentId,
+            int? limit,
+            string? cursor,
             DiscordBindingStore bindings, DiscordBotService bot,
             DiscordConversationLeadStore leads, CancellationToken ct) =>
         {
-            var items = await bindings.ListAsync(ct);
-            if (!string.IsNullOrWhiteSpace(agentId))
-                items = items.Where(item => string.Equals(
-                    item.AgentId, agentId, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (limit is < 1 or > 100)
+                return Results.BadRequest(new
+                {
+                    error = "invalid_page_size",
+                    message = "Binding page size must be between 1 and 100.",
+                });
+            var paged = limit is not null || !string.IsNullOrWhiteSpace(cursor);
+            DiscordBindingPage? page = null;
+            IReadOnlyList<DiscordBinding> items;
+            if (paged)
+            {
+                try
+                {
+                    page = await bindings.ListPageAsync(agentId, limit ?? 24, cursor, ct);
+                    items = page.Items;
+                }
+                catch (ArgumentException)
+                {
+                    return Results.BadRequest(new
+                    {
+                        error = "invalid_cursor",
+                        message = "Binding page cursor is invalid.",
+                    });
+                }
+            }
+            else
+            {
+                items = await bindings.ListAsync(ct);
+                if (!string.IsNullOrWhiteSpace(agentId))
+                    items = items.Where(item => string.Equals(
+                        item.AgentId, agentId, StringComparison.OrdinalIgnoreCase)).ToArray();
+            }
             var now = DateTimeOffset.UtcNow;
             var projected = await Task.WhenAll(items.Select(async binding =>
                 binding with
@@ -1298,9 +1328,16 @@ public static class DiscordEndpoints
                     ConversationLead = DiscordConversationLeadStore.Project(
                         await leads.GetAsync(binding, ct), now),
                 }));
-            return Results.Ok(new { items = projected });
+            return page is null
+                ? Results.Ok(new { items = projected })
+                : Results.Ok(new
+                {
+                    items = projected,
+                    nextCursor = page.NextCursor,
+                    hasMore = page.HasMore,
+                });
         })
-            .WithSummary("Lists Discord bindings with their icon and any conversation lead, optionally filtered by agentId.");
+            .WithSummary("Lists Discord bindings with their icon and any conversation lead, optionally filtered by agentId. Pass limit (1-100) and an opaque cursor for a stable UpdatedAt-descending page; omitting both preserves the legacy unpaged response.");
 
         group.MapGet("/bindings/{id:guid}/lead", async (
             Guid id, HttpContext http, IAuthContext auth,

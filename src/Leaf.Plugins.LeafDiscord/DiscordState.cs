@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -359,6 +360,11 @@ public sealed record CreateDiscordBinding(
     string? CounterpartyUserId = null,
     string SessionQualityMode = "deep-codex");
 
+public sealed record DiscordBindingPage(
+    IReadOnlyList<DiscordBinding> Items,
+    string? NextCursor,
+    bool HasMore);
+
 public sealed class DiscordBindingStore(IEntityStore store)
 {
     public const string TypeSlug = "leaf-discord-binding";
@@ -368,6 +374,72 @@ public sealed class DiscordBindingStore(IEntityStore store)
     public async Task<IReadOnlyList<DiscordBinding>> ListAsync(CancellationToken ct = default)
         => (await store.QueryAsync(new EntityQuery { TypeSlug = TypeSlug, Limit = 500 }, ct))
             .Select(Map).ToList();
+
+    public async Task<DiscordBindingPage> ListPageAsync(
+        string? agentId,
+        int limit,
+        string? cursor,
+        CancellationToken ct = default)
+    {
+        if (limit is < 1 or > 100)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Binding page size must be between 1 and 100.");
+        if (!TryDecodeCursor(cursor, out var beforeUpdatedAt, out var beforeUpdatedId))
+            throw new ArgumentException("Binding page cursor is invalid.", nameof(cursor));
+
+        var entities = await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = string.IsNullOrWhiteSpace(agentId)
+                ? null
+                : new Dictionary<string, object?> { ["agent"] = agentId.Trim() },
+            BeforeUpdatedAt = beforeUpdatedAt,
+            BeforeUpdatedId = beforeUpdatedId,
+            Limit = limit + 1,
+        }, ct);
+        var hasMore = entities.Count > limit;
+        var page = entities.Take(limit).ToArray();
+        return new DiscordBindingPage(
+            page.Select(Map).ToArray(),
+            hasMore && page.Length > 0 ? EncodeCursor(page[^1]) : null,
+            hasMore);
+    }
+
+    internal static string EncodeCursor(LeafEntity entity)
+    {
+        var value = entity.UpdatedAt.ToString("O", CultureInfo.InvariantCulture)
+            + "\n" + entity.Id.ToString("D");
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(value))
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+
+    internal static bool TryDecodeCursor(
+        string? cursor,
+        out DateTimeOffset? updatedAt,
+        out Guid? id)
+    {
+        updatedAt = null;
+        id = null;
+        if (string.IsNullOrWhiteSpace(cursor)) return true;
+        try
+        {
+            var encoded = cursor.Replace('-', '+').Replace('_', '/');
+            encoded += (encoded.Length % 4) switch { 2 => "==", 3 => "=", _ => "" };
+            var value = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
+            var separator = value.IndexOf('\n');
+            if (separator <= 0
+                || !DateTimeOffset.TryParseExact(value[..separator], "O", CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out var parsedAt)
+                || !Guid.TryParse(value[(separator + 1)..], out var parsedId))
+                return false;
+            updatedAt = parsedAt;
+            id = parsedId;
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
 
     public async Task<DiscordBinding?> GetAsync(Guid entityId, CancellationToken ct = default)
         => await store.GetAsync(entityId, ct) is { TypeSlug: TypeSlug } entity ? Map(entity) : null;

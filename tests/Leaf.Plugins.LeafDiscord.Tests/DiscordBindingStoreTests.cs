@@ -35,6 +35,37 @@ public sealed class DiscordBindingStoreTests
     }
 
     [Fact]
+    public async Task Binding_pages_are_stable_filtered_and_bounded()
+    {
+        var store = new MemoryEntityStore();
+        var bindings = new DiscordBindingStore(store);
+        for (var index = 0; index < 29; index++)
+        {
+            await bindings.CreateAsync(new CreateDiscordBinding(
+                "100000000000000001", $"conversation-{index:00}", "thread",
+                "223456789012345678", null, index < 17 ? "agent-a" : "agent-b",
+                "owner-1", "discord-external", "participate", $"Thread {index}", "Leaf"));
+        }
+
+        var ids = new List<Guid>();
+        string? cursor = null;
+        do
+        {
+            var page = await bindings.ListPageAsync("agent-a", 6, cursor);
+            Assert.InRange(page.Items.Count, 1, 6);
+            Assert.All(page.Items, binding => Assert.Equal("agent-a", binding.AgentId));
+            ids.AddRange(page.Items.Select(binding => binding.EntityId));
+            cursor = page.NextCursor;
+            Assert.Equal(page.HasMore, cursor is not null);
+        } while (cursor is not null);
+
+        Assert.Equal(17, ids.Count);
+        Assert.Equal(17, ids.Distinct().Count());
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => bindings.ListPageAsync(null, 24, "not-a-cursor"));
+    }
+
+    [Fact]
     public async Task Existing_dm_binding_backfills_its_authenticated_counterparty()
     {
         var store = new MemoryEntityStore();
