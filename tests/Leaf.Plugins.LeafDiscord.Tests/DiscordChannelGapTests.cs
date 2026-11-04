@@ -554,6 +554,7 @@ public sealed class DiscordChannelGapTests
         await entities.PatchAsync(owner.Id,
             new JsonObject { [DiscordUserIdentityResolver.UserField] = null });
 
+        harness.Clock.Now += DiscordConversationCoordinator.InboundRetryDelay(1);
         await harness.Coordinator.RetryPendingAsync(await harness.Binding());
 
         var retried = harness.Provider.Inputs[^1];
@@ -655,6 +656,7 @@ public sealed class DiscordChannelGapTests
         public required DiscordConversationCoordinator Coordinator { get; init; }
         public required Guid BindingEntityId { get; init; }
         public required DiscordUserIdentityResolver Identities { get; init; }
+        public required ManualClock Clock { get; init; }
         public List<string> Ingested { get; } = [];
 
         public static async Task<Harness> CreateAsync(
@@ -678,15 +680,17 @@ public sealed class DiscordChannelGapTests
             var provider = new RecordingProvider(failFirstSend);
             var identities = new DiscordUserIdentityResolver(
                 entities, NullLogger<DiscordUserIdentityResolver>.Instance);
+            var clock = new ManualClock();
             var coordinator = new DiscordConversationCoordinator(
                 bindings, deliveries, new DiscordBotConfigurationStore(new LeafDiscordConfigStore(entities)),
                 new DiscordRuntimeOptionsResolver(entities),
                 identities,
                 new NoComputeGateway(), [provider], new PromptInjectionDetector(),
                 new DiscordEgressGuard(), new DiscordTypingLeases(),
-                NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+                NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean, clock);
             return new Harness
             {
+                Clock = clock,
                 Entities = entities,
                 Bindings = bindings,
                 Deliveries = deliveries,
@@ -784,6 +788,12 @@ public sealed class DiscordChannelGapTests
                 .Select(message => (ulong.Parse(message.Id), (DiscordGapMessage?)message))
                 .ToArray();
         }
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = DateTimeOffset.UtcNow;
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 
     private sealed class RecordingProvider(bool failFirst) : IExternalAgentConversationProvider

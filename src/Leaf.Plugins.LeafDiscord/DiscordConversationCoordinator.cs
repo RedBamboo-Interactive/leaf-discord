@@ -115,11 +115,12 @@ public sealed class DiscordConversationCoordinator(
         DiscordEgressGuard egress,
         DiscordTypingLeases typing,
         ILogger<DiscordConversationCoordinator> logger,
-        IUntrustedContentReview? sentinel = null)
+        IUntrustedContentReview? sentinel = null,
+        TimeProvider? time = null)
         : this(bindings, deliveries, botConfigurations,
             new DiscordBehaviorStore(botConfigurations.EntityStore),
             runtimeOptions, userIdentities, compute, providers, injection,
-            egress, typing, logger, sentinel)
+            egress, typing, logger, sentinel, time)
     {
     }
 
@@ -257,40 +258,73 @@ public sealed class DiscordConversationCoordinator(
             var (provider, handle, attached) = await EnsureConversationAsync(
                 binding, ct, MessageCause(verifiedUser));
             binding = attached;
-            // The delivery payload keeps the full captured map so a retry re-plans against
-            // whatever the session actually holds; only the session-bound turn is compacted.
             var serverMap = DiscordServerMapDisclosure.Plan(binding, guildContext);
-            var sessionGuildContext = serverMap.GuildContext;
-            // Owner messages the session has not heard, and any lead, change only what the
-            // session is told and (while a discussion leads) what the bridge posts afterwards.
-            // The turn itself, and its inbound review, are the same.
-            var lead = await leadStore.GetAsync(binding, ct);
-            var leadContext = DiscordConversationLeadStore.SessionContext(lead, now);
-            var metadata = new JsonObject
+            JsonObject? leadContext = null;
+            async Task<ExternalConversationAdmission> SendToSessionAsync()
             {
-                ["transport"] = "discord",
-                ["binding_id"] = binding.BindingId,
-                ["generation"] = binding.Generation,
-                ["owner_user_id"] = binding.OwnerId,
-                ["agent_id"] = binding.AgentId,
-                ["session_quality_mode"] = binding.SessionQualityMode,
-                ["injection_risk_score"] = assessment.Score,
-                ["untrusted"] = true,
-                ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
-                ["discord_addressing"] = addressingRecord?.DeepClone(),
-                ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
-                ["discord_behavior"] = behaviorContext.DeepClone(),
-                ["leaf_community_peer"] = relayContext?.DeepClone(),
-                ["outbound_sentinel_reviews"] = await OutboundReviewsForSessionAsync(binding, ct),
-            };
-            if (leadContext is not null)
-                metadata["discord_conversation_lead"] = leadContext;
-            var admission = await provider.SendAsync(handle, new ExternalConversationInput(
-                discordMessageId,
-                requestor,
-                sessionContent,
-                attachments ?? [],
-                metadata), ct);
+                // The delivery payload keeps the full captured map so a retry re-plans against
+                // whatever the session actually holds; only the session-bound turn is compacted.
+                serverMap = DiscordServerMapDisclosure.Plan(binding, guildContext);
+                var sessionGuildContext = serverMap.GuildContext;
+                // Owner messages the session has not heard, and any lead, change only what the
+                // session is told and (while a discussion leads) what the bridge posts afterwards.
+                // The turn itself, and its inbound review, are the same.
+                var lead = await leadStore.GetAsync(binding, ct);
+                leadContext = DiscordConversationLeadStore.SessionContext(lead, now);
+                var metadata = new JsonObject
+                {
+                    ["transport"] = "discord",
+                    ["binding_id"] = binding.BindingId,
+                    ["generation"] = binding.Generation,
+                    ["owner_user_id"] = binding.OwnerId,
+                    ["agent_id"] = binding.AgentId,
+                    ["session_quality_mode"] = binding.SessionQualityMode,
+                    ["injection_risk_score"] = assessment.Score,
+                    ["untrusted"] = true,
+                    ["verified_leaf_user"] = VerifiedUserJson(verifiedUser),
+                    ["discord_addressing"] = addressingRecord?.DeepClone(),
+                    ["discord_guild_context"] = sessionGuildContext?.DeepClone(),
+                    ["discord_behavior"] = behaviorContext.DeepClone(),
+                    ["leaf_community_peer"] = relayContext?.DeepClone(),
+                    ["outbound_sentinel_reviews"] = await OutboundReviewsForSessionAsync(binding, ct),
+                    [DiscordSessionRecovery.RecoversLostSessionMetadataKey] = true,
+                };
+                if (leadContext is not null)
+                    metadata["discord_conversation_lead"] = leadContext;
+                return await provider.SendAsync(handle, new ExternalConversationInput(
+                    discordMessageId,
+                    requestor,
+                    sessionContent,
+                    attachments ?? [],
+                    metadata), ct);
+            }
+
+            ExternalConversationAdmission admission;
+            try
+            {
+                admission = await SendToSessionAsync();
+                if (admission.Disposition == DiscordSessionRecovery.SessionLostDisposition)
+                {
+                    (binding, handle, delivery) = await RecoverLostSessionAsync(
+                        binding, provider, handle, delivery, MessageCause(verifiedUser), ct);
+                    sessionContent = DiscordChannelGaps.Compose(
+                        delivery.Payload?["channel_gap"], content);
+                    admission = await SendToSessionAsync();
+                    if (admission.Disposition == DiscordSessionRecovery.SessionLostDisposition)
+                        throw new InvalidOperationException(
+                            "The session opened to recover a lost conversation was lost as well");
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // A provider failure waits like a Sentinel refusal does, instead of being
+                // retried at the maintenance loop's own pace for as long as it lasts.
+                var attempts = delivery.Attempts + 1;
+                var retryAt = now + InboundRetryDelay(attempts);
+                await deliveries.DeferFailedInboundAsync(delivery, attempts, retryAt, ex.Message, ct);
+                RetryDue?.Invoke(binding, retryAt);
+                throw;
+            }
             if (admission.Disposition == ExternalConversationDispositions.RefusedSentinelUnavailable)
             {
                 var attempts = delivery.Attempts + 1;
@@ -358,11 +392,14 @@ public sealed class DiscordConversationCoordinator(
         var now = clock.GetUtcNow();
         foreach (var delivery in await deliveries.PendingInboundAsync(binding.BindingId, ct))
         {
-            if (delivery.Generation != binding.Generation || delivery.DiscordId is null
+            // A row from an older generation belongs to a context that was cleared. A row ahead
+            // of the binding is a recovery that stopped halfway: submitting it finishes the job.
+            if (delivery.Generation < binding.Generation || delivery.DiscordId is null
                 || delivery.Payload is not JsonObject payload)
                 continue;
-            // A message waiting on the Sentinel holds every later one until it is due.
-            if (delivery.SentinelRefused && delivery.NextAttemptAt > now) break;
+            // A message waiting on the Sentinel or a failed provider holds every later one until
+            // it is due.
+            if (delivery.NextAttemptAt > now) break;
             var requestorNode = payload["requestor"] as JsonObject;
             var externalId = JsonRead.String(requestorNode ?? [], "id");
             var displayName = JsonRead.String(requestorNode ?? [], "display_name");
@@ -769,6 +806,70 @@ public sealed class DiscordConversationCoordinator(
         {
             gate.Release();
         }
+    }
+
+    /// <summary>
+    /// The binding's session can never be resumed. Its generation ends the way a clear ends one,
+    /// except that nothing waiting for it is left behind: settled replies are collected, the
+    /// waiting rows move to the new generation, and the current message carries what the old
+    /// transcript holds. The caller holds the binding's gate.
+    /// </summary>
+    private async Task<(DiscordBinding Binding, ExternalConversationHandle Handle, DiscordDelivery Delivery)>
+        RecoverLostSessionAsync(
+            DiscordBinding binding,
+            IExternalAgentConversationProvider provider,
+            ExternalConversationHandle lostHandle,
+            DiscordDelivery delivery,
+            string? cause,
+            CancellationToken ct)
+    {
+        logger.LogWarning(
+            "Discord binding {BindingId} lost session {SessionId} on generation {Generation}; opening the next one",
+            binding.BindingId, binding.SessionId, binding.Generation);
+        string? recovered = null;
+        try
+        {
+            await ReconcileCoreAsync(binding, ct);
+            binding = await bindings.GetAsync(binding.EntityId, ct) ?? binding;
+            var lostBinding = binding;
+            recovered = await DiscordSessionRecovery.ReadAsync(provider, lostHandle,
+                (messageId, token) => deliveries.FindInboundAttributionAsync(lostBinding, messageId, token), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            // What the old session held is context, not a precondition: recover without it.
+            logger.LogWarning(ex,
+                "Could not read the settled transcript of lost session {SessionId}", binding.SessionId);
+        }
+        if (recovered is not null)
+            delivery = await deliveries.ReplaceInboundGapAsync(delivery,
+                DiscordSessionRecovery.WithRecoveredConversation(
+                    delivery.Payload?["channel_gap"], recovered), ct);
+
+        var config = await botConfigurations.FindByApplicationIdAsync(binding.ApplicationId, ct)
+            ?? throw new InvalidOperationException(
+                $"Discord application '{binding.ApplicationId}' is not configured.");
+        var nextGeneration = checked(binding.Generation + 1);
+        var nextBinding = binding with
+        {
+            AgentId = config.AgentId,
+            SessionQualityMode = config.SessionQualityMode,
+        };
+        var handle = await ResolveProvider(config.AgentId).OpenAsync(await OpenRequestAsync(
+            nextBinding, nextGeneration,
+            $"discord-recover:{binding.BindingId}:{nextGeneration}:{binding.SessionId}", cause), ct);
+        // Waiting rows first: if the advance fails they are ahead of the binding, the next retry
+        // finds the session lost again and finishes, whereas rows behind it would be stranded.
+        await deliveries.MoveWaitingToGenerationAsync(
+            binding.BindingId, binding.Generation, nextGeneration, ct);
+        binding = await bindings.AdvanceGenerationAndAttachAsync(
+            binding, handle, $"session-lost:{binding.SessionId}", ct,
+            config.AgentId, config.SessionQualityMode);
+        logger.LogInformation(
+            "Discord binding {BindingId} recovered on generation {Generation}, session {SessionId}, carrying {Carried}",
+            binding.BindingId, binding.Generation, binding.SessionId,
+            recovered is null ? "no settled transcript" : "its settled transcript");
+        return (binding, handle, delivery);
     }
 
     public async Task<bool> ReconcileAsync(DiscordBinding binding, CancellationToken ct = default)

@@ -2713,6 +2713,9 @@ internal sealed class DiscordBotRuntime(
             CancelTyping(typingAdmission);
             maintenance.RequestFull(binding.BindingId);
             logger.LogError(ex, "Discord message {MessageId} failed", message.Id);
+            // Nobody spoke to this Agent, so a failure notice would only interrupt the people
+            // talking. The message stays durable and is retried either way.
+            if (!mentioned && !repliesToBot && !openInvitation && binding.Kind != "dm") return;
             try
             {
                 await conversations.EnqueueNoticeAsync(binding, message.Id.ToString(),

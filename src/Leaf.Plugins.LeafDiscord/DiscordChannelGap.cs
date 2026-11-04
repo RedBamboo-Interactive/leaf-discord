@@ -337,9 +337,10 @@ internal static class DiscordChannelGaps
     public static string Compose(JsonNode? record, string content)
         => Prefix(record) is { } prefix ? prefix + content : content;
 
-    /// <summary>Removes a leading gap block, leaving the participant's own message.</summary>
+    /// <summary>Removes any leading recovery and gap blocks, leaving the participant's own message.</summary>
     public static string StripForDisplay(string content)
     {
+        content = DiscordSessionRecovery.StripForDisplay(content);
         if (!content.StartsWith(Header, StringComparison.Ordinal)) return content;
         var end = content.IndexOf(Separator, Header.Length, StringComparison.Ordinal);
         return end < 0 ? content : content[(end + Separator.Length)..];

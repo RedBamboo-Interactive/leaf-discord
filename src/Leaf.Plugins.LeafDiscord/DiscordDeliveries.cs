@@ -266,6 +266,59 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             ["last_error"] = "sentinel_unavailable",
         }, ct: ct));
 
+    /// <summary>
+    /// A message the session could not take because of a provider failure stays <c>received</c>
+    /// and is retried at <paramref name="nextAttemptAt"/>, and later retries wait behind it.
+    /// </summary>
+    public async Task<DiscordDelivery> DeferFailedInboundAsync(
+        DiscordDelivery delivery, int attempts, DateTimeOffset nextAttemptAt, string error,
+        CancellationToken ct = default)
+        => Map(await store.PatchAsync(delivery.EntityId, new JsonObject
+        {
+            ["attempts"] = attempts,
+            ["next_attempt_at"] = nextAttemptAt.ToString("O"),
+            ["last_error"] = Truncate(error, 500),
+        }, ct: ct));
+
+    /// <summary>Stores the gap record a waiting message carries into its session.</summary>
+    public async Task<DiscordDelivery> ReplaceInboundGapAsync(
+        DiscordDelivery delivery, JsonObject gapRecord, CancellationToken ct = default)
+    {
+        var payload = delivery.Payload?.DeepClone() as JsonObject ?? new JsonObject();
+        payload["channel_gap"] = gapRecord;
+        return Map(await store.PatchAsync(delivery.EntityId, new JsonObject
+        {
+            ["payload"] = payload,
+        }, ct: ct));
+    }
+
+    /// <summary>
+    /// Takes everything still waiting in one generation along to the next, because the session
+    /// it was waiting for is gone: inbound messages not yet admitted and outbound rows not yet sent.
+    /// </summary>
+    public async Task MoveWaitingToGenerationAsync(
+        string bindingId, long fromGeneration, long toGeneration, CancellationToken ct = default)
+    {
+        var waiting = (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "inbound",
+                ["binding_id"] = bindingId,
+                ["state"] = "received",
+            },
+            Limit = 500,
+        }, ct)).Select(Map).ToList();
+        waiting.AddRange(await OutboundInStatesAsync(
+            bindingId, [ReviewingState, "queued", "retry"], ct));
+        foreach (var delivery in waiting.Where(item => item.Generation == fromGeneration))
+            _ = await store.PatchAsync(delivery.EntityId, new JsonObject
+            {
+                ["generation"] = toGeneration,
+            }, ct: ct);
+    }
+
     /// <summary>Gives up on a refused message that waited too long. It stays stored.</summary>
     public async Task RefuseInboundAsync(DiscordDelivery delivery, CancellationToken ct = default)
         => _ = await store.PatchAsync(delivery.EntityId, new JsonObject

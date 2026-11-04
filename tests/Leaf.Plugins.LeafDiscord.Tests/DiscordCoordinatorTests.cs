@@ -58,12 +58,13 @@ public sealed class DiscordCoordinatorTests
             "223456789012345678", null, "nova", "owner-1",
             "nova-discord-external", "participate"));
         var provider = new FlakyProvider();
+        var clock = new ManualClock();
         using var coordinator = new DiscordConversationCoordinator(
             bindings, deliveries, new DiscordBotConfigurationStore(config),
             new DiscordRuntimeOptionsResolver(entities),
             IdentityResolver(entities), new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean, clock);
         var attachment = new ExternalConversationAttachment(
             "a1", "trace.txt", "text/plain", 12, new string('a', 64), "/api/assets/a1.txt");
         var guildContext = new System.Text.Json.Nodes.JsonObject
@@ -93,6 +94,7 @@ public sealed class DiscordCoordinatorTests
         guildContext["mode"] = "mutated-after-receipt";
         behaviorContext["instructions"] = "mutated-after-receipt";
 
+        clock.Now += DiscordConversationCoordinator.InboundRetryDelay(1);
         await coordinator.RetryPendingAsync(binding);
 
         Assert.Empty(await deliveries.PendingInboundAsync(binding.BindingId));
@@ -159,12 +161,14 @@ public sealed class DiscordCoordinatorTests
             "223456789012345678", null, "nova", "owner-1",
             "nova-discord-external", "participate"));
         var provider = new FlakyProvider();
-        using var coordinator = Coordinator(entities, bindings, deliveries, provider);
+        var clock = new ManualClock();
+        using var coordinator = Coordinator(entities, bindings, deliveries, provider, clock);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => Submit(coordinator, binding, "1001", "general"));
         Assert.Null((await bindings.GetAsync(binding.EntityId))!.ServerMapDisclosure);
 
+        clock.Now += DiscordConversationCoordinator.InboundRetryDelay(1);
         await coordinator.RetryPendingAsync(binding);
         Assert.NotNull(SentServerMap(provider)["channels"]);
         Assert.Equal(0, (await bindings.GetAsync(binding.EntityId))!
@@ -215,12 +219,18 @@ public sealed class DiscordCoordinatorTests
 
     private static DiscordConversationCoordinator Coordinator(
         MemoryEntityStore entities, DiscordBindingStore bindings,
-        DiscordDeliveryStore deliveries, FlakyProvider provider)
+        DiscordDeliveryStore deliveries, FlakyProvider provider, TimeProvider? clock = null)
         => new(bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
             new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
-            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean);
+            NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean, clock);
+
+    private sealed class ManualClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = DateTimeOffset.UtcNow;
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
 
     private static Task<ExternalConversationAdmission?> Submit(
         DiscordConversationCoordinator coordinator, DiscordBinding binding,
