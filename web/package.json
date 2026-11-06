@@ -21,10 +21,10 @@
     "react-router-dom": "^7.0.0"
   },
   "devDependencies": {
+    "@module-federation/vite": "^1.16.12",
     "@redbamboo/chat": "link:../../redbamboo-packages/packages/chat",
     "@redbamboo/ui": "link:../../redbamboo-packages/packages/ui",
     "@redbamboo/utility": "link:../../redbamboo-packages/packages/utility",
-    "@module-federation/vite": "^1.16.12",
     "@tailwindcss/vite": "^4.2.4",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
@@ -33,6 +33,6 @@
     "react-dom": "^19.2.5",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.2",
-    "vite": "^8.0.10"
+    "vite": "^8.3.6"
   }
 }
