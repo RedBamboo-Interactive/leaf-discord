@@ -1,4 +1,5 @@
 import { rebuildBlocks, type MessageBlock, type PersistedMessage } from "@redbamboo/chat"
+import { outboundStatuses, type DiscordOutboundStatus } from "./discord-held-reply"
 
 export type DiscordTranscriptMessage = {
   cursor: { epoch: string; sequence: number }
@@ -28,14 +29,8 @@ export type DiscordTranscriptMessage = {
         authority?: string
       }
       attachmentCount?: number
-      /** The outbound Sentinel review of an assistant reply (not rendered yet). */
-      outboundSentinel?: {
-        outcome?: "delivered" | "held" | "withheld"
-        risk?: string
-        signals?: string[]
-        handling?: string
-        available?: boolean
-      }
+      /** The outbound Sentinel review of an assistant reply, with its release state. */
+      outboundSentinel?: DiscordOutboundStatus
     }
   }
   toolName?: string
@@ -53,6 +48,8 @@ export type DiscordAuthor = {
 export type DiscordTranscriptProjection = {
   messages: MessageBlock[]
   authors: Record<string, DiscordAuthor>
+  /** Outbound Sentinel reviews of the assistant replies, by message uid. */
+  outbound: Record<string, DiscordOutboundStatus>
 }
 
 function escapeXml(value: string): string {
@@ -138,5 +135,5 @@ export function projectDiscordTranscript(
       avatarUrl: requestor.avatarUrl ?? "",
     }
   }
-  return { messages, authors }
+  return { messages, authors, outbound: outboundStatuses(source) }
 }

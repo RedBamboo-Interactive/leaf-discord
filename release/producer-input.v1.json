@@ -16,7 +16,7 @@
   },
   "leafSdk": {
     "repository": "RedBamboo-Interactive/redleaf",
-    "commit": "e5a243a70ec18dcc4c5cab0c35ebffdfb01067be",
+    "commit": "984791084555b020b15afcd3485f4e46a73ad563",
     "sourcePath": "src/Leaf.Sdk"
   },
   "redbamboo": {

@@ -24,7 +24,12 @@ internal sealed record DiscordOutgoingContext(
     string? OwnerUserId,
     string AgentId,
     string SourceRef,
-    string Audience);
+    string Audience,
+    bool AudienceIsOwner = false);
+
+/// <summary>Who will read an outbound reply: the phrase the Sentinel is told, and whether the bridge
+/// has verified the reader is the owner themself (never true for anything but a Discord direct message).</summary>
+internal readonly record struct DiscordAudience(string Description, bool IsOwner);
 
 /// <summary>
 /// The outbound Sentinel refused content on a path that answers its caller directly (outreach,
@@ -1168,8 +1173,11 @@ public sealed class DiscordConversationCoordinator(
 
     internal async Task<DiscordOutgoingContext> OutgoingContextAsync(
         DiscordBinding binding, CancellationToken ct)
-        => new(binding.OwnerId, binding.AgentId,
-            $"{binding.BindingId}:{binding.Generation}", await AudienceAsync(binding, ct));
+    {
+        var audience = await AudienceAsync(binding, ct);
+        return new(binding.OwnerId, binding.AgentId,
+            $"{binding.BindingId}:{binding.Generation}", audience.Description, audience.IsOwner);
+    }
 
     /// <summary>
     /// The outbound pass for content whose caller is waiting (outreach, forum posts, owner DMs,
@@ -1189,7 +1197,8 @@ public sealed class DiscordConversationCoordinator(
             ? DeterministicHold(deterministic)
             : EffectiveVerdict(result = await RunOutboundReviewAsync(
                 context.OwnerUserId, context.AgentId, context.SourceRef,
-                context.Audience, $"sentinel-outbound:{key}", content, images, ct), images.Count);
+                new DiscordAudience(context.Audience, context.AudienceIsOwner),
+                $"sentinel-outbound:{key}", content, images, ct), images.Count);
         watch.Stop();
         var hold = IsHold(verdict);
         var review = OutboundReviewRecord(verdict,
@@ -1206,7 +1215,7 @@ public sealed class DiscordConversationCoordinator(
 
     private async Task<UntrustedContentReviewResult?> RunOutboundReviewAsync(
         string? ownerUserId, string agentId, string sourceRef,
-        string audience, string idempotencyKey, string content,
+        DiscordAudience audience, string idempotencyKey, string content,
         IReadOnlyList<ExternalConversationOutputAsset> images, CancellationToken ct)
     {
         if (sentinel is null) return null;
@@ -1229,7 +1238,10 @@ public sealed class DiscordConversationCoordinator(
                 AgentRef = agentId,
                 ComputeProvenance = provenance,
                 Direction = UntrustedContentDirection.Outbound,
-                Audience = audience,
+                Audience = audience.Description,
+                // Only a verified DM with the owner; the Sentinel then treats the owner's own
+                // information as theirs to read. Everything else keeps the default (false).
+                AudienceIsOwner = audience.IsOwner,
                 IdempotencyKey = idempotencyKey.Length <= 200 ? idempotencyKey : idempotencyKey[..200],
                 JobName = "Discord outbound review",
                 // The Sentinel reads the Asset bytes and shows them to a vision model; an image it
@@ -1274,24 +1286,68 @@ public sealed class DiscordConversationCoordinator(
         };
 
     /// <summary>Who will read the reply, from the bridge's own binding data only.</summary>
-    private async Task<string> AudienceAsync(DiscordBinding binding, CancellationToken ct)
+    private async Task<DiscordAudience> AudienceAsync(DiscordBinding binding, CancellationToken ct)
     {
         if (binding.Kind == "dm")
-            return await DirectMessageAudienceAsync(binding.CounterpartyUserId, binding.OwnerId, ct);
-        return binding.Kind is "thread" or "forum_post"
+            return await DirectMessageReaderAsync(binding.CounterpartyUserId, binding.OwnerId, ct);
+        return new(binding.Kind is "thread" or "forum_post"
             ? "a thread in a Discord server, readable by every member who can see it"
-            : "a channel in a Discord server, readable by every member who can see it";
+            : "a channel in a Discord server, readable by every member who can see it", false);
     }
 
     internal async Task<string> DirectMessageAudienceAsync(
+        string? recipientUserId, string ownerUserId, CancellationToken ct)
+        => (await DirectMessageReaderAsync(recipientUserId, ownerUserId, ct)).Description;
+
+    /// <summary>The one place that decides a reader is the owner: the DM counterpart resolves to the
+    /// Leaf user the conversation belongs to. The Sentinel is told the same in prose and, only here,
+    /// in the typed flag.</summary>
+    internal async Task<DiscordAudience> DirectMessageReaderAsync(
         string? recipientUserId, string ownerUserId, CancellationToken ct)
     {
         var counterpart = recipientUserId is null
             ? null
             : await userIdentities.ResolveAsync(recipientUserId, ownerUserId, ct);
         return counterpart?.IsConversationOwner == true
-            ? "a Discord direct message with the verified owner (Discord is still an external service)"
-            : "a Discord direct message with a participant who is not the owner";
+            ? new("a Discord direct message with the verified owner (Discord is still an external service)", true)
+            : new("a Discord direct message with a participant who is not the owner", false);
+    }
+
+    /// <summary>
+    /// The owner releases one held reply of the binding: its chunks are queued exactly as drafted,
+    /// with no second review, and who released it and when is recorded on the delivery rows (the
+    /// verdict is kept). Both a reply the Sentinel held and one withheld because the Sentinel was
+    /// unavailable sit in the held state and are releasable; the owner decides what leaves.
+    /// Idempotent. Refused while a private discussion leads the conversation, because the bridge
+    /// would not post it then. The caller has authorized the owner; nothing an Agent can do
+    /// reaches this.
+    /// </summary>
+    public async Task<DiscordReleaseResult> ReleaseHeldReplyAsync(
+        DiscordBinding binding, string messageUid, string releasedBy, CancellationToken ct = default)
+    {
+        var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var current = await bindings.GetAsync(binding.EntityId, ct);
+            // After /clear the old generation's rows stay inert; nothing of theirs is released.
+            if (current is null || current.Generation != binding.Generation)
+                return new DiscordReleaseResult(DiscordReleaseOutcome.NotFound);
+            var status = await deliveries.FindOutboundStatusAsync(current, messageUid, ct);
+            if (status is { ReleasedAt: null } && await ActiveLeadAsync(current, ct) is not null)
+                return new DiscordReleaseResult(DiscordReleaseOutcome.LeadActive);
+            var result = await deliveries.ReleaseHeldAsync(
+                current, messageUid, releasedBy, clock.GetUtcNow(), ct);
+            if (result.Outcome == DiscordReleaseOutcome.Released)
+                logger.LogInformation(
+                    "Discord reply {MessageUid} on {BindingId} was released by the owner ({Chunks} chunk(s))",
+                    messageUid, current.BindingId, result.Chunks);
+            return result;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private async Task<bool> ApplyOutboundReviewAsync(

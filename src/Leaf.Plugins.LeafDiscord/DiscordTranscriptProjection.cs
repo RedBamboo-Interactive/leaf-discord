@@ -93,6 +93,18 @@ internal static class DiscordTranscriptProjection
                         ["signals"] = outbound["signals"]?.DeepClone(),
                         ["handling"] = outbound["handling"]?.DeepClone(),
                         ["available"] = outbound["available"]?.DeepClone(),
+                        // Present only when the bridge supplied the delivery state: the owner can
+                        // release a held reply, or sees who released it.
+                        ["held"] = outbound["delivery_state"]?.DeepClone() is JsonValue state
+                            && state.TryGetValue<string>(out var delivery) && delivery == "held"
+                            ? true : null,
+                        ["released"] = outbound["released_by"] is null && outbound["released_at"] is null
+                            ? null
+                            : new JsonObject
+                            {
+                                ["by"] = outbound["released_by"]?.DeepClone(),
+                                ["at"] = outbound["released_at"]?.DeepClone(),
+                            },
                     },
                 };
                 projected.Add(message with { Metadata = metadata });
@@ -165,6 +177,17 @@ internal static class DiscordTranscriptProjection
             }
         }
         return projected;
+    }
+
+    /// <summary>A recorded review with where its reply stands, in the shape the projection reads.</summary>
+    internal static JsonObject? WithDelivery(DiscordOutboundStatus? status)
+    {
+        if (status is null) return null;
+        var review = (JsonObject)status.Review.DeepClone();
+        review["delivery_state"] = status.State;
+        review["released_by"] = status.ReleasedBy;
+        review["released_at"] = status.ReleasedAt?.ToString("O");
+        return review;
     }
 
     private static JsonObject WithDiscord(

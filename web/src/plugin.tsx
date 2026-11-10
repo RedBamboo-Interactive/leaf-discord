@@ -32,6 +32,62 @@ import {
   type PublicNovaThread,
 } from "./public-nova"
 import { DISCORD_PRODUCT_COPY } from "./discord-product"
+import {
+  blockMessageUid,
+  heldReplyReason,
+  releaseHeldReplyPath,
+  type DiscordOutboundStatus,
+} from "./discord-held-reply"
+
+/** A reply the Sentinel kept off Discord: its text is the message above; the owner may send it. */
+function HeldReplyNotice({ status, busy, onRelease }: {
+  status: DiscordOutboundStatus
+  busy: boolean
+  onRelease: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  if (status.released) {
+    const at = status.released.at ? new Date(status.released.at) : null
+    const when = at && !Number.isNaN(at.getTime()) ? ` on ${at.toLocaleString()}` : ""
+    return (
+      <div role="status" aria-label="Held reply released" className="mt-1">
+        <ChatStatusLine
+          color="var(--color-text-muted)"
+          icon="ph-bold ph-paper-plane-tilt"
+          label={`You released this reply to Discord${when}.`}
+        />
+      </div>
+    )
+  }
+  if (!status.held) return null
+  return (
+    <div
+      role="status"
+      aria-label="Reply held, not sent to Discord"
+      className="mt-2 rounded-md border px-3 py-2 text-xs"
+      style={{ borderColor: "var(--color-accent-gold)", color: "var(--color-text-muted)" }}
+    >
+      <div className="flex items-start gap-2">
+        <i className="ph-bold ph-shield-warning mt-0.5" style={{ color: "var(--color-accent-gold)" }} />
+        <span>{heldReplyReason(status)} Only you see it here; Discord has not received it.</span>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        {confirming ? (
+          <>
+            <span>Send this reply to Discord exactly as written?</span>
+            <Button size="sm" disabled={busy} onClick={onRelease}>Send it</Button>
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => setConfirming(false)}>Cancel</Button>
+          </>
+        ) : (
+          <Button size="sm" variant="secondary" disabled={busy} onClick={() => setConfirming(true)}>
+            <i className="ph-bold ph-paper-plane-tilt text-xs" />
+            Release
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
 
 function PublicNovaOutcomeStatus({ block }: { block: MessageBlock }) {
   const line = publicNovaOutcomeLine(block)
@@ -121,6 +177,7 @@ export function Page() {
   const [configuring, setConfiguring] = useState(false)
   const [messages, setMessages] = useState<MessageBlock[]>([])
   const [authors, setAuthors] = useState<Record<string, DiscordAuthor>>({})
+  const [outbound, setOutbound] = useState<Record<string, DiscordOutboundStatus>>({})
   const [transcriptLoading, setTranscriptLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
@@ -171,6 +228,7 @@ export function Page() {
     try {
       const result = await api<{ messages: DiscordTranscriptMessage[] }>(`/bindings/${bindingId}/transcript`)
       const projection = projectDiscordTranscript(result.messages)
+      setOutbound(projection.outbound)
       setMessages(projection.messages)
       setAuthors(projection.authors)
     } catch (reason) {
@@ -187,6 +245,7 @@ export function Page() {
       const payload = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(payload.message ?? payload.error ?? `HTTP ${response.status}`)
       const projection = projectPublicNovaMessages((payload as PublicNovaConversation).messages)
+      setOutbound({})
       setMessages(projection.messages)
       setAuthors(projection.authors)
     } catch (reason) {
@@ -279,6 +338,20 @@ export function Page() {
     if (agentFilter && !bots.some((bot) => bot.config.agentId === agentFilter))
       setAgentFilter(null)
   }, [agentFilter, bots, setAgentFilter])
+
+  async function releaseReply(binding: Binding, messageUid: string) {
+    setBusy(true)
+    setError(null)
+    try {
+      await api(releaseHeldReplyPath(binding.entityId, messageUid), { method: "POST" })
+      await loadTranscript(binding.entityId)
+      setNotice("Reply released; it is on its way to Discord.")
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function clearBinding(binding: Binding) {
     setBusy(true)
@@ -374,7 +447,17 @@ export function Page() {
       resolveAgentInfo={resolveDiscordAuthor}
       renderMessageExtra={selectedPublicThread
         ? (block) => <PublicNovaOutcomeStatus block={block} />
-        : undefined}
+        : (block) => {
+          const messageUid = blockMessageUid(block)
+          const status = outbound[messageUid]
+          return status && selectedBinding
+            ? <HeldReplyNotice
+              status={status}
+              busy={busy}
+              onRelease={() => void releaseReply(selectedBinding, messageUid)}
+            />
+            : null
+        }}
     />
   )
 

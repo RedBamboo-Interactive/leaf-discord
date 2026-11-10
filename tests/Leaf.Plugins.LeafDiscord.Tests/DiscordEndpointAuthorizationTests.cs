@@ -308,6 +308,60 @@ public sealed class DiscordEndpointAuthorizationTests
             Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode);
     }
 
+    private static HttpContext AgentSession(string appId = "nova")
+        => new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("token_use", "execution"),
+                new Claim("execution_identity", JsonSerializer.Serialize(new
+                {
+                    app = new { id = appId },
+                    actor = new { kind = "agent", entityId = "agent-entity-1" },
+                    beneficiary = new { kind = "user", id = "owner-1" },
+                    context = new object[]
+                    {
+                        new { kind = "external-conversation", id = "binding-1" },
+                        new { kind = "session", id = "session-1" },
+                    },
+                })),
+            ], "test")),
+        };
+
+    private static HttpContext SignedInUser()
+        => new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(
+                [new Claim(ClaimTypes.NameIdentifier, "owner-1")], "test")),
+        };
+
+    [Fact]
+    public void Releasing_a_held_reply_is_for_the_owner_or_an_administrator_in_the_ui()
+    {
+        Assert.True(DiscordEndpoints.CanReleaseHeldReply(SignedInUser(), new FakeAuthContext("owner-1", ["owner"])));
+        Assert.True(DiscordEndpoints.CanReleaseHeldReply(SignedInUser(), new FakeAuthContext("admin-1", ["admin"])));
+    }
+
+    [Fact]
+    public void Another_user_or_an_anonymous_caller_cannot_release_a_held_reply()
+    {
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(SignedInUser(), new FakeAuthContext("user-2", [])));
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(SignedInUser(), new FakeAuthContext("user-2", ["member"])));
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(SignedInUser(), new FakeAuthContext(null, ["owner"])));
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(new DefaultHttpContext(), new FakeAuthContext(" ", ["admin"])));
+    }
+
+    [Theory]
+    [InlineData("nova")]
+    [InlineData("anything-else")]
+    public void An_agents_signed_session_can_never_release_a_held_reply(string appId)
+    {
+        // Not even one whose token was minted with the owner's roles.
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(AgentSession(appId), new FakeAuthContext("owner-1", ["owner"])));
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(AgentSession(appId), new FakeAuthContext("owner-1", ["admin", "owner"])));
+        Assert.False(DiscordEndpoints.CanReleaseHeldReply(AgentSession(appId), new FakeAuthContext("owner-1", [])));
+    }
+
     private sealed class FakeAuthContext(
         string? userId,
         IReadOnlyList<string>? roles = null) : IAuthContext

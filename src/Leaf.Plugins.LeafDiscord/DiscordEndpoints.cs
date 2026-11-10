@@ -1487,11 +1487,58 @@ public static class DiscordEndpoints
                     };
                 },
                 ct,
-                (messageUid, token) => deliveries.FindOutboundReviewAsync(binding, messageUid, token),
+                async (messageUid, token) => DiscordTranscriptProjection.WithDelivery(
+                    await deliveries.FindOutboundStatusAsync(binding, messageUid, token)),
                 (await leads.GetAsync(binding, ct))?.UnpostedHistory.ToHashSet(StringComparer.Ordinal));
             return Results.Ok(new { binding, messages, nextCursor = page.NextCursor });
         })
             .WithSummary("Returns the binding's settled conversation transcript with Discord author attribution. Owner or administrator only.");
+
+        group.MapPost("/bindings/{id:guid}/messages/{messageUid}/release", async (
+            Guid id,
+            string messageUid,
+            HttpContext http,
+            IAuthContext auth,
+            DiscordBindingStore bindings,
+            DiscordConversationCoordinator conversations,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+        {
+            if (!CanReleaseHeldReply(http, auth))
+                return Forbidden("Only the owner or an administrator in the Leaf UI can release a held reply; an Agent session cannot.");
+            var binding = await bindings.GetAsync(id, ct);
+            if (binding is null) return Results.NotFound();
+            var result = await conversations.ReleaseHeldReplyAsync(binding, messageUid, auth.UserId!, ct);
+            switch (result.Outcome)
+            {
+                case DiscordReleaseOutcome.NotFound:
+                    return Results.NotFound();
+                case DiscordReleaseOutcome.NotHeld:
+                    return Results.Conflict(new
+                    {
+                        error = "discord_reply_not_held",
+                        message = "That reply is not held: it is still in review, already sent, or was cancelled.",
+                    });
+                case DiscordReleaseOutcome.LeadActive:
+                    return Results.Conflict(new
+                    {
+                        error = "discord_conversation_led",
+                        message = "A private discussion leads this Discord conversation; end the lead first, then release the reply.",
+                    });
+            }
+            await bot.RequestOutboundDrainAsync(binding, ct);
+            return Results.Ok(new
+            {
+                bindingId = binding.BindingId,
+                messageUid,
+                released = true,
+                alreadyReleased = result.Outcome == DiscordReleaseOutcome.AlreadyReleased,
+                releasedBy = result.ReleasedBy,
+                releasedAt = result.ReleasedAt,
+                chunks = result.Chunks,
+            });
+        })
+            .WithSummary("Releases one held outbound reply of this binding (messageUid from the transcript): its chunks are delivered to Discord exactly as drafted, without a second review, and who released it and when is recorded beside the original verdict. Works for a reply the Sentinel held and for one withheld because the Sentinel was unavailable. Idempotent; 409 when the reply is not held or a private discussion leads. Owner or administrator in the Leaf UI only; never callable from an Agent's signed session (403).");
 
         group.MapPut("/bindings/{id:guid}/avatar", async (
             Guid id, DiscordAvatarRequest request, IAuthContext auth,
@@ -2688,6 +2735,18 @@ public static class DiscordEndpoints
 
     private static bool IsAdmin(IAuthContext auth)
         => auth.IsInRole("admin") || auth.IsInRole("owner");
+
+    /// <summary>
+    /// Releasing a held reply overrides the Sentinel, so it is the owner's act: an owner or
+    /// administrator with an identity, and never a signed execution token, which is what every
+    /// Agent session (Discord, a private discussion, an automation) carries, whatever roles it
+    /// was minted with.
+    /// </summary>
+    internal static bool CanReleaseHeldReply(HttpContext http, IAuthContext auth)
+        => !string.Equals(http.User.FindFirst("token_use")?.Value, "execution",
+               StringComparison.OrdinalIgnoreCase)
+           && IsAdmin(auth)
+           && !string.IsNullOrWhiteSpace(auth.UserId);
 
     internal static bool CanManageBot(IAuthContext auth, LeafDiscordConfig config)
         => !string.IsNullOrWhiteSpace(auth.UserId)

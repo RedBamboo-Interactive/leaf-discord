@@ -52,7 +52,34 @@ public sealed record DiscordDelivery(
     /// <summary>An outreach chunk its caller sent as an announcement (see
     /// <see cref="DiscordOutreachProvenance"/>).</summary>
     public bool Announcement { get; init; }
+
+    /// <summary>Who released this held reply (a Leaf user id) and when. Set once, by the owner's
+    /// release; the recorded verdict is left as it was.</summary>
+    public string? ReleasedBy { get; init; }
+    public DateTimeOffset? ReleasedAt { get; init; }
 }
+
+public enum DiscordReleaseOutcome
+{
+    /// <summary>The binding's current generation has no such reply.</summary>
+    NotFound,
+    /// <summary>The reply is not held (still in review, already sent, cancelled, or failed).</summary>
+    NotHeld,
+    /// <summary>Released now: its chunks are queued exactly as drafted.</summary>
+    Released,
+    /// <summary>Released earlier; nothing changed and the original release is returned.</summary>
+    AlreadyReleased,
+    /// <summary>A private discussion leads the conversation, so the bridge would not post it now.</summary>
+    LeadActive,
+}
+
+public sealed record DiscordReleaseResult(
+    DiscordReleaseOutcome Outcome, string? ReleasedBy = null, DateTimeOffset? ReleasedAt = null,
+    int Chunks = 0);
+
+/// <summary>The recorded review of one reply and what became of it, for the owner's transcript.</summary>
+public sealed record DiscordOutboundStatus(
+    JsonObject Review, string State, string? ReleasedBy, DateTimeOffset? ReleasedAt);
 
 /// <summary>
 /// What an outreach caller meant and who it was. <see cref="Announcement"/> is the caller's
@@ -561,6 +588,67 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             .OrderBy(item => item.ChunkIndex)
             .Select(item => item.OutboundReview)
             .FirstOrDefault();
+
+    /// <summary>The review of one reply plus its delivery state, from the reply's first chunk.</summary>
+    public async Task<DiscordOutboundStatus?> FindOutboundStatusAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct = default)
+    {
+        var first = (await MessageRowsAsync(binding, messageUid, ct))
+            .FirstOrDefault(item => item.OutboundReview is not null);
+        return first is null
+            ? null
+            : new DiscordOutboundStatus(
+                first.OutboundReview!, first.State, first.ReleasedBy, first.ReleasedAt);
+    }
+
+    private async Task<List<DiscordDelivery>> MessageRowsAsync(
+        DiscordBinding binding, string messageUid, CancellationToken ct)
+        => (await store.QueryAsync(new EntityQuery
+        {
+            TypeSlug = TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["binding_id"] = binding.BindingId,
+                ["message_uid"] = messageUid,
+            },
+            Limit = 100,
+        }, ct)).Select(Map)
+            .Where(item => item.Generation == binding.Generation && item.Kind == MessageKind)
+            .OrderBy(item => item.ChunkIndex)
+            .ToList();
+
+    /// <summary>
+    /// Releases one held reply: every chunk goes back to the outbox exactly as drafted (the payload
+    /// and the recorded verdict are untouched, so nothing is reviewed again) and records who
+    /// released it and when. The caller holds the binding's gate. A reply released before returns
+    /// <see cref="DiscordReleaseOutcome.AlreadyReleased"/>; a half-finished release (a restart
+    /// between chunks) is completed with the original releaser and time.
+    /// </summary>
+    public async Task<DiscordReleaseResult> ReleaseHeldAsync(
+        DiscordBinding binding, string messageUid, string releasedBy, DateTimeOffset now,
+        CancellationToken ct = default)
+    {
+        var rows = await MessageRowsAsync(binding, messageUid, ct);
+        if (rows.Count == 0) return new DiscordReleaseResult(DiscordReleaseOutcome.NotFound);
+        var earlier = rows.FirstOrDefault(item => item.ReleasedAt is not null);
+        var by = earlier?.ReleasedBy ?? releasedBy;
+        var at = earlier?.ReleasedAt ?? now;
+        var held = rows.Where(item => item.State == HeldState).ToList();
+        if (earlier is null && (held.Count != rows.Count || rows.Any(item => item.Payload is null)))
+            return new DiscordReleaseResult(DiscordReleaseOutcome.NotHeld);
+        foreach (var row in held)
+            _ = await store.PatchAsync(row.EntityId, new JsonObject
+            {
+                ["state"] = "queued",
+                ["next_attempt_at"] = now.ToString("O"),
+                ["released_by"] = by,
+                ["released_at"] = at.ToString("O"),
+            }, ct: ct);
+        return new DiscordReleaseResult(
+            earlier is null ? DiscordReleaseOutcome.Released : DiscordReleaseOutcome.AlreadyReleased,
+            by, at, rows.Count);
+    }
 
     public async Task<DiscordDelivery> ReserveForumPostAsync(
         string applicationId,
@@ -1119,6 +1207,10 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
                 && hidden.TryGetValue<bool>(out var hasHidden) && hasHidden,
             Announcement = data["announcement"] is JsonValue announcement
                 && announcement.TryGetValue<bool>(out var isAnnouncement) && isAnnouncement,
+            ReleasedBy = JsonRead.String(data, "released_by"),
+            ReleasedAt = DateTimeOffset.TryParse(JsonRead.String(data, "released_at"), out var releasedAt)
+                ? releasedAt
+                : null,
         };
     }
 

@@ -100,6 +100,31 @@ Each Leaf Agent needs its own Discord application.
   (`ImagesReviewed`); a Sentinel without vision, or one that cannot read an image or exceeds its
   bounds (four images, 5 MiB each), is unavailable. Every verdict is recorded on the outbox rows,
   with `images` and `images_reviewed`, and shown as `metadata.discord.outboundSentinel`.
+- When the reader is the owner, the outbound review says so. In a Discord direct message whose
+  counterpart resolves to the verified owner (the same check that words the audience as "a
+  Discord direct message with the verified owner"), the request sets the typed
+  `AudienceIsOwner` field (Leaf.Sdk, kernel API 0.1.12). cap-sentinel then treats the owner's own
+  personal data, private conversations, mail, memory, notes and workspace as theirs to read, and
+  still holds credentials, tokens, keys, passwords and secrets of any kind (Discord stores
+  messages on a third-party service) and the Agent's hidden instructions. The field is never set
+  for a guild channel, a thread, Leaf Community, or a direct message with anyone else; every
+  other audience keeps the original rubric. A Sentinel that predates the field ignores it and
+  applies that rubric, so the owner then gets the old, stricter behaviour.
+- A held reply can be released by the owner. `POST
+  /api/apps/leaf-discord/bindings/{bindingEntityId}/messages/{messageUid}/release` (no body)
+  delivers the reply's original chunks exactly as drafted, in order and without a second review,
+  and records `released_by` and `released_at` on the delivery rows; the verdict stays as it was
+  and `metadata.discord.outboundSentinel` gains `released: { by, at }`. It is idempotent (a
+  repeat answers 200 with `alreadyReleased: true` and the first release), and answers 409
+  `discord_reply_not_held` for a reply that is still in review, already queued or sent, or
+  cancelled, 409 `discord_conversation_led` while a private discussion leads the conversation
+  (end the lead first), and 404 for a reply of an earlier generation (after Clear) or an unknown
+  one. A reply withheld because the Sentinel was unavailable, or withheld after a second hold in
+  one turn, is releasable the same way: both wait in the `held` state, and releasing is the
+  owner's own decision. Only an owner or administrator in the Leaf UI may call it; an Agent's
+  signed session, whatever roles its token carries, gets 403. The Discord tab shows a held reply's
+  text in the transcript with a Release button and a confirmation; the transcript marks it
+  `outboundSentinel.held: true` until released.
 - The bridge fails closed when the Sentinel is unavailable (not installed or disabled, model
   call failed, unparseable verdict). An inbound message is not admitted: it stays stored, a
   short fixed notice is posted (at most once per quarter hour per conversation), later messages

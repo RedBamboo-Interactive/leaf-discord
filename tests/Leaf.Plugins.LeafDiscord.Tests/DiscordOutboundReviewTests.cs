@@ -1104,6 +1104,324 @@ public sealed class DiscordOutboundReviewTests
         Assert.Null(observed);
     }
 
+    private static async Task<(MemoryEntityStore Entities, string OwnerId)> EntitiesWithLinkedOwnerAsync()
+    {
+        var entities = new MemoryEntityStore();
+        var owner = await entities.UpsertBySlugAsync("user", "owner", "Owner Example", new JsonObject
+        {
+            [DiscordUserIdentityResolver.UserField] = "200000000000000002",
+        });
+        return (entities, owner.Id.ToString());
+    }
+
+    [Fact]
+    public async Task A_dm_with_the_verified_owner_tells_the_sentinel_the_reader_is_the_owner()
+    {
+        var (entities, ownerId) = await EntitiesWithLinkedOwnerAsync();
+        var h = await Harness.CreateAsync(_ => Clean, entities, kind: "dm",
+            ownerId: ownerId, counterparty: "200000000000000002");
+        h.Reply(1, "reply-1", "Your appointment is Thursday.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        var request = Assert.Single(h.Sentinel.Requests);
+        Assert.True(request.AudienceIsOwner);
+        Assert.Equal(UntrustedContentDirection.Outbound, request.Direction);
+    }
+
+    [Fact]
+    public async Task A_dm_with_anyone_else_never_sets_the_owner_flag()
+    {
+        // A different Discord user, and a DM binding that records no counterpart at all.
+        foreach (var counterparty in new string?[] { "500000000000000005", null })
+        {
+            var (entities, ownerId) = await EntitiesWithLinkedOwnerAsync();
+            var h = await Harness.CreateAsync(_ => Clean, entities, kind: "dm",
+                ownerId: ownerId, counterparty: counterparty);
+            h.Reply(1, "reply-1", "Hello.");
+            await h.ReconcileAsync();
+            await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+            var request = Assert.Single(h.Sentinel.Requests);
+            Assert.False(request.AudienceIsOwner);
+            Assert.Equal("a Discord direct message with a participant who is not the owner", request.Audience);
+        }
+    }
+
+    [Theory]
+    [InlineData("guild_channel")]
+    [InlineData("thread")]
+    public async Task A_shared_conversation_never_sets_the_owner_flag_even_if_the_owner_is_in_it(string kind)
+    {
+        var (entities, ownerId) = await EntitiesWithLinkedOwnerAsync();
+        var h = await Harness.CreateAsync(_ => Clean, entities, kind: kind,
+            ownerId: ownerId, counterparty: "200000000000000002");
+        h.Reply(1, "reply-1", "Hello everyone.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.False(Assert.Single(h.Sentinel.Requests).AudienceIsOwner);
+    }
+
+    [Fact]
+    public async Task Waiting_outreach_to_the_owner_in_a_dm_sets_the_flag_and_to_anyone_else_does_not()
+    {
+        var (entities, ownerId) = await EntitiesWithLinkedOwnerAsync();
+        var h = await Harness.CreateAsync(_ => Clean, entities, kind: "dm",
+            ownerId: ownerId, counterparty: "200000000000000002");
+
+        var toOwner = await h.Coordinator.OutgoingContextAsync(h.Binding, default);
+        var toOther = await h.Coordinator.DirectMessageReaderAsync("500000000000000005", ownerId, default);
+
+        Assert.True(toOwner.AudienceIsOwner);
+        Assert.False(toOther.IsOwner);
+        Assert.False(new DiscordOutgoingContext("owner-1", "nova", "ref", "a channel").AudienceIsOwner);
+        await h.Coordinator.ReviewOutgoingOrThrowAsync(toOwner, "Your schedule.", [], false, "key-1", default);
+        Assert.True(Assert.Single(h.Sentinel.Requests).AudienceIsOwner);
+    }
+
+    private static async Task<IReadOnlyList<Leaf.Sdk.LeafEntity>> ReplyEntitiesAsync(Harness h, string messageUid)
+        => (await h.Entities.QueryAsync(new Leaf.Sdk.EntityQuery
+        {
+            TypeSlug = DiscordDeliveryStore.TypeSlug,
+            DataEquals = new Dictionary<string, object?>
+            {
+                ["direction"] = "outbound",
+                ["message_uid"] = messageUid,
+            },
+        })).OrderBy(entity => JsonRead.Long(entity.Data, "chunk_index", 0)).ToList();
+
+    private static string LongReply()
+        => string.Join("\n\n", Enumerable.Range(1, 6).Select(i => $"Part {i}: " + new string('x', 700)));
+
+    private static async Task<Harness> HeldAsync(string text = "He lives at 14 rue des Lilas.",
+        Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide = null)
+    {
+        var h = await Harness.CreateAsync(decide ?? (_ => Leak));
+        h.Reply(1, "reply-1", text);
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        return h;
+    }
+
+    [Fact]
+    public async Task Releasing_a_held_reply_queues_its_chunks_as_drafted_without_a_second_review()
+    {
+        var h = await HeldAsync(LongReply());
+        var before = await ReplyEntitiesAsync(h, "reply-1");
+        Assert.True(before.Count > 1);
+        Assert.All(before, entity => Assert.Equal("held", JsonRead.String(entity.Data, "state")));
+        var drafted = before.Select(entity => entity.Data["payload"]!.ToJsonString()).ToList();
+        var requests = h.Sentinel.Requests.Count;
+        Assert.Empty(await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId));
+
+        var result = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+
+        Assert.Equal(DiscordReleaseOutcome.Released, result.Outcome);
+        Assert.Equal("owner-1", result.ReleasedBy);
+        Assert.Equal(before.Count, result.Chunks);
+        var after = await ReplyEntitiesAsync(h, "reply-1");
+        Assert.All(after, entity => Assert.Equal("queued", JsonRead.String(entity.Data, "state")));
+        Assert.Equal(drafted, after.Select(entity => entity.Data["payload"]!.ToJsonString()));
+        // Who and when are recorded on every row; the original verdict is kept as it was.
+        Assert.All(after, entity =>
+        {
+            Assert.Equal("owner-1", JsonRead.String(entity.Data, "released_by"));
+            Assert.True(DateTimeOffset.TryParse(JsonRead.String(entity.Data, "released_at"), out _));
+            Assert.Equal("held", JsonRead.String((JsonObject)entity.Data["outbound_review"]!, "outcome"));
+            Assert.Equal("high", JsonRead.String((JsonObject)entity.Data["outbound_review"]!, "risk"));
+        });
+        // No re-review, and the drain now sees them in chunk order.
+        Assert.Equal(requests, h.Sentinel.Requests.Count);
+        var pending = await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId);
+        Assert.Equal(Enumerable.Range(0, before.Count), pending.Select(item => item.ChunkIndex));
+        Assert.All(pending, item => Assert.Equal("reply-1", item.MessageUid));
+    }
+
+    [Fact]
+    public async Task Releasing_twice_changes_nothing_the_second_time_and_reports_the_first_release()
+    {
+        var h = await HeldAsync(LongReply());
+        var first = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+        h.Clock.Advance(TimeSpan.FromMinutes(5));
+
+        var second = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "admin-2");
+
+        Assert.Equal(DiscordReleaseOutcome.AlreadyReleased, second.Outcome);
+        Assert.Equal("owner-1", second.ReleasedBy);
+        Assert.Equal(first.ReleasedAt, second.ReleasedAt);
+        Assert.All(await ReplyEntitiesAsync(h, "reply-1"), entity =>
+            Assert.Equal("owner-1", JsonRead.String(entity.Data, "released_by")));
+        Assert.Equal(first.Chunks, (await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId)).Count);
+    }
+
+    [Fact]
+    public async Task A_release_a_restart_interrupted_between_chunks_is_completed_with_the_original_releaser()
+    {
+        var h = await HeldAsync(LongReply());
+        var rows = await ReplyEntitiesAsync(h, "reply-1");
+        // Only the first chunk was patched before the restart.
+        _ = await h.Entities.PatchAsync(rows[0].Id, new JsonObject
+        {
+            ["state"] = "queued",
+            ["released_by"] = "owner-1",
+            ["released_at"] = h.Clock.GetUtcNow().ToString("O"),
+        });
+
+        var result = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "admin-2");
+
+        Assert.Equal(DiscordReleaseOutcome.AlreadyReleased, result.Outcome);
+        Assert.All(await ReplyEntitiesAsync(h, "reply-1"), entity =>
+        {
+            Assert.Equal("queued", JsonRead.String(entity.Data, "state"));
+            Assert.Equal("owner-1", JsonRead.String(entity.Data, "released_by"));
+        });
+    }
+
+    [Fact]
+    public async Task A_reply_that_is_not_held_is_refused_and_untouched()
+    {
+        var h = await Harness.CreateAsync(_ => Clean);
+        h.Reply(1, "reply-1", "Still in review.");
+        await h.ReconcileAsync();
+
+        // Under review.
+        var inReview = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+        Assert.Equal(DiscordReleaseOutcome.NotHeld, inReview.Outcome);
+        Assert.Equal(DiscordDeliveryStore.ReviewingState,
+            JsonRead.String(Assert.Single(await ReplyEntitiesAsync(h, "reply-1")).Data, "state"));
+
+        // Reviewed clean and queued: it is going out anyway, so there is nothing to release.
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        var queued = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+        Assert.Equal(DiscordReleaseOutcome.NotHeld, queued.Outcome);
+        var row = Assert.Single(await ReplyEntitiesAsync(h, "reply-1"));
+        Assert.Equal("queued", JsonRead.String(row.Data, "state"));
+        Assert.Null(JsonRead.String(row.Data, "released_by"));
+
+        // Sent, and a reply that does not exist.
+        await h.Deliveries.MarkSentAsync(
+            (await h.Deliveries.PendingOutboundAsync(h.Binding.BindingId)).Single(), "900000000000000009");
+        Assert.Equal(DiscordReleaseOutcome.NotHeld,
+            (await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1")).Outcome);
+        Assert.Equal(DiscordReleaseOutcome.NotFound,
+            (await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "no-such-reply", "owner-1")).Outcome);
+    }
+
+    [Fact]
+    public async Task A_cancelled_reply_is_not_releasable()
+    {
+        var h = await HeldAsync();
+        Assert.True(await h.Deliveries.WithholdUnsentMessageAsync(h.Binding, "reply-1", "test"));
+        // Held rows are not "unsent" in the outbox sense; force the cancelled state the lead path writes.
+        var row = Assert.Single(await ReplyEntitiesAsync(h, "reply-1"));
+        _ = await h.Entities.PatchAsync(row.Id, new JsonObject { ["state"] = "cancelled", ["payload"] = null });
+
+        Assert.Equal(DiscordReleaseOutcome.NotHeld,
+            (await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1")).Outcome);
+    }
+
+    [Fact]
+    public async Task A_reply_withheld_because_the_sentinel_was_unavailable_can_be_released_too()
+    {
+        var h = await Harness.CreateAsync(_ => UntrustedContentVerdict.Unavailable());
+        h.Reply(1, "reply-1", "Here is the fix.");
+        await h.ReconcileAsync();
+        foreach (var wait in new[] { 0, 30, 60, 120 })
+        {
+            h.Clock.Advance(TimeSpan.FromSeconds(wait + 1));
+            await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        }
+        var withheld = Assert.Single(await ReplyEntitiesAsync(h, "reply-1"));
+        Assert.Equal("held", JsonRead.String(withheld.Data, "state"));
+        Assert.False(((JsonObject)withheld.Data["outbound_review"]!)["available"]!.GetValue<bool>());
+
+        var result = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+
+        Assert.Equal(DiscordReleaseOutcome.Released, result.Outcome);
+        var released = Assert.Single(await ReplyEntitiesAsync(h, "reply-1"));
+        Assert.Equal("queued", JsonRead.String(released.Data, "state"));
+        Assert.Equal("withheld", JsonRead.String((JsonObject)released.Data["outbound_review"]!, "outcome"));
+    }
+
+    [Fact]
+    public async Task A_reply_withheld_after_a_second_hold_can_be_released_by_the_owner()
+    {
+        var h = await Harness.CreateAsync(_ => Leak);
+        h.Reply(1, "reply-1", "He lives at 14 rue des Lilas.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+        h.Reply(3, "reply-2", "Fine: 14 rue des Lilas, second floor.");
+        await h.ReconcileAsync();
+        await h.Coordinator.ReviewPendingOutboundAsync(h.Binding);
+
+        Assert.Equal("withheld", JsonRead.String(
+            (JsonObject)Assert.Single(await ReplyEntitiesAsync(h, "reply-2")).Data["outbound_review"]!, "outcome"));
+        Assert.Equal(DiscordReleaseOutcome.Released,
+            (await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-2", "owner-1")).Outcome);
+    }
+
+    [Fact]
+    public async Task A_reply_is_not_released_while_a_private_discussion_leads_the_conversation()
+    {
+        var h = await HeldAsync();
+        await h.Coordinator.Leads.ClaimAsync(
+            h.Binding, "discussion-1", "owner-1", "agent-entity-1", TimeSpan.FromMinutes(30), h.Clock.GetUtcNow());
+
+        var result = await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+
+        Assert.Equal(DiscordReleaseOutcome.LeadActive, result.Outcome);
+        Assert.Equal("held", JsonRead.String(Assert.Single(await ReplyEntitiesAsync(h, "reply-1")).Data, "state"));
+    }
+
+    [Fact]
+    public async Task A_reply_of_an_earlier_generation_is_not_released_after_clear()
+    {
+        var h = await HeldAsync();
+        await h.SeedBotConfigurationAsync();
+        var cleared = await h.Coordinator.ClearAsync(h.Binding, "clear-1");
+
+        Assert.Equal(DiscordReleaseOutcome.NotFound,
+            (await h.Coordinator.ReleaseHeldReplyAsync(cleared, "reply-1", "owner-1")).Outcome);
+        Assert.Equal(DiscordReleaseOutcome.NotFound,
+            (await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1")).Outcome);
+        Assert.Equal("held", JsonRead.String(Assert.Single(await ReplyEntitiesAsync(h, "reply-1")).Data, "state"));
+    }
+
+    [Fact]
+    public async Task The_transcript_marks_a_held_reply_releasable_and_a_released_one_with_who_and_when()
+    {
+        var h = await HeldAsync();
+        var messages = new[]
+        {
+            new ExternalConversationMessage(new ExternalConversationCursor("e", 1), "reply-1",
+                "assistant", "text", "He lives at 14 rue des Lilas.", DateTimeOffset.UtcNow),
+        };
+        async Task<JsonNode?> Project()
+        {
+            var projected = await DiscordTranscriptProjection.ProjectAsync(messages,
+                (_, _) => Task.FromResult<DiscordUserProfile?>(null), null, default,
+                async (uid, token) => DiscordTranscriptProjection.WithDelivery(
+                    await h.Deliveries.FindOutboundStatusAsync(h.Binding, uid, token)));
+            return projected[0].Metadata?["discord"]?["outboundSentinel"];
+        }
+
+        var held = await Project();
+        Assert.True(held?["held"]?.GetValue<bool>());
+        Assert.Null(held?["released"]);
+        Assert.Equal("held", held?["outcome"]?.GetValue<string>());
+
+        await h.Coordinator.ReleaseHeldReplyAsync(h.Binding, "reply-1", "owner-1");
+
+        var released = await Project();
+        Assert.Null(released?["held"]);
+        Assert.Equal("owner-1", released?["released"]?["by"]?.GetValue<string>());
+        Assert.NotNull(released?["released"]?["at"]);
+        // The verdict the Sentinel gave is still what the transcript shows.
+        Assert.Equal("held", released?["outcome"]?.GetValue<string>());
+        Assert.Equal("high", released?["risk"]?.GetValue<string>());
+    }
+
     private sealed class Harness
     {
         public required MemoryEntityStore Entities { get; init; }

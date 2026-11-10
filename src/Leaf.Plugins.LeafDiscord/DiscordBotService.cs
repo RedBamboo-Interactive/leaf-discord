@@ -298,6 +298,19 @@ public sealed class DiscordBotService(
         => await (await ResolveRuntimeAsync(binding.ApplicationId, ct))
             .PinExistingBindingMessageAsync(binding, messageUid, ct);
 
+    /// <summary>Asks the binding's bot to send what is queued now (after the owner releases a held
+    /// reply). Best effort: when the bot is not running, its next maintenance sweep sends it.</summary>
+    public async Task RequestOutboundDrainAsync(DiscordBinding binding, CancellationToken ct = default)
+    {
+        try
+        {
+            (await ResolveRuntimeAsync(binding.ApplicationId, ct)).RequestOutboundDrain(binding.BindingId);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
     public async Task<DiscordMessageMutationResult> EditExistingBindingMessageAsync(
         DiscordBinding binding,
         string messageUid,
@@ -3352,6 +3365,8 @@ internal sealed class DiscordBotRuntime(
                 $"Discord REST {(int)ex.HttpCode}: {ex.Reason}{discordCode}");
         }
     }
+
+    internal void RequestOutboundDrain(string bindingId) => maintenance.RequestDrain(bindingId);
 
     public async Task<string> PinExistingBindingMessageAsync(
         DiscordBinding binding, string messageUid, CancellationToken ct = default)
