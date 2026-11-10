@@ -1686,13 +1686,26 @@ internal sealed class DiscordBotRuntime(
             categories, channels, capturedAt, broadcastRoleId);
     }
 
+    /// <summary>
+    /// Whether Discord.Net can compute permissions for the channel. Its
+    /// <c>ChannelPermissions.All</c> throws for any type outside this list, which Discord adds
+    /// faster than the library does.
+    /// </summary>
+    internal static bool HasModeledPermissions(IChannel? channel)
+        => channel is IStageChannel or IVoiceChannel or ITextChannel or ICategoryChannel
+            or IMediaChannel or IForumChannel;
+
     private static DiscordGuildChannelSnapshot? ProjectGuildChannel(
         SocketGuild guild, SocketGuildChannel channel)
     {
-        var permissionTarget = channel is SocketThreadChannel thread
+        IGuildChannel? permissionTarget = channel is SocketThreadChannel thread
             ? thread.ParentChannel
             : channel;
-        var permissions = guild.CurrentUser.GetPermissions(permissionTarget);
+        // One channel the map cannot describe must never fail the message that asked for the
+        // map: Discord.Net throws for a channel type it does not model, and a thread's parent
+        // can be missing from the cache. Such a channel is left out of the map.
+        if (!HasModeledPermissions(permissionTarget)) return null;
+        var permissions = guild.CurrentUser.GetPermissions(permissionTarget!);
         if (!permissions.ViewChannel) return null;
 
         var kind = channel switch
