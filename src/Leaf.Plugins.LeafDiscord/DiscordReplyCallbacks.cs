@@ -63,6 +63,31 @@ public sealed class DiscordReplySubscriptionStore(IEntityStore store)
         return Map(entity);
     }
 
+    /// <summary>
+    /// Ends a discussion's subscription to a binding early: deletes every row for that binding
+    /// and discussion (an expired row counts too) and returns how many it removed. Idempotent:
+    /// a discussion with no subscription removes 0.
+    /// </summary>
+    public async Task<int> UnsubscribeAsync(
+        string bindingId, string discussionId, CancellationToken ct = default)
+    {
+        var removed = 0;
+        foreach (var subscription in await ListAsync(bindingId, ct))
+        {
+            if (!string.Equals(subscription.DiscussionId, discussionId, StringComparison.Ordinal))
+                continue;
+            await store.DeleteAsync(subscription.EntityId, ct);
+            removed++;
+        }
+        return removed;
+    }
+
+    /// <summary>The discussion's unexpired subscription to a binding, or null.</summary>
+    public async Task<DiscordReplySubscription?> FindActiveAsync(
+        string bindingId, string discussionId, DateTimeOffset now, CancellationToken ct = default)
+        => (await ActiveAsync(bindingId, now, ct)).FirstOrDefault(item =>
+            string.Equals(item.DiscussionId, discussionId, StringComparison.Ordinal));
+
     /// <summary>Unexpired subscriptions for a binding. Expired rows are deleted on read.</summary>
     public async Task<IReadOnlyList<DiscordReplySubscription>> ActiveAsync(
         string bindingId, DateTimeOffset now, CancellationToken ct = default)

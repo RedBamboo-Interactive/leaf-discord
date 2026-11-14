@@ -1434,6 +1434,37 @@ public static class DiscordEndpoints
         })
             .WithSummary("Ends the conversation lead on this binding so the Discord session answers again. A discussion can end only its own lead; an owner or administrator can end any.");
 
+        group.MapGet("/bindings/{id:guid}/subscription", async (
+            Guid id, string? discussionId, HttpContext http, IAuthContext auth,
+            DiscordBindingStore bindings, DiscordAgentResolver agents,
+            DiscordReplySubscriptionStore replySubscriptions, CancellationToken ct) =>
+        {
+            var binding = await bindings.GetAsync(id, ct);
+            if (binding is null) return Results.NotFound();
+            var caller = ReadBindingMessageCaller(http);
+            var agent = caller is null ? null : await agents.ResolveAsync(binding.AgentId, ct);
+            return await ReadSubscriptionAsync(
+                caller, caller is null && IsAdmin(auth), binding, agent?.Id.ToString(),
+                discussionId, replySubscriptions, DateTimeOffset.UtcNow, ct);
+        })
+            .WithSummary("Returns whether the calling private discussion is subscribed to Discord reply notices for this binding, and when the subscription expires. Callable by the binding's Agent discussion (its own subscription) or by an owner or administrator (pass discussionId).");
+
+        group.MapDelete("/bindings/{id:guid}/subscription", async (
+            Guid id, string? discussionId, HttpContext http, IAuthContext auth,
+            DiscordBindingStore bindings, DiscordAgentResolver agents,
+            DiscordReplySubscriptionStore replySubscriptions,
+            DiscordConversationLeadStore leads, CancellationToken ct) =>
+        {
+            var binding = await bindings.GetAsync(id, ct);
+            if (binding is null) return Results.NotFound();
+            var caller = ReadBindingMessageCaller(http);
+            var agent = caller is null ? null : await agents.ResolveAsync(binding.AgentId, ct);
+            return await UnsubscribeRepliesAsync(
+                caller, caller is null && IsAdmin(auth), binding, agent?.Id.ToString(),
+                discussionId, replySubscriptions, leads, DateTimeOffset.UtcNow, ct);
+        })
+            .WithSummary("Stops Discord reply notices for this binding to a private discussion by removing its subscription (notifyReplies:false on a later send avoids re-subscribing). A discussion removes only its own; an owner or administrator can pass discussionId to remove another's. Also ends that discussion's conversation lead, since a lead must hear the replies. Returns { ok, removed }; removed is 0 when it was not subscribed.");
+
         group.MapGet("/bindings/{id:guid}/transcript", async (
             Guid id,
             IAuthContext auth,
@@ -1698,7 +1729,7 @@ public static class DiscordEndpoints
                     await leads.RevertClaimAsync(binding, previousLead, CancellationToken.None);
             }
         })
-            .WithSummary("Sends a message from the Agent into an existing Discord binding (content and idempotencyKey required), optionally taking the conversation lead. Requires a signed private Agent discussion or binding-authorized automation, and an enabled binding with a session. This is the right way to post into a bound channel.");
+            .WithSummary("Sends a message from the Agent into an existing Discord binding (content and idempotencyKey required), optionally taking the conversation lead. A signed private discussion is subscribed to Discord reply notices for the binding for 48 hours, renewed on each send; notifyReplies:false sends without subscribing, and DELETE /bindings/{id}/subscription ends it. Requires a signed private Agent discussion or binding-authorized automation, and an enabled binding with a session. This is the right way to post into a bound channel.");
 
         group.MapPost("/bindings/{id:guid}/messages/{messageUid}/edit", async (
             Guid id,
@@ -2937,6 +2968,83 @@ public static class DiscordEndpoints
                 binding.BindingId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Resolves whose subscription a subscription route acts on. A signed Agent discussion acts
+    /// only on its own, from its signed identity; a discussionId that names another one is
+    /// refused. An owner or administrator must name the discussion.
+    /// </summary>
+    private static (string? DiscussionId, IResult? Failure) ResolveSubscriptionTarget(
+        LeafAgentCaller? caller, bool isAdmin, DiscordBinding binding,
+        string? resolvedAgentEntityId, string? requestedDiscussionId)
+    {
+        if (caller is not null)
+        {
+            if (!CanAddressBinding(caller, binding, resolvedAgentEntityId))
+                return (null, Forbidden("This Agent cannot address that Discord binding."));
+            if (caller.DiscussionId is null)
+                return (null, Forbidden("Only a signed private discussion has a reply subscription."));
+            if (!string.IsNullOrEmpty(requestedDiscussionId)
+                && !string.Equals(requestedDiscussionId, caller.DiscussionId, StringComparison.Ordinal))
+                return (null, Forbidden("A discussion can only manage its own reply subscription."));
+            return (caller.DiscussionId, null);
+        }
+        if (!isAdmin)
+            return (null, Forbidden("Owner or administrator access is required."));
+        if (string.IsNullOrWhiteSpace(requestedDiscussionId))
+            return (null, Results.BadRequest(new
+            {
+                error = "discussion_id_required",
+                message = "Pass ?discussionId= to name the discussion whose subscription to read or remove.",
+            }));
+        return (requestedDiscussionId, null);
+    }
+
+    internal static async Task<IResult> ReadSubscriptionAsync(
+        LeafAgentCaller? caller, bool isAdmin, DiscordBinding binding,
+        string? resolvedAgentEntityId, string? requestedDiscussionId,
+        DiscordReplySubscriptionStore replySubscriptions, DateTimeOffset now, CancellationToken ct)
+    {
+        var (discussionId, failure) = ResolveSubscriptionTarget(
+            caller, isAdmin, binding, resolvedAgentEntityId, requestedDiscussionId);
+        if (failure is not null) return failure;
+        var subscription = await replySubscriptions.FindActiveAsync(
+            binding.BindingId, discussionId!, now, ct);
+        return Results.Ok(new
+        {
+            bindingId = binding.BindingId,
+            discussionId,
+            subscribed = subscription is not null,
+            expiresAt = subscription?.ExpiresAt,
+        });
+    }
+
+    /// <summary>
+    /// Ends a discussion's reply subscription. A lead must hear the replies it holds back from
+    /// Discord, so if the discussion leads the conversation that lead ends first; if removing
+    /// the subscription then fails, the discussion still hears the replies and the session
+    /// answers again, never the reverse (a lead with nobody listening).
+    /// </summary>
+    internal static async Task<IResult> UnsubscribeRepliesAsync(
+        LeafAgentCaller? caller, bool isAdmin, DiscordBinding binding,
+        string? resolvedAgentEntityId, string? requestedDiscussionId,
+        DiscordReplySubscriptionStore replySubscriptions, DiscordConversationLeadStore leads,
+        DateTimeOffset now, CancellationToken ct)
+    {
+        var (discussionId, failure) = ResolveSubscriptionTarget(
+            caller, isAdmin, binding, resolvedAgentEntityId, requestedDiscussionId);
+        if (failure is not null) return failure;
+        var released = await leads.ReleaseAsync(binding, "unsubscribed", now, discussionId, ct);
+        var removed = await replySubscriptions.UnsubscribeAsync(binding.BindingId, discussionId!, ct);
+        return Results.Ok(new
+        {
+            ok = true,
+            removed,
+            bindingId = binding.BindingId,
+            discussionId,
+            leadEnded = released is not null,
+        });
     }
 
     internal static IResult? ValidateLeadRequest(
