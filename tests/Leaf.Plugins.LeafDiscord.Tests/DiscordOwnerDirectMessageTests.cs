@@ -446,6 +446,9 @@ public sealed class DiscordOwnerDirectMessageTests
             CancellationToken ct = default)
         {
             var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct);
+            // The delivered-as-one-message mark is not a transcript injection.
+            if (request.RequestUri?.ToString().EndsWith("/delivery", StringComparison.Ordinal) == true)
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") };
             Requests.Add((request.RequestUri?.ToString() ?? "", body));
             var messageUid = JsonDocument.Parse(body).RootElement.GetProperty("messageUid").GetString();
             return new HttpResponseMessage(HttpStatusCode.OK)

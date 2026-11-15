@@ -130,6 +130,8 @@ public sealed class DiscordConversationCoordinator(
     }
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim> gates = new(StringComparer.Ordinal);
+    // Sessions RedCompute already knows are delivered as one message; a restart asks once more per session.
+    private readonly ConcurrentDictionary<string, byte> deliveredAsOneMessage = new(StringComparer.Ordinal);
     private readonly List<IDisposable> subscriptions = [];
 
     public event Action<DiscordBinding>? Reconciled;
@@ -803,6 +805,7 @@ public sealed class DiscordConversationCoordinator(
             };
             var handle = await provider.OpenAsync(await OpenRequestAsync(nextBinding, nextGeneration,
                 $"discord-clear:{binding.BindingId}:{nextGeneration}:{requestId}"), ct);
+            await MarkDeliveredAsOneMessageAsync(handle, ct);
             return await bindings.AdvanceGenerationAndAttachAsync(
                 binding, handle, requestId, ct, config.AgentId,
                 config.SessionQualityMode);
@@ -863,6 +866,7 @@ public sealed class DiscordConversationCoordinator(
         var handle = await ResolveProvider(config.AgentId).OpenAsync(await OpenRequestAsync(
             nextBinding, nextGeneration,
             $"discord-recover:{binding.BindingId}:{nextGeneration}:{binding.SessionId}", cause), ct);
+        await MarkDeliveredAsOneMessageAsync(handle, ct);
         // Waiting rows first: if the advance fails they are ahead of the binding, the next retry
         // finds the session lost again and finishes, whereas rows behind it would be stranded.
         await deliveries.MoveWaitingToGenerationAsync(
@@ -1494,12 +1498,55 @@ public sealed class DiscordConversationCoordinator(
     {
         var provider = ResolveProvider(binding.AgentId);
         if (binding.SessionId is not null && binding.ConversationHandleId is not null)
-            return (provider, ToHandle(binding, provider.ProviderId), binding);
+        {
+            // An existing binding's session was created before the option existed, or by an earlier run:
+            // it is marked here, so its next resume (the send that follows) launches without progress lines.
+            var existing = ToHandle(binding, provider.ProviderId);
+            await MarkDeliveredAsOneMessageAsync(existing, ct);
+            return (provider, existing, binding);
+        }
 
         var handle = await provider.OpenAsync(await OpenRequestAsync(binding, binding.Generation,
             $"discord-open:{binding.BindingId}:{binding.Generation}", cause), ct);
+        await MarkDeliveredAsOneMessageAsync(handle, ct);
         var attached = await bindings.AttachConversationAsync(binding, handle, ct);
         return (provider, handle, attached);
+    }
+
+    /// <summary>
+    /// Tells RedCompute that this session's output reaches Discord as one message, so the model is not
+    /// asked for progress lines (Claude Code's silent-turn reminder: its status sentence would become the
+    /// first line of the public reply). Persisted by RedCompute with the session and applied on every
+    /// launch, so a session that is running keeps its current process until it next resumes. Never blocks
+    /// a message: a failure is logged and retried on the next one.
+    /// </summary>
+    private async Task MarkDeliveredAsOneMessageAsync(ExternalConversationHandle handle, CancellationToken ct)
+    {
+        if (deliveredAsOneMessage.ContainsKey(handle.SessionId)) return;
+        try
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Put, $"/ai-session/sessions/{handle.SessionId}/delivery")
+            {
+                Content = JsonContent.Create(new { deliveredAsOneMessage = true }),
+            };
+            using var response = await compute.SendAsync(request, provenance: null, ct);
+            if (response.IsSuccessStatusCode)
+                deliveredAsOneMessage[handle.SessionId] = 0;
+            else
+                logger.LogWarning(
+                    "RedCompute did not accept the delivered-as-one-message option for session {SessionId} ({Status})",
+                    handle.SessionId, (int)response.StatusCode);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Could not set the delivered-as-one-message option for session {SessionId}", handle.SessionId);
+        }
     }
 
     /// <summary>

@@ -111,6 +111,83 @@ public sealed class DiscordCoordinatorTests
             provider.LastInput.Metadata?["discord_behavior"]?["instructions"]?.GetValue<string>());
     }
 
+    // A Discord reply is one message: the model's status sentence for a long silent turn (Claude Code's
+    // silent-turn reminder) would open the public answer. The bridge marks every session it uses, new or
+    // existing, before the send that may resume it.
+    [Fact]
+    public async Task A_new_session_is_marked_delivered_as_one_message_before_its_first_send()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var bindings = new DiscordBindingStore(entities);
+        var deliveries = new DiscordDeliveryStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", "owner-1",
+            "nova-discord-external", "participate"));
+        var provider = new FlakyProvider(false);
+        var sendsAtMark = -1;
+        var compute = new FakeComputeGateway { OnDelivery = () => sendsAtMark = provider.SendAttempts };
+        using var coordinator = Coordinator(entities, bindings, deliveries, provider, compute: compute);
+
+        await Submit(coordinator, binding, "1001", "general");
+
+        var mark = Assert.Single(compute.DeliveryRequests);
+        Assert.Equal("PUT", mark.Method);
+        Assert.EndsWith("/ai-session/sessions/session/delivery", mark.Uri, StringComparison.Ordinal);
+        Assert.True(JsonDocument.Parse(mark.Body).RootElement.GetProperty("deliveredAsOneMessage").GetBoolean());
+        Assert.Equal(0, sendsAtMark);
+        Assert.Equal(1, provider.SendAttempts);
+    }
+
+    [Fact]
+    public async Task An_existing_binding_is_marked_on_its_next_message_and_then_once_per_session()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var bindings = new DiscordBindingStore(entities);
+        var deliveries = new DiscordDeliveryStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", "owner-1",
+            "nova-discord-external", "participate"));
+        // A binding that predates the option: it already has its session.
+        var provider = new FlakyProvider(false);
+        await bindings.AttachConversationAsync(binding,
+            new ExternalConversationHandle("test", binding.BindingId, binding.Generation, "conversation", "old-session"));
+        var compute = new FakeComputeGateway();
+        using var coordinator = Coordinator(entities, bindings, deliveries, provider, compute: compute);
+
+        await Submit(coordinator, binding, "1001", "general");
+        await Submit(coordinator, binding, "1002", "general");
+
+        Assert.Equal(0, provider.OpenAttempts);
+        var mark = Assert.Single(compute.DeliveryRequests);
+        Assert.EndsWith("/ai-session/sessions/old-session/delivery", mark.Uri, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_refused_mark_never_blocks_the_message_and_is_retried_on_the_next_one()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var bindings = new DiscordBindingStore(entities);
+        var deliveries = new DiscordDeliveryStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", "owner-1",
+            "nova-discord-external", "participate"));
+        var provider = new FlakyProvider(false);
+        var compute = new FakeComputeGateway { DeliveryStatus = HttpStatusCode.NotFound };
+        using var coordinator = Coordinator(entities, bindings, deliveries, provider, compute: compute);
+
+        await Submit(coordinator, binding, "1001", "general");
+        await Submit(coordinator, binding, "1002", "general");
+
+        Assert.Equal(2, provider.SendAttempts);
+        Assert.Equal(2, compute.DeliveryRequests.Count);
+    }
+
     [Fact]
     public async Task Server_map_is_sent_in_full_once_then_referenced_until_it_changes()
     {
@@ -219,10 +296,11 @@ public sealed class DiscordCoordinatorTests
 
     private static DiscordConversationCoordinator Coordinator(
         MemoryEntityStore entities, DiscordBindingStore bindings,
-        DiscordDeliveryStore deliveries, FlakyProvider provider, TimeProvider? clock = null)
+        DiscordDeliveryStore deliveries, FlakyProvider provider, TimeProvider? clock = null,
+        FakeComputeGateway? compute = null)
         => new(bindings, deliveries, BotConfigurations(entities),
             new DiscordRuntimeOptionsResolver(entities), IdentityResolver(entities),
-            new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
+            compute ?? new FakeComputeGateway(), [provider], new PromptInjectionDetector(),
             new DiscordEgressGuard(), new DiscordTypingLeases(),
             NullLogger<DiscordConversationCoordinator>.Instance, TestSentinel.Clean, clock);
 
@@ -1271,12 +1349,23 @@ public sealed class DiscordCoordinatorTests
     {
         public bool InjectionAccepted { get; init; } = true;
         public List<(string Uri, string Body)> Requests { get; } = [];
+        // The delivered-as-one-message marks (PUT .../delivery), kept apart from the injections above.
+        public List<(string Method, string Uri, string Body)> DeliveryRequests { get; } = [];
+        public HttpStatusCode DeliveryStatus { get; init; } = HttpStatusCode.OK;
+        public Action? OnDelivery { get; init; }
 
         public async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             ComputeProvenance? provenance = null,
             CancellationToken ct = default)
         {
+            if (request.RequestUri?.ToString().EndsWith("/delivery", StringComparison.Ordinal) == true)
+            {
+                DeliveryRequests.Add((request.Method.Method, request.RequestUri.ToString(),
+                    request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct)));
+                OnDelivery?.Invoke();
+                return new HttpResponseMessage(DeliveryStatus) { Content = new StringContent("{}") };
+            }
             Requests.Add((
                 request.RequestUri?.ToString() ?? "",
                 request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct)));
