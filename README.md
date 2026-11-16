@@ -540,8 +540,12 @@ announcement, when it is a Discord reply to another message, or mentions the bot
 bot's managed integration role, or the guild's `Novas` role. Mentioning anyone else (a
 member, another bot, an ordinary role) does not change that.
 
-A host announcement never enters a native Agent binding. Everything else there is not
-forwarded. A member's message, or a host's conversation, takes the ordinary inbound path of a
+A host announcement never enters a native Agent binding. An edit is forwarded as an `update`
+only when the post is still a host announcement under the same rule and its `create` was
+forwarded (the bot's `announcement:{id}:create` ingest record exists), so an edit can neither
+turn conversation into an announcement nor update one Leaf Community never received; an
+announcement edited into conversation keeps its last relayed text. Everything else there is
+not forwarded. A member's message, or a host's conversation, takes the ordinary inbound path of a
 bound guild channel (binding, DM rules, behavior and response mode, mentions and replies,
 inbound Sentinel, typing), so the native Agent sees it and can answer a question asked under an
 announcement; a `silent-host` scope still keeps it out. A mention of the `Novas` role there is

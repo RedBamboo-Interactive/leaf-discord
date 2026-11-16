@@ -2911,8 +2911,12 @@ internal sealed class DiscordBotRuntime(
     /// relayed as an announcement and nobody answers it; anyone else posting there is not relayed
     /// and takes the ordinary inbound path, unless the scope silences the native Agent. Other
     /// postable scope channels relay every message, then hand webhooks to Envoy admission and
-    /// everyone else to the native Agent. An edit only ever re-relays a host announcement.
+    /// everyone else to the native Agent. An edit is never admitted and re-relays only a post
+    /// that is still a host announcement and whose create was relayed, so an edit can neither
+    /// turn conversation into an announcement nor update one the relay never received.
     /// </summary>
+    /// <param name="createRelayed">Edit only: the post's <c>announcement:{id}:create</c> was
+    /// queued for the relay.</param>
     internal static DiscordCommonsInboundRoute RouteCommonsInbound(
         bool inCommonsScope,
         bool announcements,
@@ -2921,10 +2925,11 @@ internal sealed class DiscordBotRuntime(
         MessageSource source,
         bool authorIsBot,
         bool suppressesNativeAgent,
-        bool edit = false)
+        bool edit = false,
+        bool createRelayed = false)
     {
         if (edit)
-            return new(inCommonsScope && announcements && announcementHost,
+            return new(inCommonsScope && announcements && announcementHost && createRelayed,
                 DiscordCommonsInboundNext.Stop);
         if (inCommonsScope && announcements)
             return announcementHost
@@ -3242,18 +3247,25 @@ internal sealed class DiscordBotRuntime(
         var scope = await commons.GetScopeAsync(configId, location.Value.GuildId);
         var inCommonsScope = scope is not null && scope.Contains(
             location.Value.ChannelId, location.Value.CategoryId);
+        var announcementHost = inCommonsScope && await IsAnnouncementHostAsync(message);
         var route = RouteCommonsInbound(
             inCommonsScope,
             true,
             false,
-            inCommonsScope && await IsAnnouncementHostAsync(message),
+            announcementHost,
             message.Source,
             message.Author.IsBot,
             scope?.SuppressesNativeAgent == true,
-            edit: true);
+            edit: true,
+            createRelayed: announcementHost && await commons.WasEnqueuedAsync(
+                configId, AnnouncementCreateEventId(message.Id)));
         if (route.Forward)
             await ForwardAnnouncementAsync(message, location.Value, "update", eventId);
     }
+
+    /// <summary>The relay event of an announcement's first post; its edits are relayed only after it.</summary>
+    internal static string AnnouncementCreateEventId(ulong messageId)
+        => $"announcement:{messageId}:create";
 
     /// <summary>Relays a host post in <c>#announcements</c>; the caller has decided it is one.</summary>
     private async Task ForwardAnnouncementAsync(
@@ -3264,7 +3276,7 @@ internal sealed class DiscordBotRuntime(
     {
         var nativeHost = message.Author.IsBot
             && message.Author.Id == client?.CurrentUser.Id;
-        var id = eventId ?? $"announcement:{message.Id}:create";
+        var id = eventId ?? AnnouncementCreateEventId(message.Id);
         await commons.EnqueueAsync(configId, location.GuildId, id,
             DiscordCommonsRelayService.BuildAnnouncementPayload(
                 id,

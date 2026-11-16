@@ -342,10 +342,11 @@ public sealed class DiscordCommonsTests
         bool inCommonsScope = true,
         bool announcements = true,
         bool canPostInLocation = true,
-        bool edit = false)
+        bool edit = false,
+        bool createRelayed = false)
         => DiscordBotRuntime.RouteCommonsInbound(
             inCommonsScope, announcements, canPostInLocation, announcementHost,
-            source, authorIsBot, suppressesNativeAgent, edit);
+            source, authorIsBot, suppressesNativeAgent, edit, createRelayed);
 
     [Fact]
     public void A_host_post_in_announcements_is_relayed_and_never_answered()
@@ -383,16 +384,77 @@ public sealed class DiscordCommonsTests
     public void An_announcement_edit_is_relayed_only_for_a_host_and_never_admitted()
     {
         Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
-            Route(announcementHost: true, edit: true));
+            Route(announcementHost: true, edit: true, createRelayed: true));
         Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
             Route(announcementHost: true, source: MessageSource.Bot, authorIsBot: true,
-                edit: true));
+                edit: true, createRelayed: true));
         Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
-            Route(edit: true));
+            Route(edit: true, createRelayed: true));
         Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
-            Route(source: MessageSource.Webhook, authorIsBot: true, edit: true));
+            Route(source: MessageSource.Webhook, authorIsBot: true, edit: true,
+                createRelayed: true));
         Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
-            Route(announcementHost: true, inCommonsScope: false, edit: true));
+            Route(announcementHost: true, inCommonsScope: false, edit: true,
+                createRelayed: true));
+    }
+
+    [Fact]
+    public void An_edit_relays_an_update_only_for_a_host_announcement_whose_create_was_relayed()
+    {
+        // Still an announcement, and the relay has its create: the update follows it.
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId), edit: true, createRelayed: true));
+        // Still an announcement, but its create never went (a conversation post edited to
+        // address nobody, or a post from before the scope): no update for an unknown create.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId), edit: true, createRelayed: false));
+        // The native bot's announcement follows the same rule.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, source: MessageSource.Bot, authorIsBot: true,
+                edit: true, createRelayed: false));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void An_edit_never_turns_conversation_into_an_announcement(bool createRelayed)
+    {
+        // createRelayed: true is the 16 Nov post, relayed by the old rule, then edited.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId, roles: [NovasRoleId]), edit: true,
+                createRelayed: createRelayed));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(ManagerId, users: [NativeBotId]), edit: true,
+                createRelayed: createRelayed));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId, repliesToMessage: true), edit: true,
+                createRelayed: createRelayed));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(MemberId), edit: true, createRelayed: createRelayed));
+    }
+
+    [Fact]
+    public async Task The_relayed_create_is_found_by_its_event_id_in_any_delivery_state()
+    {
+        var deliveries = new DiscordCommonsIngestStore(new MemoryEntityStore());
+        var botId = Guid.NewGuid();
+        var createId = DiscordBotRuntime.AnnouncementCreateEventId(1571775128134750239);
+        var payload = DiscordCommonsRelayService.BuildAnnouncementPayload(
+            createId, "1571775128134750239", "create", "human", "20", "Laurent",
+            "Release notes", "30", "announcements", 1_234);
+
+        Assert.Equal("announcement:1571775128134750239:create", createId);
+        Assert.False(await deliveries.ExistsAsync(botId, createId));
+
+        var queued = await deliveries.EnqueueAsync(botId, LabGuildId, createId, payload);
+        Assert.True(await deliveries.ExistsAsync(botId, createId));
+        await deliveries.MarkSentAsync(queued);
+        Assert.True(await deliveries.ExistsAsync(botId, createId));
+
+        Assert.False(await deliveries.ExistsAsync(Guid.NewGuid(), createId));
+        Assert.False(await deliveries.ExistsAsync(
+            botId, DiscordBotRuntime.AnnouncementCreateEventId(1571775128134750240)));
+        Assert.False(await deliveries.ExistsAsync(botId, ""));
     }
 
     [Fact]

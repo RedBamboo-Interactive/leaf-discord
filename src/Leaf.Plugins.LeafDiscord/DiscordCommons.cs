@@ -814,7 +814,7 @@ public sealed class DiscordCommonsIngestStore(IEntityStore store)
     {
         if (string.IsNullOrWhiteSpace(eventId) || eventId.Length > 200)
             throw new ArgumentException("A bounded Commons event ID is required.");
-        var slug = $"discord-commons-{Hash($"{botId:N}:{eventId}")}";
+        var slug = Slug(botId, eventId);
         var existing = await store.GetBySlugAsync(TypeSlug, slug, ct);
         if (existing is not null) return Map(existing);
         return Map(await store.UpsertBySlugAsync(TypeSlug, slug,
@@ -829,6 +829,18 @@ public sealed class DiscordCommonsIngestStore(IEntityStore store)
                 ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
             }, ct));
     }
+
+    /// <summary>
+    /// Whether this bot ever queued the event for the relay, whatever its delivery state. Rows are
+    /// never deleted, so an announcement's create is found for as long as it can be edited.
+    /// </summary>
+    public async Task<bool> ExistsAsync(
+        Guid botId, string eventId, CancellationToken ct = default)
+        => !string.IsNullOrWhiteSpace(eventId) && eventId.Length <= 200
+           && await store.GetBySlugAsync(TypeSlug, Slug(botId, eventId), ct) is not null;
+
+    private static string Slug(Guid botId, string eventId)
+        => $"discord-commons-{Hash($"{botId:N}:{eventId}")}";
 
     public async Task<IReadOnlyList<DiscordCommonsIngestDelivery>> PendingAsync(
         CancellationToken ct = default)
@@ -943,6 +955,11 @@ public sealed class DiscordCommonsRelayService(
         _ = await deliveries.EnqueueAsync(botId, guildId, eventId, payload, ct);
         try { signal.Release(); } catch (SemaphoreFullException) { }
     }
+
+    /// <summary>Whether the event was ever queued for the relay (see <see cref="DiscordCommonsIngestStore.ExistsAsync"/>).</summary>
+    public Task<bool> WasEnqueuedAsync(
+        Guid botId, string eventId, CancellationToken ct = default)
+        => deliveries.ExistsAsync(botId, eventId, ct);
 
     public async Task<IReadOnlyList<DiscordCommonsRelayEnvoy>> GetEnvoysAsync(
         Guid botId, string guildId, CancellationToken ct = default)
