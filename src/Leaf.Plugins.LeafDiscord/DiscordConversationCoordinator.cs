@@ -805,7 +805,7 @@ public sealed class DiscordConversationCoordinator(
             };
             var handle = await provider.OpenAsync(await OpenRequestAsync(nextBinding, nextGeneration,
                 $"discord-clear:{binding.BindingId}:{nextGeneration}:{requestId}"), ct);
-            await MarkDeliveredAsOneMessageAsync(handle, ct);
+            await MarkDeliveredAsOneMessageAsync(nextBinding, handle, ct);
             return await bindings.AdvanceGenerationAndAttachAsync(
                 binding, handle, requestId, ct, config.AgentId,
                 config.SessionQualityMode);
@@ -866,7 +866,7 @@ public sealed class DiscordConversationCoordinator(
         var handle = await ResolveProvider(config.AgentId).OpenAsync(await OpenRequestAsync(
             nextBinding, nextGeneration,
             $"discord-recover:{binding.BindingId}:{nextGeneration}:{binding.SessionId}", cause), ct);
-        await MarkDeliveredAsOneMessageAsync(handle, ct);
+        await MarkDeliveredAsOneMessageAsync(nextBinding, handle, ct);
         // Waiting rows first: if the advance fails they are ahead of the binding, the next retry
         // finds the session lost again and finishes, whereas rows behind it would be stranded.
         await deliveries.MoveWaitingToGenerationAsync(
@@ -1502,13 +1502,13 @@ public sealed class DiscordConversationCoordinator(
             // An existing binding's session was created before the option existed, or by an earlier run:
             // it is marked here, so its next resume (the send that follows) launches without progress lines.
             var existing = ToHandle(binding, provider.ProviderId);
-            await MarkDeliveredAsOneMessageAsync(existing, ct);
+            await MarkDeliveredAsOneMessageAsync(binding, existing, ct);
             return (provider, existing, binding);
         }
 
         var handle = await provider.OpenAsync(await OpenRequestAsync(binding, binding.Generation,
             $"discord-open:{binding.BindingId}:{binding.Generation}", cause), ct);
-        await MarkDeliveredAsOneMessageAsync(handle, ct);
+        await MarkDeliveredAsOneMessageAsync(binding, handle, ct);
         var attached = await bindings.AttachConversationAsync(binding, handle, ct);
         return (provider, handle, attached);
     }
@@ -1517,21 +1517,30 @@ public sealed class DiscordConversationCoordinator(
     /// Tells RedCompute that this session's output reaches Discord as one message, so the model is not
     /// asked for progress lines (Claude Code's silent-turn reminder: its status sentence would become the
     /// first line of the public reply). Persisted by RedCompute with the session and applied on every
-    /// launch, so a session that is running keeps its current process until it next resumes. Never blocks
-    /// a message: a failure is logged and retried on the next one.
+    /// launch, so a session that is running keeps its current process until it next resumes. A provider
+    /// without the setting (Codex, OpenCode: no such reminder) answers 422 not_supported, which is final.
+    /// Never blocks a message: any other failure is logged and retried on the next one.
     /// </summary>
-    private async Task MarkDeliveredAsOneMessageAsync(ExternalConversationHandle handle, CancellationToken ct)
+    private async Task MarkDeliveredAsOneMessageAsync(
+        DiscordBinding binding, ExternalConversationHandle handle, CancellationToken ct)
     {
         if (deliveredAsOneMessage.ContainsKey(handle.SessionId)) return;
         try
         {
+            // This often runs with no request or execution scope to inherit, so it states its own
+            // provenance; RedLeaf turns that into the signed execution identity a Compute write needs.
+            var provenance = await DiscordComputeProvenance.CreateAsync(
+                botConfigurations.EntityStore, binding.AgentId, binding.OwnerId,
+                [new ComputeContextReference("external-conversation", binding.BindingId),
+                 new ComputeContextReference("session", handle.SessionId)],
+                $"discord-delivery:{handle.SessionId}", ct);
             using var request = new HttpRequestMessage(
-                HttpMethod.Put, $"/ai-session/sessions/{handle.SessionId}/delivery")
+                HttpMethod.Put, $"/ai-session/sessions/{Uri.EscapeDataString(handle.SessionId)}/delivery")
             {
                 Content = JsonContent.Create(new { deliveredAsOneMessage = true }),
             };
-            using var response = await compute.SendAsync(request, provenance: null, ct);
-            if (response.IsSuccessStatusCode)
+            using var response = await compute.SendAsync(request, provenance, ct);
+            if (response.IsSuccessStatusCode || await IsNotSupportedAsync(response, ct))
                 deliveredAsOneMessage[handle.SessionId] = 0;
             else
                 logger.LogWarning(
@@ -1546,6 +1555,22 @@ public sealed class DiscordConversationCoordinator(
         {
             logger.LogWarning(ex,
                 "Could not set the delivered-as-one-message option for session {SessionId}", handle.SessionId);
+        }
+    }
+
+    /// <summary>RedCompute's answer for a provider that has no such setting: nothing to retry.</summary>
+    private static async Task<bool> IsNotSupportedAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        if ((int)response.StatusCode != 422) return false;
+        try
+        {
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+            return body.RootElement.TryGetProperty("error", out var error)
+                && string.Equals(error.GetString(), "not_supported", StringComparison.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 

@@ -136,6 +136,10 @@ public sealed class DiscordCoordinatorTests
         Assert.Equal("PUT", mark.Method);
         Assert.EndsWith("/ai-session/sessions/session/delivery", mark.Uri, StringComparison.Ordinal);
         Assert.True(JsonDocument.Parse(mark.Body).RootElement.GetProperty("deliveredAsOneMessage").GetBoolean());
+        // Signed as the bound Agent: the mark often runs with no request scope, and an unsigned write is refused.
+        Assert.NotNull(mark.Provenance);
+        Assert.Equal("agent", mark.Provenance!.Actor.Kind);
+        Assert.Contains(mark.Provenance.Context, item => item.Kind == "session" && item.Id == "session");
         Assert.Equal(0, sendsAtMark);
         Assert.Equal(1, provider.SendAttempts);
     }
@@ -164,6 +168,33 @@ public sealed class DiscordCoordinatorTests
         Assert.Equal(0, provider.OpenAttempts);
         var mark = Assert.Single(compute.DeliveryRequests);
         Assert.EndsWith("/ai-session/sessions/old-session/delivery", mark.Uri, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_provider_without_the_setting_is_asked_once_and_never_again()
+    {
+        var entities = new MemoryEntityStore();
+        await SeedQualityMode(entities);
+        var bindings = new DiscordBindingStore(entities);
+        var deliveries = new DiscordDeliveryStore(entities);
+        var binding = await bindings.CreateAsync(new CreateDiscordBinding(
+            "100000000000000001", "123456789012345678", "guild_channel",
+            "223456789012345678", null, "nova", "owner-1",
+            "nova-discord-external", "participate"));
+        var provider = new FlakyProvider(false);
+        // Codex and OpenCode have no silent-turn reminder: RedCompute answers 422 not_supported.
+        var compute = new FakeComputeGateway
+        {
+            DeliveryStatus = (HttpStatusCode)422,
+            DeliveryBody = "{\"error\":\"not_supported\",\"message\":\"Provider 'codex' does not support it\"}",
+        };
+        using var coordinator = Coordinator(entities, bindings, deliveries, provider, compute: compute);
+
+        await Submit(coordinator, binding, "1001", "general");
+        await Submit(coordinator, binding, "1002", "general");
+
+        Assert.Single(compute.DeliveryRequests);
+        Assert.Equal(2, provider.SendAttempts);
     }
 
     [Fact]
@@ -1350,8 +1381,9 @@ public sealed class DiscordCoordinatorTests
         public bool InjectionAccepted { get; init; } = true;
         public List<(string Uri, string Body)> Requests { get; } = [];
         // The delivered-as-one-message marks (PUT .../delivery), kept apart from the injections above.
-        public List<(string Method, string Uri, string Body)> DeliveryRequests { get; } = [];
+        public List<(string Method, string Uri, string Body, ComputeProvenance? Provenance)> DeliveryRequests { get; } = [];
         public HttpStatusCode DeliveryStatus { get; init; } = HttpStatusCode.OK;
+        public string DeliveryBody { get; init; } = "{}";
         public Action? OnDelivery { get; init; }
 
         public async Task<HttpResponseMessage> SendAsync(
@@ -1362,9 +1394,9 @@ public sealed class DiscordCoordinatorTests
             if (request.RequestUri?.ToString().EndsWith("/delivery", StringComparison.Ordinal) == true)
             {
                 DeliveryRequests.Add((request.Method.Method, request.RequestUri.ToString(),
-                    request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct)));
+                    request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct), provenance));
                 OnDelivery?.Invoke();
-                return new HttpResponseMessage(DeliveryStatus) { Content = new StringContent("{}") };
+                return new HttpResponseMessage(DeliveryStatus) { Content = new StringContent(DeliveryBody) };
             }
             Requests.Add((
                 request.RequestUri?.ToString() ?? "",
