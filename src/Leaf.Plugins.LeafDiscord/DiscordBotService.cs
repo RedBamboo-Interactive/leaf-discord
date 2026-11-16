@@ -2626,8 +2626,9 @@ internal sealed class DiscordBotRuntime(
         }
         if (message.Author.IsBot || message.Source == MessageSource.Webhook) return;
         await ObserveOwnerLinkAsync();
-        // A mention of the Novas role in a relayed Leaf Community channel is an open invitation.
-        var openInvitation = route.Forward && !announcements
+        // A mention of the Novas role is an open invitation in a relayed Leaf Community channel,
+        // and in #announcements when the post is conversation rather than an announcement.
+        var openInvitation = BroadcastMentionInvites(inCommonsScope, announcements, route.Forward)
             && DiscordCommonsBroadcast.Mentions(
                 message.Content,
                 message.MentionedRoleIds.Select(id => id.ToString()),
@@ -2798,10 +2799,14 @@ internal sealed class DiscordBotRuntime(
 
     /// <summary>
     /// Who may announce to Leaf Community from <c>#announcements</c>: the registered native bot,
-    /// or a human who owns the guild or holds Manage Server or Administrator in it, in a
-    /// top-level post. That human's Discord reply to another message is conversation. Other
-    /// bots, webhooks and ordinary members never announce.
+    /// or a human who owns the guild or holds Manage Server or Administrator in it, in a post
+    /// that addresses nobody. That human talks to Nova there too: a Discord reply to another
+    /// message, or a post that <paramref name="addressesNova"/>, is conversation. Other bots,
+    /// webhooks and ordinary members never announce. The native bot's own posts are decided by
+    /// their outbound delivery (<see cref="IsNativeAnnouncementPost"/>), not by what they mention.
     /// </summary>
+    /// <param name="addressesNova">The post mentions the bot, its managed role or the guild's
+    /// Novas role (<see cref="AddressesNova"/>).</param>
     internal static bool IsAnnouncementHost(
         MessageSource source,
         bool authorIsBot,
@@ -2809,14 +2814,42 @@ internal sealed class DiscordBotRuntime(
         ulong? nativeBotId,
         bool authorOwnsGuild,
         GuildPermissions authorPermissions,
-        bool repliesToMessage)
+        bool repliesToMessage,
+        bool addressesNova)
         => source != MessageSource.Webhook
            && (authorIsBot
                ? nativeBotId is not null && authorId == nativeBotId.Value
                : !repliesToMessage
+                 && !addressesNova
                  && (authorOwnsGuild
                      || authorPermissions.ManageGuild
                      || authorPermissions.Administrator));
+
+    /// <summary>
+    /// Whether a post speaks to Nova: it mentions the bot user or the bot's managed integration
+    /// role (<see cref="MentionsBot(IEnumerable{ulong}, IEnumerable{ulong}, ulong, Func{ulong, ulong?})"/>),
+    /// or the guild's Novas broadcast role (<see cref="DiscordCommonsBroadcast.Mentions"/>).
+    /// </summary>
+    internal static bool AddressesNova(
+        IEnumerable<ulong> mentionedUserIds,
+        IReadOnlyCollection<ulong> mentionedRoleIds,
+        string? content,
+        ulong? botUserId,
+        Func<ulong, ulong?> roleBotId,
+        string? broadcastRoleId)
+        => (botUserId is { } bot
+               && MentionsBot(mentionedUserIds, mentionedRoleIds, bot, roleBotId))
+           || DiscordCommonsBroadcast.Mentions(
+               content, mentionedRoleIds.Select(id => id.ToString()), broadcastRoleId);
+
+    /// <summary>
+    /// Whether a mention of the Novas role is an open invitation to the native Agent: in a Leaf
+    /// Community scope, in a channel that relays the post, or in <c>#announcements</c> when the
+    /// post is not relayed there as an announcement (a host or member talking to Nova).
+    /// </summary>
+    internal static bool BroadcastMentionInvites(
+        bool inCommonsScope, bool announcements, bool relayed)
+        => inCommonsScope && (announcements ? !relayed : relayed);
 
     /// <summary>
     /// How long the native bot's own post may wait for its outbound delivery to record the
@@ -2844,7 +2877,7 @@ internal sealed class DiscordBotRuntime(
         {
             if (!IsAnnouncementHost(
                     message.Source, true, message.Author.Id, client?.CurrentUser?.Id,
-                    false, GuildPermissions.None, false))
+                    false, GuildPermissions.None, false, false))
                 return false;
             return IsNativeAnnouncementPost(
                     await deliveries.SentAsAnnouncementAsync(message.Id.ToString()),
@@ -2857,11 +2890,20 @@ internal sealed class DiscordBotRuntime(
         // who already left holds no permission here.
         var member = message.Author as IGuildUser
             ?? await guild.GetUserAsync(message.Author.Id, CacheMode.AllowDownload);
+        var socketGuild = client?.GetGuild(guild.Id);
         return IsAnnouncementHost(
             message.Source, false, message.Author.Id, client?.CurrentUser?.Id,
             guild.OwnerId == message.Author.Id,
             member?.GuildPermissions ?? GuildPermissions.None,
-            message.Reference is not null);
+            message.Reference is not null,
+            AddressesNova(
+                message.MentionedUserIds,
+                message.MentionedRoleIds,
+                message.Content,
+                client?.CurrentUser?.Id,
+                roleId => socketGuild?.GetRole(roleId)?.Tags?.BotId,
+                (await commons.GetConfigurationAsync(configId))
+                    ?.BroadcastRoleId(guild.Id.ToString())));
     }
 
     /// <summary>
@@ -3794,23 +3836,27 @@ internal sealed class DiscordBotRuntime(
     }
 
     /// <summary>
-    /// A human message that mentions the Novas role in a relayed Leaf Community channel: the same
-    /// test as live admission, for a message read back after a restart.
+    /// A human message that mentions the Novas role where that is an open invitation: the same
+    /// test as live admission, for a message read back after a restart. In
+    /// <c>#announcements</c> such a mention makes even a host's post conversation, so it is
+    /// never relayed there.
     /// </summary>
     private async Task<bool> MentionsCommonsBroadcastAsync(IUserMessage message)
     {
         if (message.Author.IsBot || message.Source == MessageSource.Webhook
-            || CommonsLocation(message.Channel) is not { } location
-            || IsAnnouncements(location.Channel)
-            || !CanPostInCommonsLocation(message.Channel))
+            || CommonsLocation(message.Channel) is not { } location)
             return false;
+        var announcements = IsAnnouncements(location.Channel);
         var config = await commons.GetConfigurationAsync(configId);
-        return config?.Scope(location.GuildId) is { } scope
-            && scope.Contains(location.ChannelId, location.CategoryId)
+        return BroadcastMentionInvites(
+                config?.Scope(location.GuildId) is { } scope
+                    && scope.Contains(location.ChannelId, location.CategoryId),
+                announcements,
+                relayed: !announcements && CanPostInCommonsLocation(message.Channel))
             && DiscordCommonsBroadcast.Mentions(
                 message.Content,
                 message.MentionedRoleIds.Select(id => id.ToString()),
-                config.BroadcastRoleId(location.GuildId));
+                config?.BroadcastRoleId(location.GuildId));
     }
 
     internal static CreateDiscordBinding? BuildExistingDmBackfill(

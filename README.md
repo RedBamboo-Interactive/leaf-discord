@@ -462,8 +462,9 @@ retries with the role it already recorded. Mentioning `@Novas` is an open invita
 Agent in the community, each free to stay silent:
 
 - The relay invites every active Envoy (see its protocol, "Open invitations").
-- The native Agent admits a human's `@Novas` message in a relayed Leaf Community channel even
-  when the binding's response mode is `direct`; `context_only` and disabled bindings still
+- The native Agent admits a human's `@Novas` message in a relayed Leaf Community channel, or in
+  that scope's `#announcements` (where such a message is never relayed: only the native Agent
+  hears it), even when the binding's response mode is `direct`; `context_only` and disabled bindings still
   never answer. Unless the message also mentions or replies to the bot, it does not start the
   immediate typing indicator, and its behavior block carries `open_invitation: true` with
   `response_mode: "selective"` (the owner's mode kept as `owner_response_mode`), the mode in
@@ -531,15 +532,20 @@ create/update events:
 
 - a native bot post sent through binding outreach with `"announcement": true` (see "Stating
   an announcement" below), which is how Release Manager posts (`native_host`);
-- a top-level post by a human who owns the guild or holds Manage Server or Administrator
-  there (`human`).
+- a post that addresses nobody by a human who owns the guild or holds Manage Server or
+  Administrator there (`human`).
 
-A host announcement never enters a native Agent binding, and an edit re-forwards it because
-it follows the same rule. Everything else there is not forwarded. A member's message, or a
-host's Discord reply to another message, takes the ordinary inbound path of a bound guild
-channel (binding, DM rules, behavior and response mode, mentions and replies, inbound
-Sentinel, typing), so the native Agent sees it and can answer a question asked under an
-announcement; a `silent-host` scope still keeps it out. Other bots and all webhooks there
+A host talks to Nova in that channel too, so a host's post is conversation, not an
+announcement, when it is a Discord reply to another message, or mentions the bot user, the
+bot's managed integration role, or the guild's `Novas` role. Mentioning anyone else (a
+member, another bot, an ordinary role) does not change that.
+
+A host announcement never enters a native Agent binding. Everything else there is not
+forwarded. A member's message, or a host's conversation, takes the ordinary inbound path of a
+bound guild channel (binding, DM rules, behavior and response mode, mentions and replies,
+inbound Sentinel, typing), so the native Agent sees it and can answer a question asked under an
+announcement; a `silent-host` scope still keeps it out. A mention of the `Novas` role there is
+an open invitation, as in a relayed channel. Other bots and all webhooks there
 are ignored. Every other native bot post is conversation, never an announcement: outreach
 without the flag (an owner discussion answering someone), the channel's own session
 (answers, tool progress, bridge notices), and a post no outbound delivery recorded. Because

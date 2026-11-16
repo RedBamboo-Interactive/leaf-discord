@@ -143,26 +143,195 @@ public sealed class DiscordCommonsTests
     {
         Assert.Equal(expected, DiscordBotRuntime.IsAnnouncementHost(
             source, authorIsBot, authorId, NativeBotId, ownsGuild,
-            new GuildPermissions(permissions), repliesToMessage));
+            new GuildPermissions(permissions), repliesToMessage, addressesNova: false));
     }
 
     [Fact]
     public void No_native_bot_identity_means_no_bot_announces()
     {
         Assert.False(DiscordBotRuntime.IsAnnouncementHost(
-            MessageSource.Bot, true, NativeBotId, null, false, GuildPermissions.None, false));
+            MessageSource.Bot, true, NativeBotId, null, false, GuildPermissions.None, false, false));
     }
 
     [Fact]
     public void A_host_reply_in_announcements_takes_the_member_path()
     {
         var hostReply = DiscordBotRuntime.IsAnnouncementHost(
-            MessageSource.User, false, 20, NativeBotId, true, GuildPermissions.All, true);
+            MessageSource.User, false, 20, NativeBotId, true, GuildPermissions.All, true, false);
 
         Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
             Route(announcementHost: hostReply));
         Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
             Route(announcementHost: hostReply, edit: true));
+    }
+
+    // Roles in the addressing matrix: the native bot's managed integration role, another bot's
+    // managed role, the guild's Novas broadcast role, and an ordinary role.
+    private const ulong NativeBotRoleId = 990;
+    private const ulong OtherBotRoleId = 980;
+    private const ulong NovasRoleId = 555;
+    private const ulong OrdinaryRoleId = 970;
+    private const ulong OwnerId = 20;
+    private const ulong ManagerId = 21;
+    private const ulong AdministratorId = 22;
+    private const ulong MemberId = 23;
+
+    private static readonly IReadOnlyDictionary<ulong, ulong?> RoleBots = new Dictionary<ulong, ulong?>
+    {
+        [NativeBotRoleId] = NativeBotId,
+        [OtherBotRoleId] = 98,
+        [NovasRoleId] = null,
+        [OrdinaryRoleId] = null,
+    };
+
+    /// <summary>The create and edit paths' decision, from what Discord reports about a post.</summary>
+    private static bool Hosts(
+        ulong authorId,
+        bool repliesToMessage = false,
+        ulong[]? users = null,
+        ulong[]? roles = null,
+        string content = "Release notes",
+        MessageSource source = MessageSource.User,
+        bool authorIsBot = false,
+        string? broadcastRoleId = "555")
+    {
+        var permissions = authorId switch
+        {
+            ManagerId => new GuildPermissions((ulong)GuildPermission.ManageGuild),
+            AdministratorId => new GuildPermissions((ulong)GuildPermission.Administrator),
+            MemberId => new GuildPermissions((ulong)GuildPermission.SendMessages),
+            _ => GuildPermissions.None,
+        };
+        return DiscordBotRuntime.IsAnnouncementHost(
+            source, authorIsBot, authorId, NativeBotId, authorId == OwnerId, permissions,
+            repliesToMessage,
+            DiscordBotRuntime.AddressesNova(
+                users ?? [], roles ?? [], content, NativeBotId,
+                roleId => RoleBots.GetValueOrDefault(roleId), broadcastRoleId));
+    }
+
+    [Theory]
+    [InlineData(OwnerId)]
+    [InlineData(ManagerId)]
+    [InlineData(AdministratorId)]
+    public void A_host_post_that_addresses_nobody_is_an_announcement(ulong host)
+    {
+        Assert.True(Hosts(host));
+        // Mentioning someone other than Nova still addresses nobody Nova must hear.
+        Assert.True(Hosts(host, users: [MemberId]));
+        Assert.True(Hosts(host, roles: [OrdinaryRoleId]));
+        Assert.True(Hosts(host, roles: [OtherBotRoleId]));
+    }
+
+    [Theory]
+    [InlineData(OwnerId)]
+    [InlineData(ManagerId)]
+    [InlineData(AdministratorId)]
+    public void A_host_post_that_addresses_nova_is_conversation(ulong host)
+    {
+        Assert.False(Hosts(host, users: [NativeBotId]));
+        Assert.False(Hosts(host, roles: [NativeBotRoleId]));
+        Assert.False(Hosts(host, roles: [NovasRoleId]));
+        // A Novas mention written raw, as Discord may not have parsed it.
+        Assert.False(Hosts(host, content: "That's a lazy patch note. <@&555>. Please revisit."));
+        Assert.False(Hosts(host, users: [MemberId, NativeBotId], roles: [OrdinaryRoleId]));
+        Assert.False(Hosts(host, repliesToMessage: true));
+    }
+
+    [Fact]
+    public void The_16_Nov_complaint_to_nova_is_not_an_announcement()
+    {
+        // The owner's top-level post that pinged the Novas role, relayed to every Envoy that day.
+        Assert.False(Hosts(OwnerId, roles: [NovasRoleId],
+            content: "That's a lazy patch note. <@&555>. Please revisit."));
+    }
+
+    [Fact]
+    public void Without_a_recorded_Novas_role_only_the_bot_and_its_role_address_nova()
+    {
+        Assert.True(Hosts(OwnerId, roles: [NovasRoleId], broadcastRoleId: null));
+        Assert.False(Hosts(OwnerId, users: [NativeBotId], broadcastRoleId: null));
+        Assert.False(Hosts(OwnerId, roles: [NativeBotRoleId], broadcastRoleId: null));
+    }
+
+    [Fact]
+    public void Members_never_announce_whether_or_not_they_address_nova()
+    {
+        Assert.False(Hosts(MemberId));
+        Assert.False(Hosts(MemberId, users: [NativeBotId]));
+        Assert.False(Hosts(MemberId, roles: [NovasRoleId]));
+        Assert.False(Hosts(MemberId, repliesToMessage: true));
+    }
+
+    [Fact]
+    public void Bots_and_webhooks_are_decided_as_before_whatever_they_mention()
+    {
+        // The native bot is a host here; its delivery's announcement flag decides afterwards.
+        Assert.True(Hosts(NativeBotId, source: MessageSource.Bot, authorIsBot: true));
+        Assert.True(Hosts(NativeBotId, source: MessageSource.Bot, authorIsBot: true,
+            roles: [NovasRoleId]));
+        Assert.True(Hosts(NativeBotId, source: MessageSource.Bot, authorIsBot: true,
+            users: [NativeBotId]));
+        Assert.False(Hosts(98, source: MessageSource.Bot, authorIsBot: true));
+        Assert.False(Hosts(97, source: MessageSource.Webhook, authorIsBot: true));
+        Assert.False(Hosts(NativeBotId, source: MessageSource.Webhook, authorIsBot: true));
+    }
+
+    [Fact]
+    public void A_host_addressing_nova_in_announcements_reaches_the_participate_binding()
+    {
+        var route = Route(announcementHost: Hosts(OwnerId, users: [NativeBotId]));
+
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            route);
+        Assert.True(DiscordBotRuntime.ShouldAdmitMessage(
+            "guild_channel", DiscordResponseModes.Participate, mentioned: true,
+            repliesToBot: false));
+        // The bot's managed role is the same address as the bot.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            Route(announcementHost: Hosts(ManagerId, roles: [NativeBotRoleId])));
+        // A silent host still keeps the native Agent out, as for a member.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId, users: [NativeBotId]),
+                suppressesNativeAgent: true));
+    }
+
+    [Theory]
+    [InlineData(OwnerId)]
+    [InlineData(AdministratorId)]
+    [InlineData(MemberId)]
+    public void A_novas_mention_in_announcements_is_admitted_as_an_open_invitation(ulong author)
+    {
+        var route = Route(announcementHost: Hosts(author, roles: [NovasRoleId]));
+        var invites = DiscordBotRuntime.BroadcastMentionInvites(true, true, route.Forward);
+
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.NativeAgent),
+            route);
+        Assert.True(invites);
+        Assert.True(DiscordBotRuntime.ShouldAdmitMessage(
+            "guild_channel", DiscordResponseModes.Participate, false, false, invites));
+        // Even a direct-mode binding hears it, exactly as in a relayed channel.
+        Assert.True(DiscordBotRuntime.ShouldAdmitMessage(
+            "guild_channel", DiscordResponseModes.Direct, false, false, invites));
+        Assert.True(DiscordBotRuntime.InboundBehaviorContext(
+            new DiscordBehavior(
+                null, Guid.NewGuid(), DiscordBehaviorScopes.Guild, LabGuildId, null,
+                DiscordResponseModes.Participate, null, "", true), false, false, invites)
+                ["open_invitation"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void A_novas_mention_invites_only_where_it_did_outside_announcements()
+    {
+        // Relayed scope channel: an invitation, as before.
+        Assert.True(DiscordBotRuntime.BroadcastMentionInvites(true, false, relayed: true));
+        // A scope channel the bot cannot post in relays nothing and invites nobody, as before.
+        Assert.False(DiscordBotRuntime.BroadcastMentionInvites(true, false, relayed: false));
+        // Outside a scope, nothing is an invitation, #announcements included.
+        Assert.False(DiscordBotRuntime.BroadcastMentionInvites(false, false, relayed: false));
+        Assert.False(DiscordBotRuntime.BroadcastMentionInvites(false, true, relayed: false));
+        // A relayed announcement is never conversation.
+        Assert.False(DiscordBotRuntime.BroadcastMentionInvites(true, true, relayed: true));
     }
 
     private static DiscordCommonsInboundRoute Route(
