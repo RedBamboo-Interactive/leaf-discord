@@ -343,10 +343,11 @@ public sealed class DiscordCommonsTests
         bool announcements = true,
         bool canPostInLocation = true,
         bool edit = false,
-        bool createRelayed = false)
+        bool createRelayed = false,
+        bool retracted = false)
         => DiscordBotRuntime.RouteCommonsInbound(
             inCommonsScope, announcements, canPostInLocation, announcementHost,
-            source, authorIsBot, suppressesNativeAgent, edit, createRelayed);
+            source, authorIsBot, suppressesNativeAgent, edit, createRelayed, retracted);
 
     [Fact]
     public void A_host_post_in_announcements_is_relayed_and_never_answered()
@@ -431,6 +432,27 @@ public sealed class DiscordCommonsTests
                 createRelayed: createRelayed));
         Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
             Route(announcementHost: Hosts(MemberId), edit: true, createRelayed: createRelayed));
+    }
+
+    [Fact]
+    public void An_edit_after_a_retraction_is_never_relayed()
+    {
+        // A host announcement whose create was relayed and then retracted stays retracted,
+        // whoever posted it, however it is edited.
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId), edit: true, createRelayed: true,
+                retracted: true));
+        Assert.Equal(new DiscordCommonsInboundRoute(false, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: true, source: MessageSource.Bot, authorIsBot: true,
+                edit: true, createRelayed: true, retracted: true));
+        // Without the retraction the same edit is relayed: the retraction alone stops it.
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId), edit: true, createRelayed: true,
+                retracted: false));
+        // It concerns edits only: a post's create is queued once, by its event ID, and the
+        // retraction can only follow it.
+        Assert.Equal(new DiscordCommonsInboundRoute(true, DiscordCommonsInboundNext.Stop),
+            Route(announcementHost: Hosts(OwnerId), retracted: true));
     }
 
     [Fact]

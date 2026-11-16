@@ -28,6 +28,12 @@ public sealed class DiscordGatewayInboxStore(IEntityStore store)
 {
     public const string TypeSlug = "leaf-discord-gateway-inbox";
 
+    /// <summary>
+    /// A message deleted in <c>#announcements</c>. Unlike the other kinds it is never refetched
+    /// (Discord no longer has it): its coordinates are all it needs.
+    /// </summary>
+    public const string AnnouncementDeleteKind = "announcement-delete";
+
     public async Task<DiscordGatewayInboxItem> EnqueueAsync(
         Guid botId,
         string messageId,
@@ -39,7 +45,7 @@ public sealed class DiscordGatewayInboxStore(IEntityStore store)
     {
         if (!ulong.TryParse(messageId, out _) || !ulong.TryParse(channelId, out _))
             throw new ArgumentException("Discord inbox coordinates must be snowflakes.");
-        if (kind is not ("message" or "announcement-update"))
+        if (kind is not ("message" or "announcement-update" or AnnouncementDeleteKind))
             throw new ArgumentException("Unknown Discord inbox event kind.", nameof(kind));
         eventId ??= messageId;
         if (string.IsNullOrWhiteSpace(eventId) || eventId.Length > 200)

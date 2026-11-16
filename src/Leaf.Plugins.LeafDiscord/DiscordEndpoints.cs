@@ -48,6 +48,9 @@ public sealed record DiscordForumPostRequest(
     string Content,
     string IdempotencyKey);
 public sealed record DiscordAvatarRequest(string AssetId);
+
+/// <summary>An optional reason for retracting an announcement: audited, never relayed.</summary>
+public sealed record DiscordAnnouncementRetractRequest(string? Reason = null);
 public sealed record DiscordBehaviorRequest(
     string Scope,
     string ResponseMode,
@@ -802,6 +805,22 @@ public static class DiscordEndpoints
             }
         })
             .WithSummary("Saves the Leaf Community configuration for a bot. Owner or administrator only.");
+
+        group.MapPost("/bots/{id:guid}/announcements/{messageId}/retract", async (
+            Guid id,
+            string messageId,
+            DiscordAnnouncementRetractRequest? request,
+            HttpContext http,
+            IAuthContext auth,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordCommonsRelayService commons,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+            await RetractAnnouncementAsync(
+                id, messageId, request, http, auth, configurations, agents, commons,
+                bot.FindAnnouncementsChannelIdAsync, DateTimeOffset.UtcNow, ct))
+            .WithSummary("Retracts an announcement this bot relayed from a Leaf Community #announcements to Leaf Community (messageId is the Discord message snowflake): queues announcement:{messageId}:retract for the relay, which drops it from every Envoy's inbox and has Leaf Community delete its digest; its later edits are never relayed. Optional body { reason } is only audited. Idempotent: a repeat returns the existing retraction. Returns messageId, eventId and the delivery state of the create and retract events; 404 when the bot never relayed that message. For a signed private Agent discussion of the bot's Agent with its owner as beneficiary, or the owner or an administrator directly; never from a Discord session.");
 
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/channels", async (
             Guid id,
@@ -2721,6 +2740,104 @@ public static class DiscordEndpoints
         {
             gate.Release();
         }
+    }
+
+    /// <summary>
+    /// Retracts a relayed announcement (Retraction Contract v1). The bot's owner decides: from a
+    /// signed private discussion of the bot's own Agent on the owner's behalf, or directly as
+    /// the owner or an administrator. Every other signed session, a Discord one above all, is
+    /// refused, whatever roles its token carries. The retraction needs the bot's
+    /// <c>announcement:{id}:create</c> row and goes to that row's guild; the channel comes from
+    /// the row, or for a row sent before channels were recorded, from the guild's
+    /// <c>#announcements</c> as the connected bot sees it.
+    /// </summary>
+    internal static async Task<IResult> RetractAnnouncementAsync(
+        Guid id,
+        string messageId,
+        DiscordAnnouncementRetractRequest? request,
+        HttpContext http,
+        IAuthContext auth,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        DiscordCommonsRelayService commons,
+        Func<Guid, string?, CancellationToken, Task<string?>> findAnnouncementsChannel,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        DiscordAnnouncementRetractionAudit audit;
+        if (string.Equals(http.User.FindFirst("token_use")?.Value, "execution",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var caller = ReadPrivateLeafAgentCaller(http);
+            if (caller is null)
+                return Forbidden("A signed private Nova Agent discussion is required; a Discord session cannot retract an announcement.");
+            var config = await configurations.GetAsync(id, ct);
+            if (config is null) return Results.NotFound();
+            var agent = await agents.ResolveAsync(config.AgentId, ct);
+            if (!MatchesBotOwnerAndAgent(caller, config, agent?.Id.ToString()))
+                return Forbidden("This Agent cannot address that Discord bot.");
+            audit = new("agent", caller.ActorEntityId, caller.BeneficiaryId,
+                caller.DiscussionId, request?.Reason);
+        }
+        else
+        {
+            if (!IsAdmin(auth) || string.IsNullOrWhiteSpace(auth.UserId))
+                return Forbidden("An authenticated owner or administrator is required.");
+            var config = await configurations.GetAsync(id, ct);
+            if (config is null) return Results.NotFound();
+            if (!CanManageBot(auth, config))
+                return Forbidden("You cannot manage this Discord bot.");
+            audit = new("user", auth.UserId, Reason: request?.Reason);
+        }
+        if (!ulong.TryParse(messageId, out var snowflake) || snowflake == 0)
+            return Results.BadRequest(new
+            {
+                error = "invalid_announcement_message_id",
+                message = "messageId must be the Discord message snowflake.",
+            });
+        if (request?.Reason is { } reason
+            && reason.Trim().Length > DiscordAnnouncementRetractionAudit.MaxReasonLength)
+            return Results.BadRequest(new
+            {
+                error = "invalid_retraction_reason",
+                message = $"reason is limited to {DiscordAnnouncementRetractionAudit.MaxReasonLength} characters.",
+            });
+        DiscordAnnouncementRetraction? retraction;
+        try
+        {
+            retraction = await commons.RetractAnnouncementAsync(
+                id, snowflake.ToString(),
+                (guildId, token) => findAnnouncementsChannel(id, guildId, token),
+                audit, now, ct);
+        }
+        catch (InvalidOperationException)
+        {
+            return Results.Json(new
+            {
+                error = "announcement_channel_unknown",
+                message = "The announcement's relay record does not keep its channel, and the connected bot could not find the guild's #announcements; nothing was queued.",
+            }, statusCode: StatusCodes.Status409Conflict);
+        }
+        if (retraction is null)
+            return Results.NotFound(new
+            {
+                error = "announcement_not_relayed",
+                message = "This bot never relayed an announcement with that Discord message ID.",
+            });
+        return Results.Ok(new
+        {
+            ok = true,
+            messageId = retraction.MessageId,
+            eventId = retraction.Retract.EventId,
+            alreadyRetracted = !retraction.Queued,
+            create = new { eventId = retraction.Create.EventId, state = retraction.Create.State },
+            retract = new
+            {
+                eventId = retraction.Retract.EventId,
+                state = retraction.Retract.State,
+                attempts = retraction.Retract.Attempts,
+            },
+        });
     }
 
     private static async Task<IResult?> AuthorizeBotAgentAsync(

@@ -383,6 +383,18 @@ public sealed class DiscordBotService(
         return runtime.ListGuildChannels();
     }
 
+    /// <summary>See <see cref="DiscordBotRuntime.FindAnnouncementsChannelIdAsync"/>.</summary>
+    public async Task<string?> FindAnnouncementsChannelIdAsync(
+        Guid botId, string? guildId, CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.FindAnnouncementsChannelIdAsync(guildId, ct);
+    }
+
     public async Task<IReadOnlyList<JsonObject>> ListGuildNavigationAsync(
         Guid botId, CancellationToken ct = default)
     {
@@ -863,6 +875,29 @@ internal sealed class DiscordBotRuntime(
             .OrderBy(channel => channel.GuildName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(channel => channel.ChannelName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    /// <summary>
+    /// The guild's Leaf Community <c>#announcements</c> text channel, when exactly one in its
+    /// scope has that name; null when there is none or several, or the guild is not known.
+    /// </summary>
+    public async Task<string?> FindAnnouncementsChannelIdAsync(
+        string? guildId, CancellationToken ct = default)
+    {
+        var current = client
+            ?? throw new InvalidOperationException("Discord bot is not connected.");
+        if (!ulong.TryParse(guildId, out var parsedGuildId)
+            || current.GetGuild(parsedGuildId) is not { } guild
+            || await commons.GetScopeAsync(configId, guildId, ct) is not { } scope)
+            return null;
+        var matches = guild.TextChannels
+            .Where(channel => channel is not SocketThreadChannel
+                && IsAnnouncements(channel.Name)
+                && scope.Contains(channel.Id.ToString(), channel.CategoryId?.ToString()))
+            .Select(channel => channel.Id.ToString())
+            .Take(2)
+            .ToArray();
+        return matches.Length == 1 ? matches[0] : null;
     }
 
     public async Task<IReadOnlyList<JsonObject>> ListGuildNavigationAsync(CancellationToken ct = default)
@@ -1933,6 +1968,8 @@ internal sealed class DiscordBotRuntime(
             next.Ready += readyHandler;
             next.MessageReceived += OnMessageAsync;
             next.MessageUpdated += OnMessageUpdatedAsync;
+            next.MessageDeleted += OnMessageDeletedAsync;
+            next.MessagesBulkDeleted += OnMessagesBulkDeletedAsync;
             next.ReactionAdded += OnReactionAddedAsync;
             next.SlashCommandExecuted += OnSlashCommandAsync;
             next.UserLeft += OnGuildMemberLeftAsync;
@@ -2571,6 +2608,64 @@ internal sealed class DiscordBotRuntime(
             $"announcement:{message.Id}:update:{editedAt.ToUnixTimeMilliseconds()}");
     }
 
+    private Task OnMessageDeletedAsync(
+        Cacheable<IMessage, ulong> message, Cacheable<IMessageChannel, ulong> channel)
+        => EnqueueAnnouncementDeletionsAsync([message.Id], channel);
+
+    private Task OnMessagesBulkDeletedAsync(
+        IReadOnlyCollection<Cacheable<IMessage, ulong>> messages,
+        Cacheable<IMessageChannel, ulong> channel)
+        => EnqueueAnnouncementDeletionsAsync(messages.Select(message => message.Id), channel);
+
+    /// <summary>
+    /// Hands a deletion in a Leaf Community <c>#announcements</c> to the gateway inbox, in the
+    /// channel's order, so it is handled after the create and edits queued before it. Whether
+    /// the message was relayed is decided there (<see cref="RetractDeletedAnnouncementAsync"/>).
+    /// </summary>
+    private async Task EnqueueAnnouncementDeletionsAsync(
+        IEnumerable<ulong> messageIds, Cacheable<IMessageChannel, ulong> cached)
+    {
+        var channel = (cached.HasValue ? cached.Value : null) as IChannel
+            ?? client?.GetChannel(cached.Id);
+        if (channel is null || CommonsLocation(channel) is not { } location) return;
+        foreach (var (messageId, eventId) in AnnouncementDeletions(location.Channel, messageIds))
+            await gatewayInbox.EnqueueAsync(
+                configId, messageId, cached.Id.ToString(), location.GuildId,
+                DiscordGatewayInboxStore.AnnouncementDeleteKind, eventId);
+    }
+
+    /// <summary>
+    /// The gateway inbox items a deletion leaves: one per deleted message (message ID and the
+    /// retraction's event ID) in a channel named <c>#announcements</c>, none anywhere else.
+    /// </summary>
+    internal static IReadOnlyList<(string MessageId, string EventId)> AnnouncementDeletions(
+        string channel, IEnumerable<ulong> messageIds)
+        => IsAnnouncements(channel)
+            ? messageIds.Where(id => id > 0).Distinct()
+                .Select(id => (id.ToString(),
+                    DiscordCommonsRelayService.AnnouncementRetractEventId(id.ToString())))
+                .ToArray()
+            : [];
+
+    /// <summary>
+    /// A message deleted in <c>#announcements</c>: queues its retraction when this bot relayed
+    /// its create, in the create's guild, without refetching it. A message never relayed leaves
+    /// nothing, and a repeated deletion finds the retraction already queued.
+    /// </summary>
+    internal static Task<DiscordAnnouncementRetraction?> RetractDeletedAnnouncementAsync(
+        DiscordCommonsRelayService commons,
+        Guid botId,
+        DiscordGatewayInboxItem item,
+        DateTimeOffset now,
+        CancellationToken ct = default)
+        => commons.RetractAnnouncementAsync(
+            botId,
+            item.MessageId,
+            (_, _) => Task.FromResult<string?>(item.ChannelId),
+            new DiscordAnnouncementRetractionAudit("discord", null),
+            now,
+            ct);
+
     private async Task EnqueueGatewayMessageAsync(
         IUserMessage message, string kind = "message", string? eventId = null)
     {
@@ -2912,10 +3007,13 @@ internal sealed class DiscordBotRuntime(
     /// and takes the ordinary inbound path, unless the scope silences the native Agent. Other
     /// postable scope channels relay every message, then hand webhooks to Envoy admission and
     /// everyone else to the native Agent. An edit is never admitted and re-relays only a post
-    /// that is still a host announcement and whose create was relayed, so an edit can neither
-    /// turn conversation into an announcement nor update one the relay never received.
+    /// that is still a host announcement, whose create was relayed and which was not retracted,
+    /// so an edit can neither turn conversation into an announcement, nor update one the relay
+    /// never received, nor bring back one taken back.
     /// </summary>
     /// <param name="createRelayed">Edit only: the post's <c>announcement:{id}:create</c> was
+    /// queued for the relay.</param>
+    /// <param name="retracted">Edit only: the post's <c>announcement:{id}:retract</c> was
     /// queued for the relay.</param>
     internal static DiscordCommonsInboundRoute RouteCommonsInbound(
         bool inCommonsScope,
@@ -2926,10 +3024,12 @@ internal sealed class DiscordBotRuntime(
         bool authorIsBot,
         bool suppressesNativeAgent,
         bool edit = false,
-        bool createRelayed = false)
+        bool createRelayed = false,
+        bool retracted = false)
     {
         if (edit)
-            return new(inCommonsScope && announcements && announcementHost && createRelayed,
+            return new(inCommonsScope && announcements && announcementHost && createRelayed
+                    && !retracted,
                 DiscordCommonsInboundNext.Stop);
         if (inCommonsScope && announcements)
             return announcementHost
@@ -3218,6 +3318,12 @@ internal sealed class DiscordBotRuntime(
         if (!ulong.TryParse(item.ChannelId, out var channelId)
             || !ulong.TryParse(item.MessageId, out var messageId))
             return;
+        if (item.Kind == DiscordGatewayInboxStore.AnnouncementDeleteKind)
+        {
+            await RetractDeletedAnnouncementAsync(
+                commons, configId, item, DateTimeOffset.UtcNow, ct);
+            return;
+        }
         var options = new RequestOptions { CancelToken = ct };
         var channel = source.GetChannel(channelId) as IMessageChannel
             ?? await source.GetChannelAsync(channelId, options) as IMessageChannel;
@@ -3258,14 +3364,16 @@ internal sealed class DiscordBotRuntime(
             scope?.SuppressesNativeAgent == true,
             edit: true,
             createRelayed: announcementHost && await commons.WasEnqueuedAsync(
-                configId, AnnouncementCreateEventId(message.Id)));
+                configId, AnnouncementCreateEventId(message.Id)),
+            retracted: announcementHost && await commons.WasRetractedAsync(
+                configId, message.Id.ToString()));
         if (route.Forward)
             await ForwardAnnouncementAsync(message, location.Value, "update", eventId);
     }
 
     /// <summary>The relay event of an announcement's first post; its edits are relayed only after it.</summary>
     internal static string AnnouncementCreateEventId(ulong messageId)
-        => $"announcement:{messageId}:create";
+        => DiscordCommonsRelayService.AnnouncementCreateEventId(messageId.ToString());
 
     /// <summary>Relays a host post in <c>#announcements</c>; the caller has decided it is one.</summary>
     private async Task ForwardAnnouncementAsync(
@@ -5289,6 +5397,8 @@ internal sealed class DiscordBotRuntime(
         if (disconnectedHandler is not null) target.Disconnected -= disconnectedHandler;
         target.MessageReceived -= OnMessageAsync;
         target.MessageUpdated -= OnMessageUpdatedAsync;
+        target.MessageDeleted -= OnMessageDeletedAsync;
+        target.MessagesBulkDeleted -= OnMessagesBulkDeletedAsync;
         target.ReactionAdded -= OnReactionAddedAsync;
         target.SlashCommandExecuted -= OnSlashCommandAsync;
         target.UserLeft -= OnGuildMemberLeftAsync;

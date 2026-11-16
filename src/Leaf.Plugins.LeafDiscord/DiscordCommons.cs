@@ -705,7 +705,53 @@ public sealed record DiscordCommonsIngestDelivery(
     JsonObject? Payload,
     string State,
     int Attempts,
-    DateTimeOffset? NextAttemptAt);
+    DateTimeOffset? NextAttemptAt)
+{
+    /// <summary>
+    /// The Discord channel the event came from. Recorded beside the payload because a sent row
+    /// keeps no payload; a row queued before it was recorded has it only while still unsent.
+    /// </summary>
+    public string? ChannelId { get; init; }
+}
+
+/// <summary>
+/// The retraction of a relayed announcement: its <c>create</c> row and its <c>retract</c> row,
+/// and whether this call queued the retraction (false when it was already queued).
+/// </summary>
+public sealed record DiscordAnnouncementRetraction(
+    string MessageId,
+    DiscordCommonsIngestDelivery Create,
+    DiscordCommonsIngestDelivery Retract,
+    bool Queued);
+
+/// <summary>
+/// Who asked for a retraction, recorded on its ingest row beside (never inside) the payload:
+/// <c>agent</c> (a private discussion of the bot's Agent), <c>user</c> (the owner or an
+/// administrator directly) or <c>discord</c> (the message was deleted on Discord).
+/// </summary>
+public sealed record DiscordAnnouncementRetractionAudit(
+    string RequestedByKind,
+    string? RequestedBy,
+    string? Beneficiary = null,
+    string? DiscussionId = null,
+    string? Reason = null)
+{
+    public const int MaxReasonLength = 500;
+
+    internal JsonObject ToJson(DateTimeOffset requestedAt)
+    {
+        var reason = string.IsNullOrWhiteSpace(Reason) ? null : Reason.Trim();
+        return new JsonObject
+        {
+            ["requested_by_kind"] = RequestedByKind,
+            ["requested_by"] = RequestedBy,
+            ["beneficiary"] = Beneficiary,
+            ["discussion_id"] = DiscussionId,
+            ["reason"] = reason is { Length: > MaxReasonLength } ? reason[..MaxReasonLength] : reason,
+            ["requested_at"] = requestedAt.ToString("O"),
+        };
+    }
+}
 
 public sealed record DiscordCommonsHostTurn(
     Guid EntityId,
@@ -808,27 +854,40 @@ public sealed class DiscordCommonsIngestStore(IEntityStore store)
 {
     public const string TypeSlug = "leaf-discord-commons-ingest";
 
+    /// <param name="audit">Recorded on the row beside the payload, never sent to the relay.</param>
     public async Task<DiscordCommonsIngestDelivery> EnqueueAsync(
-        Guid botId, string guildId, string eventId, JsonObject payload,
-        CancellationToken ct = default)
+        Guid botId, string? guildId, string eventId, JsonObject payload,
+        CancellationToken ct = default, JsonObject? audit = null)
     {
         if (string.IsNullOrWhiteSpace(eventId) || eventId.Length > 200)
             throw new ArgumentException("A bounded Commons event ID is required.");
         var slug = Slug(botId, eventId);
         var existing = await store.GetBySlugAsync(TypeSlug, slug, ct);
         if (existing is not null) return Map(existing);
+        var data = new JsonObject
+        {
+            ["bot_id"] = botId.ToString(),
+            ["guild_id"] = guildId,
+            ["event_id"] = eventId,
+            ["channel_id"] = JsonRead.String(payload, "channelId"),
+            ["payload"] = payload.DeepClone(),
+            ["state"] = "queued",
+            ["attempts"] = 0,
+            ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
+        };
+        if (audit is not null) data["audit"] = audit.DeepClone();
         return Map(await store.UpsertBySlugAsync(TypeSlug, slug,
-            $"Leaf Community ingest {eventId}", new JsonObject
-            {
-                ["bot_id"] = botId.ToString(),
-                ["guild_id"] = guildId,
-                ["event_id"] = eventId,
-                ["payload"] = payload.DeepClone(),
-                ["state"] = "queued",
-                ["attempts"] = 0,
-                ["next_attempt_at"] = DateTimeOffset.UtcNow.ToString("O"),
-            }, ct));
+            $"Leaf Community ingest {eventId}", data, ct));
     }
+
+    /// <summary>The bot's row for the event, whatever its delivery state, or null.</summary>
+    public async Task<DiscordCommonsIngestDelivery?> GetAsync(
+        Guid botId, string eventId, CancellationToken ct = default)
+        => string.IsNullOrWhiteSpace(eventId) || eventId.Length > 200
+            ? null
+            : await store.GetBySlugAsync(TypeSlug, Slug(botId, eventId), ct) is { } entity
+                ? Map(entity)
+                : null;
 
     /// <summary>
     /// Whether this bot ever queued the event for the relay, whatever its delivery state. Rows are
@@ -893,15 +952,20 @@ public sealed class DiscordCommonsIngestStore(IEntityStore store)
         var data = entity.Data;
         _ = Guid.TryParse(JsonRead.String(data, "bot_id"), out var botId);
         _ = DateTimeOffset.TryParse(JsonRead.String(data, "next_attempt_at"), out var next);
+        var payload = data["payload"]?.DeepClone() as JsonObject;
         return new DiscordCommonsIngestDelivery(
             entity.Id,
             botId,
             JsonRead.String(data, "guild_id"),
             JsonRead.String(data, "event_id") ?? "",
-            data["payload"]?.DeepClone() as JsonObject,
+            payload,
             JsonRead.String(data, "state") ?? "queued",
             (int)JsonRead.Long(data, "attempts", 0),
-            next == default ? null : next);
+            next == default ? null : next)
+        {
+            ChannelId = JsonRead.String(data, "channel_id")
+                ?? (payload is null ? null : JsonRead.String(payload, "channelId")),
+        };
     }
 
     private static string Hash(string value)
@@ -953,8 +1017,55 @@ public sealed class DiscordCommonsRelayService(
         CancellationToken ct = default)
     {
         _ = await deliveries.EnqueueAsync(botId, guildId, eventId, payload, ct);
+        Wake();
+    }
+
+    private void Wake()
+    {
         try { signal.Release(); } catch (SemaphoreFullException) { }
     }
+
+    /// <summary>
+    /// Queues the retraction of an announcement this bot relayed: <c>announcement:{id}:retract</c>
+    /// in the Commons ingest outbox, for the guild of its <c>create</c> row. Null when no create
+    /// was ever queued (nothing to retract). Idempotent: a retraction already queued is returned
+    /// as it is, with its delivery state, and nothing new is recorded.
+    /// </summary>
+    /// <param name="fallbackChannelId">Asked for the channel, given the create row's guild, only
+    /// when that row does not record it (a row sent before channels were recorded keeps no
+    /// payload).</param>
+    /// <exception cref="InvalidOperationException">The channel cannot be determined.</exception>
+    public async Task<DiscordAnnouncementRetraction?> RetractAnnouncementAsync(
+        Guid botId,
+        string messageId,
+        Func<string?, CancellationToken, Task<string?>> fallbackChannelId,
+        DiscordAnnouncementRetractionAudit audit,
+        DateTimeOffset now,
+        CancellationToken ct = default)
+    {
+        var snowflake = RequiredAnnouncementSnowflake(messageId, nameof(messageId));
+        var create = await deliveries.GetAsync(botId, AnnouncementCreateEventId(snowflake), ct);
+        if (create is null) return null;
+        var retractId = AnnouncementRetractEventId(snowflake);
+        if (await deliveries.GetAsync(botId, retractId, ct) is { } existing)
+            return new(snowflake, create, existing, false);
+        var channelId = create.ChannelId ?? await fallbackChannelId(create.GuildId, ct)
+            ?? throw new InvalidOperationException(
+                "The announcement's channel is not recorded and could not be found.");
+        var retract = await deliveries.EnqueueAsync(botId, create.GuildId, retractId,
+            BuildAnnouncementRetractionPayload(snowflake, channelId, now.ToUnixTimeMilliseconds()),
+            ct, audit.ToJson(now));
+        Wake();
+        logger.LogInformation(
+            "Queued Leaf Community retraction {EventId} requested by {RequestedByKind}",
+            retractId, audit.RequestedByKind);
+        return new(snowflake, create, retract, true);
+    }
+
+    /// <summary>Whether this bot queued a retraction of the announcement (see <see cref="RetractAnnouncementAsync"/>).</summary>
+    public Task<bool> WasRetractedAsync(
+        Guid botId, string messageId, CancellationToken ct = default)
+        => deliveries.ExistsAsync(botId, AnnouncementRetractEventId(messageId), ct);
 
     /// <summary>Whether the event was ever queued for the relay (see <see cref="DiscordCommonsIngestStore.ExistsAsync"/>).</summary>
     public Task<bool> WasEnqueuedAsync(
@@ -1369,6 +1480,39 @@ public sealed class DiscordCommonsRelayService(
             ["timestamp"] = timestamp,
         };
     }
+
+    /// <summary>The relay event of an announcement's first post; its edits and retraction need it.</summary>
+    internal static string AnnouncementCreateEventId(string messageId)
+        => $"announcement:{messageId}:create";
+
+    /// <summary>The relay event that retracts an announcement; after it no edit is relayed.</summary>
+    internal static string AnnouncementRetractEventId(string messageId)
+        => $"announcement:{messageId}:retract";
+
+    /// <summary>
+    /// Takes a relayed announcement back from Leaf Community (Retraction Contract v1): the relay
+    /// drops it from every Envoy's inbox and Leaf Community deletes its digest. It carries no
+    /// content, author or reason.
+    /// </summary>
+    internal static JsonObject BuildAnnouncementRetractionPayload(
+        string messageId, string channelId, long timestamp)
+    {
+        var message = RequiredAnnouncementSnowflake(messageId, nameof(messageId));
+        return new JsonObject
+        {
+            ["type"] = "announcement_retraction",
+            ["eventId"] = AnnouncementRetractEventId(message),
+            ["messageId"] = message,
+            ["channelId"] = RequiredAnnouncementSnowflake(channelId, nameof(channelId)),
+            ["channel"] = "announcements",
+            ["timestamp"] = timestamp,
+        };
+    }
+
+    private static string RequiredAnnouncementSnowflake(string value, string name)
+        => ulong.TryParse(value?.Trim(), out var parsed) && parsed > 0
+            ? parsed.ToString()
+            : throw new ArgumentException("A Discord snowflake is required.", name);
 
     private async Task RunAsync(CancellationToken ct)
     {

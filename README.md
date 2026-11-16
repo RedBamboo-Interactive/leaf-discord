@@ -542,9 +542,11 @@ member, another bot, an ordinary role) does not change that.
 
 A host announcement never enters a native Agent binding. An edit is forwarded as an `update`
 only when the post is still a host announcement under the same rule and its `create` was
-forwarded (the bot's `announcement:{id}:create` ingest record exists), so an edit can neither
-turn conversation into an announcement nor update one Leaf Community never received; an
-announcement edited into conversation keeps its last relayed text. Everything else there is
+forwarded (the bot's `announcement:{id}:create` ingest record exists) and it was not
+retracted (no `announcement:{id}:retract` record), so an edit can neither turn conversation
+into an announcement, nor update one Leaf Community never received, nor bring back one taken
+back (see "Retracting an announcement" below); an announcement edited into conversation keeps
+its last relayed text. Everything else there is
 not forwarded. A member's message, or a host's conversation, takes the ordinary inbound path of a
 bound guild channel (binding, DM rules, behavior and response mode, mentions and replies,
 inbound Sentinel, typing), so the native Agent sees it and can answer a question asked under an
@@ -754,6 +756,42 @@ as `outreach_caller` (`app`, `actor_kind`, `actor_entity_id`) for audit. An exac
 keeps the first request's intent; reusing the idempotency key with the other value returns
 `400 invalid_message`. Edits through `/messages/{messageUid}/edit` keep the original row and
 therefore its intent.
+
+### Retracting an announcement
+
+```text
+POST /api/apps/leaf-discord/bots/{botEntityId}/announcements/{messageId}/retract
+{ "reason": "optional, audited only" }
+```
+
+Takes back an announcement this bot relayed to Leaf Community (`messageId` is the Discord
+message snowflake). It queues one `announcement_retraction` event,
+`announcement:{messageId}:retract`, in the durable Commons ingest outbox, for the guild of the
+bot's `announcement:{messageId}:create` record; the relay drops the announcement from every
+Envoy's inbox and Leaf Community deletes its digest. The payload carries the message and
+channel IDs, `channel: "announcements"` and the retraction time, never content, author or the
+reason. The reason (at most 500 characters, otherwise `400`) and who asked are recorded on the
+outbox row beside the payload.
+
+The bot's owner decides: a signed private discussion of the bot's own Agent with the owner as
+beneficiary, or the owner or the trusted local administrator directly in the Leaf UI. A
+Discord session, an automation, another Agent, another beneficiary or another user gets `403`,
+whatever roles its token carries. `404 announcement_not_relayed` when the bot has no create
+record for that message (nothing reached Leaf Community). The answer is `messageId`, `eventId`,
+`alreadyRetracted`, and `create` and `retract` with each event's delivery state (`queued`,
+`retry`, `sent`). A repeat changes nothing and returns the existing retraction and its state.
+
+The channel comes from the create record. A create sent before records kept their channel has
+no payload left, so its guild's `#announcements` in the Commons scope is looked up through the
+connected bot; when the bot is offline or the guild has no single such channel, the answer is
+`409 announcement_channel_unknown` and nothing is queued.
+
+Deleting a relayed announcement on Discord (one message or a bulk delete) queues the same
+retraction: the deletion goes through the gateway inbox as an `announcement-delete` item,
+ordered after the message's create and edits and never refetched. A deleted message that was
+never relayed, and deletions in any other channel, leave nothing. Deletions while the bot is
+offline are not replayed by Discord; use the route for those. After a retraction, edits of
+that message are never relayed again.
 
 ### Leading a conversation from a private discussion
 
