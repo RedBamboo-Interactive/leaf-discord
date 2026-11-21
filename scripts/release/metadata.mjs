@@ -4,7 +4,10 @@ import { resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
-const INPUT_KEYS = ["backendProject", "classification", "component", "dependencies", "frontendDirectory", "inputType", "leafSdk", "redbamboo", "redleafReleaseToolCommit", "runtimeRequirements", "schemaVersion", "targetPlatform", "testProject", "toolchain"]
+// The release input names Discord's dependencies (repository, source paths, inputs) and commits none of their
+// commits: the builder resolves RedLeaf (Leaf.Sdk and the ReleaseTool) and redbamboo-packages, passes them as
+// --redleaf-commit and --redbamboo-commit, and they are checked against the checkouts and recorded here.
+const INPUT_KEYS = ["backendProject", "classification", "component", "dependencies", "frontendDirectory", "inputType", "leafSdk", "redbamboo", "runtimeRequirements", "schemaVersion", "targetPlatform", "testProject", "toolchain"]
 const SHARED = [
   ["redbamboo-chat", "@redbamboo/chat", "packages/chat"],
   ["redbamboo-ui", "@redbamboo/ui", "packages/ui"],
@@ -101,18 +104,19 @@ function cleanDiscordGit(root, input, manifest, packageJson) {
 }
 
 export function validateInput(input, manifest, packageJson) {
+  if (input && ("redleafReleaseToolCommit" in input
+      || (input.leafSdk && "commit" in input.leafSdk) || (input.redbamboo && "commit" in input.redbamboo))) {
+    fail("Dependency commits are builder inputs (--redleaf-commit, --redbamboo-commit); release/producer-input.v1.json must not commit them.")
+  }
   exactKeys(input, INPUT_KEYS, "producer input")
   exactKeys(input.component, ["id", "kind", "version"], "component")
   exactKeys(input.toolchain, ["dotnetSdk", "msbuild", "node", "pnpm"], "toolchain")
   exactKeys(input.targetPlatform, ["architecture", "operatingSystem"], "targetPlatform")
-  exactKeys(input.leafSdk, ["commit", "repository", "sourcePath"], "Leaf.Sdk")
-  exactKeys(input.redbamboo, ["commit", "inputs", "lockPath", "repository"], "RedBamboo")
+  exactKeys(input.leafSdk, ["repository", "sourcePath"], "Leaf.Sdk")
+  exactKeys(input.redbamboo, ["inputs", "lockPath", "repository"], "RedBamboo")
   if (input.schemaVersion !== 1
       || input.inputType !== "leaf-discord-extension-release-producer-input") fail("Unsupported producer input.")
   if (input.classification !== "optional") fail("Discord must be classified optional.")
-  exactCommit(input.redleafReleaseToolCommit, "RedLeaf release-tool pin")
-  exactCommit(input.leafSdk.commit, "Leaf.Sdk pin")
-  exactCommit(input.redbamboo.commit, "RedBamboo pin")
   if (input.leafSdk.repository !== "RedBamboo-Interactive/redleaf"
       || input.leafSdk.sourcePath !== "src/Leaf.Sdk") fail("Leaf.Sdk repository or source path is invalid.")
   if (input.redbamboo.repository !== "RedBamboo-Interactive/redbamboo-packages"
@@ -156,6 +160,18 @@ export function validateInput(input, manifest, packageJson) {
   }
 }
 
+// The builder-supplied dependency commits, each the exact HEAD of the checkout it names: Leaf.Sdk and the
+// ReleaseTool both come from the one supplied RedLeaf commit.
+export function checkDependencyCommits(supplied, checkouts) {
+  exactCommit(supplied.redleaf, "--redleaf-commit")
+  exactCommit(supplied.redbamboo, "--redbamboo-commit")
+  for (const [label, actual, expected] of [
+    ["Leaf.Sdk", checkouts.leafSdk, supplied.redleaf],
+    ["RedLeaf release tool", checkouts.redleaf, supplied.redleaf],
+    ["RedBamboo", checkouts.redbamboo, supplied.redbamboo],
+  ]) if (actual !== expected) fail(`The ${label} checkout is at ${actual}, but the builder supplied ${expected}.`)
+}
+
 export function buildMetadata(input, manifest, source) {
   const compatibility = { kernelApi: manifest.kernelApi }
   addOptional(compatibility, "computeApi", manifest.computeApi)
@@ -169,14 +185,14 @@ export function buildMetadata(input, manifest, source) {
     buildId: `source-${source.componentCommit}`,
     builtAt: source.builtAt,
     repository: { id: input.component.id, repositoryUrl: source.componentUrl, commit: source.componentCommit },
-    toolchain: { ...input.toolchain, releaseTool: input.redleafReleaseToolCommit },
+    toolchain: { ...input.toolchain, releaseTool: source.redleafCommit },
     build: { backendProject: input.backendProject, frontendDirectory: input.frontendDirectory },
     buildInputs: [
-      { id: "leaf-sdk", repositoryUrl: source.leafSdkUrl, commit: input.leafSdk.commit, sourcePath: input.leafSdk.sourcePath },
+      { id: "leaf-sdk", repositoryUrl: source.leafSdkUrl, commit: source.redleafCommit, sourcePath: input.leafSdk.sourcePath },
       ...input.redbamboo.inputs.map((item) => ({
         id: item.id,
         repositoryUrl: source.redbambooUrl,
-        commit: input.redbamboo.commit,
+        commit: source.redbambooCommit,
         sourcePath: item.sourcePath,
       })),
     ].sort((a, b) => ordinal(a.id, b.id)),
@@ -250,11 +266,12 @@ function collect(get) {
   const expectedCommit = get("source-commit")
   exactCommit(expectedCommit, "Discord source commit")
   if (componentCommit !== expectedCommit) fail("Discord checkout does not match the called workflow commit.")
-  if (git(redbamboo, "rev-parse", "HEAD") !== input.redbamboo.commit
-      || git(leafSdk, "rev-parse", "HEAD") !== input.leafSdk.commit
-      || git(redleaf, "rev-parse", "HEAD") !== input.redleafReleaseToolCommit) {
-    fail("A checkout does not match its immutable producer pin.")
-  }
+  const supplied = { redleaf: get("redleaf-commit"), redbamboo: get("redbamboo-commit") }
+  checkDependencyCommits(supplied, {
+    leafSdk: git(leafSdk, "rev-parse", "HEAD"),
+    redleaf: git(redleaf, "rev-parse", "HEAD"),
+    redbamboo: git(redbamboo, "rev-parse", "HEAD"),
+  })
   git(leafSdk, "cat-file", "-e", `HEAD:${input.leafSdk.sourcePath}`)
   for (const item of input.redbamboo.inputs) git(redbamboo, "cat-file", "-e", `HEAD:${item.sourcePath}`)
   const sourceEpoch = get("source-date-epoch")
@@ -278,6 +295,8 @@ function collect(get) {
     componentUrl: git(repository, "config", "--get", "remote.origin.url"),
     leafSdkUrl: git(leafSdk, "config", "--get", "remote.origin.url"),
     redbambooUrl: git(redbamboo, "config", "--get", "remote.origin.url"),
+    redleafCommit: supplied.redleaf,
+    redbambooCommit: supplied.redbamboo,
     builtAt,
   })
   const locks = {
