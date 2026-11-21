@@ -214,22 +214,16 @@ public sealed class PluginPackagingContractTests
         Assert.Equal("string", counterparty.GetProperty("fieldType").GetString());
     }
 
-    internal static string FindRepositoryRoot([System.Runtime.CompilerServices.CallerFilePath] string sourceFile = "")
+    // From the test output directory, not [CallerFilePath]: a release build maps source paths to /_/ (PathMap).
+    internal static string FindRepositoryRoot()
     {
-        // Deterministic release builds map source paths to "/_/...", so the caller path
-        // only works in local builds; the test binary's own location works in both.
-        string?[] starts = [Path.GetDirectoryName(sourceFile), AppContext.BaseDirectory];
-        foreach (var start in starts)
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
         {
-            if (string.IsNullOrEmpty(start) || !Directory.Exists(start)) continue;
-            for (var directory = new DirectoryInfo(start);
-                 directory is not null;
-                 directory = directory.Parent)
-            {
-                if (File.Exists(Path.Combine(directory.FullName, "plugin.json"))
-                    && Directory.Exists(Path.Combine(directory.FullName, "seeds")))
-                    return directory.FullName;
-            }
+            if (File.Exists(Path.Combine(directory.FullName, "plugin.json"))
+                && Directory.Exists(Path.Combine(directory.FullName, "seeds")))
+                return directory.FullName;
         }
 
         throw new DirectoryNotFoundException("Could not locate the leaf-discord repository root.");
