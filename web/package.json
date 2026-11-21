@@ -13,7 +13,7 @@
   "scripts": {
     "dev": "vite build --watch",
     "build:pkg": "vite build",
-    "test": "node --experimental-strip-types --test src/*.test.ts"
+    "test": "node --experimental-strip-types --test src/*.test.ts ../tests/release-contract.test.mjs"
   },
   "peerDependencies": {
     "react": "^19.0.0",
