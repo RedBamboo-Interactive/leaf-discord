@@ -718,6 +718,29 @@ attachments instead of sending private Asset Markdown as text:
 }
 ```
 
+### Owner approval for held private outreach
+
+When Sentinel holds a private Agent discussion's existing-binding message or its review is
+unavailable, this route keeps the draft and returns `sentinel_held` (422) or
+`sentinel_unavailable` (503) with `approvalPending: true` and `messageUid`. The draft is
+shown in its originating Nova discussion. The target transcript, Discord outbox, lead and
+reply subscription only change after release. Retry with the same key and exact request
+from that discussion to recover the original outcome. Reusing the key on that binding with
+different content, intent or origin returns 409.
+
+```text
+GET  /api/apps/leaf-discord/outreach/approvals?discussionId=<origin>
+POST /api/apps/leaf-discord/bindings/{id}/messages/{messageUid}/release?discussionId=<origin>
+POST /api/apps/leaf-discord/bindings/{id}/messages/{messageUid}/discard?discussionId=<origin>
+```
+
+The list returns `{ items }` with the target channel and guild IDs and names, canonical
+`content`, `deliveryContent`, exact `deliveryChunks`, `outputAssets`, and the `sentinel`
+verdict. The discussion owner needs a signed-in human session and the owner or admin role.
+Release keeps the original text, attachments and intent and queues the standard Discord
+delivery. If admission stops partway, retry Release from the same card. Discard closes
+the draft permanently. Drafts from earlier binding generations cannot be released.
+
 ### Reply callbacks to the sending discussion
 
 When a private Leaf discussion sends through `POST /bindings/{entityId}/messages` or

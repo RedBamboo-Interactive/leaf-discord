@@ -65,7 +65,9 @@ public sealed class PluginPackagingContractTests
         Assert.False(frontend.TryGetProperty("sections", out _));
         Assert.Equal(JsonValueKind.Object, frontend.GetProperty("settings").ValueKind);
 
-        var extension = Assert.Single(frontend.GetProperty("extensions").EnumerateArray());
+        var extensions = frontend.GetProperty("extensions").EnumerateArray().ToArray();
+        Assert.Equal(2, extensions.Length);
+        var extension = extensions[0];
         Assert.Equal("discord", extension.GetProperty("id").GetString());
         Assert.Equal("nova", extension.GetProperty("target").GetString());
         Assert.Equal("app-section", extension.GetProperty("slot").GetString());
@@ -74,7 +76,11 @@ public sealed class PluginPackagingContractTests
             extension.GetProperty("section").GetProperty("legacyRoute").GetString());
 
         var frontendSource = File.ReadAllText(Path.Combine(root, "web", "src", "plugin.tsx"));
-        Assert.Contains("extensions: { discord: Page }", frontendSource, StringComparison.Ordinal);
+        Assert.Equal("discord-outreach-approvals", extensions[1].GetProperty("id").GetString());
+        Assert.Equal("nova", extensions[1].GetProperty("target").GetString());
+        Assert.Equal("discussion-notices", extensions[1].GetProperty("slot").GetString());
+        Assert.Contains("extensions: { discord: Page,", frontendSource, StringComparison.Ordinal);
+        Assert.Contains("\"discord-outreach-approvals\": OutreachApprovalNotices", frontendSource, StringComparison.Ordinal);
         Assert.DoesNotContain("commands:", frontendSource, StringComparison.Ordinal);
     }
 

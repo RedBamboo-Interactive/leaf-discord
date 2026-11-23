@@ -1,6 +1,8 @@
 using System.Text.Json.Nodes;
 using Leaf.Plugins.LeafDiscord;
+using Leaf.Sdk;
 using Leaf.Sdk.Services;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -1422,6 +1424,260 @@ public sealed class DiscordOutboundReviewTests
         Assert.Equal("high", released?["risk"]?.GetValue<string>());
     }
 
+    [Theory]
+    [InlineData(false, "chat")]
+    [InlineData(true, "live")]
+    public async Task Private_outreach_keeps_exact_payload_and_verdict_across_restart(
+        bool unavailable, string discussionType)
+    {
+        var f = await PrivateOutreachFixture.CreateAsync(unavailable ? null : _ => Leak, discussionType);
+        var request = new DiscordBindingMessageRequest("Canonical ![one](/api/assets/test.png)", "exact-key",
+            "Discord <literal>\ntext", [new("test.png", "one"), new("second.webp", "two")],
+            NotifyReplies: false, Announcement: true);
+        var held = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        Assert.Equal(unavailable, held.Unavailable);
+        Assert.Equal(f.Origin.Id, (await f.Store.FindOriginAsync(f.Caller.DiscussionId!, default))?.Id);
+        Assert.Empty(f.Gateway.Messages);
+        Assert.Empty(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+        Assert.Null(await f.Harness.Coordinator.Leads.GetAsync(f.Binding));
+        Assert.Null(await f.Subscriptions.FindActiveAsync(f.Binding.BindingId, f.Caller.DiscussionId!, DateTimeOffset.UtcNow));
+
+        f.Restart(_ => Clean);
+        var replay = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        Assert.Equal(held.ApprovalMessageUid, replay.ApprovalMessageUid);
+        Assert.Equal(held.Unavailable, replay.Unavailable);
+        Assert.Empty(f.Harness.Sentinel.Requests);
+        var draft = Assert.Single(await f.Store.ListOpenAsync(f.Origin.Id, default));
+        Assert.Equal(request.Content, draft.Prepared.Content);
+        Assert.Equal(request.DeliveryContent, draft.Prepared.DeliveryContent);
+        Assert.Equal(request.OutputAssets!.Select(asset => asset.AssetId), draft.Prepared.OutputAssets.Select(asset => asset.AssetId));
+        Assert.Equal(f.Binding.ConversationId, draft.ChannelId);
+        Assert.Empty(await f.Store.ListOpenAsync(Guid.NewGuid(), default));
+        var row = (await f.Store.FindByKeyAsync(f.Binding.EntityId, request.IdempotencyKey, default))!.Entity;
+        Assert.DoesNotContain(request.Content, f.Harness.Entities.StoredData(row.Id).ToJsonString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(request.DeliveryContent!, f.Harness.Entities.Redacted(row.Id).ToJsonString(), StringComparison.Ordinal);
+
+        await Assert.ThrowsAsync<DiscordOutreachConflictException>(() =>
+            f.SubmitAsync(request with { Content = "Changed with the same Discord text" }));
+        await Assert.ThrowsAsync<DiscordOutreachConflictException>(() =>
+            f.SubmitAsync(request with { NotifyReplies = true }));
+        await Assert.ThrowsAsync<DiscordOutreachConflictException>(() =>
+            f.Harness.Coordinator.SubmitPrivateOutreachAsync(f.Binding, f.Origin with { Id = Guid.NewGuid() },
+                f.Caller with { DiscussionId = "different-origin" }, request, f.Subscriptions, default));
+        Assert.Empty(f.Gateway.Messages);
+        Assert.Empty(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+
+        var release = await f.ReleaseAsync(draft.MessageUid);
+        Assert.Equal(DiscordReleaseOutcome.Released, release.Outcome);
+        Assert.Equal(request.Content, Assert.Single(f.Gateway.Messages).Content);
+        var delivery = Assert.Single(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+        Assert.Equal(draft.MessageUid, delivery.MessageUid);
+        Assert.Equal(request.DeliveryContent, delivery.Payload?["content"]?.GetValue<string>());
+        Assert.Equal(2, delivery.Payload?["assets"]?.AsArray().Count);
+        Assert.True(delivery.Announcement);
+        Assert.Equal(release.ReleasedAt, delivery.ReleasedAt);
+        await f.Harness.Deliveries.MarkSentAsync(delivery, "123456789012345678");
+        await f.Harness.ReconcileAsync();
+        f.Restart(_ => Clean);
+        Assert.Equal(DiscordReleaseOutcome.AlreadyReleased, (await f.ReleaseAsync(draft.MessageUid)).Outcome);
+        Assert.Equal(draft.MessageUid, (await f.SubmitAsync(request)).MessageUid);
+        Assert.Single(f.Gateway.Messages);
+        Assert.Single(await f.Harness.Rows(draft.MessageUid));
+        Assert.Empty(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+        Assert.Empty(await f.Store.ListOpenAsync(f.Origin.Id, default));
+        Assert.Null(await f.Subscriptions.FindActiveAsync(f.Binding.BindingId, f.Caller.DiscussionId!, DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public async Task Private_outreach_keeps_deterministic_holds_and_releases_only_the_sanitized_text()
+    {
+        var f = await PrivateOutreachFixture.CreateAsync(_ => Clean);
+        var request = new DiscordBindingMessageRequest("Exact\u200b text", "deterministic-key");
+        var held = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        Assert.False(held.Unavailable);
+        Assert.Contains(DiscordEgressGuard.HiddenCharactersFinding, held.Review["signals"]!.ToJsonString(), StringComparison.Ordinal);
+        Assert.Empty(f.Harness.Sentinel.Requests);
+        Assert.Empty(f.Gateway.Messages);
+        await f.ReleaseAsync(held.ApprovalMessageUid!);
+        Assert.Equal("Exact text", Assert.Single(f.Gateway.Messages).Content);
+        Assert.Equal("Exact text", Assert.Single(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId))
+            .Payload?["content"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Private_outreach_preserves_an_approved_legacy_delivery_and_does_not_review_again()
+    {
+        var f = await PrivateOutreachFixture.CreateAsync(_ => Clean);
+        var request = new DiscordBindingMessageRequest("Canonical ![one](/api/assets/test.png)", "legacy-key",
+            "Discord text", [new("test.png", "one")]);
+        var original = await f.Harness.Coordinator.SendExistingProactiveAsync(f.Binding,
+            request.IdempotencyKey, request.Content, request.DeliveryContent, [new("test.png", "one")]);
+        var delivery = Assert.Single(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+        await f.Harness.Deliveries.MarkSentAsync(delivery, "123456789012345678");
+        f.Restart(_ => Leak);
+        var replay = await f.SubmitAsync(request);
+        Assert.Equal(original.MessageUid, replay.MessageUid);
+        Assert.Empty(f.Harness.Sentinel.Requests);
+        Assert.Empty(await f.Store.ListOpenAsync(f.Origin.Id, default));
+        Assert.Single(f.Gateway.Messages);
+        Assert.Single(await f.Harness.Rows(replay.MessageUid));
+        Assert.Empty(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+    }
+
+    [Fact]
+    public async Task Private_outreach_discard_wins_and_remains_inert_for_release_and_agent_retry()
+    {
+        var f = await PrivateOutreachFixture.CreateAsync(_ => Leak);
+        var request = new DiscordBindingMessageRequest("Parked", "discard-key", LeadConversation: true);
+        var ex = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        var uid = ex.ApprovalMessageUid!;
+        var discard = f.DiscardAsync(uid);
+        var release = Assert.ThrowsAsync<DiscordOutreachConflictException>(() => f.ReleaseAsync(uid));
+        Assert.False(await discard);
+        Assert.Equal("discord_outreach_discarded", (await release).Code);
+        f.Restart(_ => Clean);
+        Assert.True(await f.DiscardAsync(uid));
+        Assert.Equal("discord_outreach_discarded",
+            (await Assert.ThrowsAsync<DiscordOutreachConflictException>(() => f.SubmitAsync(request))).Code);
+        Assert.Empty(f.Gateway.Messages);
+        Assert.Empty(await f.Harness.Deliveries.PendingOutboundAsync(f.Binding.BindingId));
+        Assert.Empty(await f.Store.ListOpenAsync(f.Origin.Id, default));
+        Assert.Null(await f.Harness.Coordinator.Leads.GetAsync(f.Binding));
+    }
+
+    [Fact]
+    public async Task Private_outreach_partial_release_can_only_be_resumed_by_owner_and_wins_against_discard()
+    {
+        var f = await PrivateOutreachFixture.CreateAsync(_ => Leak);
+        var request = new DiscordBindingMessageRequest(string.Concat(Enumerable.Repeat("Canonical ", 500)),
+            "partial-key", "Exact Discord text", LeadConversation: true, LeadForMinutes: 45);
+        var held = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        var uid = held.ApprovalMessageUid!;
+        f.Gateway.Injected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Gateway.ReturnResult = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Gateway.FailNextResult = true;
+        var release = Assert.ThrowsAsync<InvalidOperationException>(() => f.ReleaseAsync(uid));
+        await f.Gateway.Injected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var discard = Assert.ThrowsAsync<DiscordOutreachConflictException>(() => f.DiscardAsync(uid));
+        f.Gateway.ReturnResult.SetResult();
+        await release;
+        Assert.Equal("discord_outreach_already_released", (await discard).Code);
+        Assert.Single(f.Gateway.Messages);
+        Assert.Empty(await f.Harness.Rows(uid));
+
+        f.Restart(_ => Clean);
+        await f.Harness.ReconcileAsync(); // Canonical text has more chunks than the approved Discord text.
+        Assert.Empty(await f.Harness.Rows(uid));
+        await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        Assert.Equal(1, f.Gateway.Injections);
+        var pending = Assert.Single(await f.Store.ListOpenAsync(f.Origin.Id, default));
+        Assert.NotNull(pending.ReleasedAt);
+        var retry = await f.ReleaseAsync(uid);
+        Assert.Equal(DiscordReleaseOutcome.AlreadyReleased, retry.Outcome);
+        Assert.Equal(pending.ReleasedAt, retry.ReleasedAt);
+        Assert.Single(f.Gateway.Messages);
+        Assert.Equal("Exact Discord text", Assert.Single(await f.Harness.Deliveries.PendingOutboundAsync(
+            f.Binding.BindingId)).Payload?["content"]?.GetValue<string>());
+        Assert.NotNull(await f.Subscriptions.FindActiveAsync(f.Binding.BindingId, f.Caller.DiscussionId!, DateTimeOffset.UtcNow));
+        Assert.Equal(f.Caller.DiscussionId, (await f.Harness.Coordinator.Leads.GetAsync(f.Binding))?.DiscussionId);
+    }
+
+    [Fact]
+    public async Task Private_outreach_refuses_an_old_generation_and_a_conflicting_lead()
+    {
+        var f = await PrivateOutreachFixture.CreateAsync(_ => Leak);
+        var request = new DiscordBindingMessageRequest("Parked", "stale-key", LeadConversation: true);
+        var ex = await Assert.ThrowsAsync<DiscordSentinelRefusedException>(() => f.SubmitAsync(request));
+        var uid = ex.ApprovalMessageUid!;
+        await f.Harness.Coordinator.Leads.ClaimAsync(f.Binding, "other", "owner-1", "agent-1",
+            TimeSpan.FromHours(1), DateTimeOffset.UtcNow);
+        await Assert.ThrowsAsync<DiscordConversationLedElsewhereException>(() => f.ReleaseAsync(uid));
+        Assert.Null(Assert.Single(await f.Store.ListOpenAsync(f.Origin.Id, default)).ReleasedAt);
+        f.Harness.Binding = await f.Harness.Coordinator.ClearAsync(f.Binding, "test-clear");
+        Assert.Equal("discord_binding_session_changed",
+            (await Assert.ThrowsAsync<DiscordOutreachConflictException>(() => f.ReleaseAsync(uid))).Code);
+        Assert.Equal("discord_binding_session_changed",
+            (await Assert.ThrowsAsync<DiscordOutreachConflictException>(() => f.SubmitAsync(request))).Code);
+        Assert.Empty(f.Gateway.Messages);
+        Assert.Empty(await f.Harness.Rows(uid));
+    }
+
+    private sealed class PrivateOutreachFixture(
+        Harness harness, LeafEntity origin, RecordedOutreachGateway gateway, IDataProtectionProvider keys)
+    {
+        public Harness Harness { get; private set; } = harness;
+        public LeafEntity Origin { get; } = origin;
+        public RecordedOutreachGateway Gateway { get; } = gateway;
+        public DiscordOutreachApprovalStore Store => new(Harness.Entities, keys);
+        public DiscordReplySubscriptionStore Subscriptions => new(Harness.Entities);
+        public DiscordBinding Binding => Harness.Binding;
+        public LeafAgentCaller Caller { get; } = new("agent-1", "owner-1")
+        {
+            DiscussionId = "discussion-1", AppId = "nova", ActorKind = "agent",
+        };
+
+        public static async Task<PrivateOutreachFixture> CreateAsync(
+            Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide, string discussionType = "chat")
+        {
+            var entities = MemoryEntityStore.WithSeedSecretFields();
+            var keys = new EphemeralDataProtectionProvider();
+            var provider = new ScriptedProvider();
+            var gateway = new RecordedOutreachGateway(provider);
+            var h = await Harness.CreateAsync(decide, entities, approvalOptions: (provider, gateway, keys));
+            await h.SeedBotConfigurationAsync(enabled: true);
+            var origin = await entities.CreateAsync("discussion", "Private Nova", new JsonObject
+            {
+                ["app"] = "nova", ["type"] = discussionType, ["status"] = "idle",
+                ["discussion_id"] = "discussion-1", ["owner_id"] = "owner-1", ["agent"] = "agent-1",
+            });
+            return new(h, origin, gateway, keys);
+        }
+
+        public void Restart(Func<UntrustedContentReviewRequest, UntrustedContentVerdict> decide)
+            => Harness = Harness.RebuildForOutreach(decide, Gateway, keys);
+
+        public Task<DiscordOutreachReceipt> SubmitAsync(DiscordBindingMessageRequest request)
+            => Harness.Coordinator.SubmitPrivateOutreachAsync(Binding, Origin, Caller, request, Subscriptions, default);
+
+        public Task<DiscordReleaseResult> ReleaseAsync(string uid)
+            => Harness.Coordinator.ReleasePrivateOutreachAsync(Binding, Origin, uid, "owner-1", Subscriptions, default);
+
+        public Task<bool?> DiscardAsync(string uid)
+            => Harness.Coordinator.DiscardPrivateOutreachAsync(Binding, Origin, uid, "owner-1", default);
+    }
+
+    private sealed class RecordedOutreachGateway(ScriptedProvider provider) : IComputeGateway
+    {
+        public List<ExternalConversationMessage> Messages => provider.Messages;
+        public int Injections { get; private set; }
+        public bool FailNextResult { get; set; }
+        public TaskCompletionSource? Injected { get; set; }
+        public TaskCompletionSource? ReturnResult { get; set; }
+
+        public async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, ComputeProvenance? provenance = null, CancellationToken ct = default)
+        {
+            if (request.Method != HttpMethod.Post) return new(System.Net.HttpStatusCode.OK);
+            Injections++;
+            var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct))!.AsObject();
+            var uid = JsonRead.String(body, "messageUid")!;
+            if (Messages.All(message => message.MessageUid != uid))
+                Messages.Add(new(new("epoch-1", Messages.Count + 1), uid,
+                    "assistant", "text", JsonRead.String(body, "content"), DateTimeOffset.UtcNow));
+            Injected?.TrySetResult();
+            if (ReturnResult is { } signal) await signal.Task.WaitAsync(ct);
+            if (FailNextResult)
+            {
+                FailNextResult = false;
+                return new(System.Net.HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{}") };
+            }
+            return new(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(new JsonObject { ["injected"] = true, ["messageUid"] = uid }.ToJsonString()),
+            };
+        }
+    }
+
     private sealed class Harness
     {
         public required MemoryEntityStore Entities { get; init; }
@@ -1440,7 +1696,8 @@ public sealed class DiscordOutboundReviewTests
             string kind = "guild_channel",
             string ownerId = "owner-1",
             string? counterparty = null,
-            bool acceptInjection = false)
+            bool acceptInjection = false,
+            (ScriptedProvider Provider, IComputeGateway Gateway, IDataProtectionProvider Keys)? approvalOptions = null)
         {
             entities ??= new MemoryEntityStore();
             _ = await entities.UpsertBySlugAsync("quality-mode", "deep-codex", "Deep (Codex)", new JsonObject
@@ -1455,8 +1712,9 @@ public sealed class DiscordOutboundReviewTests
                 "100000000000000001", kind == "dm" ? "323456789012345678" : "123456789012345678", kind,
                 kind == "dm" ? null : "223456789012345678", null, "nova", ownerId,
                 "nova-discord-external", "participate", CounterpartyUserId: counterparty));
-            var harness = Build(entities, bindings, binding, decide, new ScriptedProvider(), new ManualClock(),
-                acceptInjection ? new AcceptingComputeGateway() : new NoComputeGateway());
+            var harness = Build(entities, bindings, binding, decide, approvalOptions?.Provider ?? new ScriptedProvider(),
+                new ManualClock(), approvalOptions?.Gateway ?? (acceptInjection ? new AcceptingComputeGateway() : new NoComputeGateway()),
+                approvalOptions?.Keys);
             harness.Binding = await harness.Coordinator.EnsureReadyAsync(binding);
             return harness;
         }
@@ -1475,7 +1733,7 @@ public sealed class DiscordOutboundReviewTests
         private static Harness Build(
             MemoryEntityStore entities, DiscordBindingStore bindings, DiscordBinding binding,
             Func<UntrustedContentReviewRequest, UntrustedContentVerdict>? decide, ScriptedProvider provider,
-            ManualClock clock, IComputeGateway compute)
+            ManualClock clock, IComputeGateway compute, IDataProtectionProvider? approvalKeys = null)
         {
             var deliveries = new DiscordDeliveryStore(entities);
             var sentinel = new FakeSentinel(decide ?? (_ => Clean));
@@ -1487,7 +1745,8 @@ public sealed class DiscordOutboundReviewTests
                 compute, [provider], new PromptInjectionDetector(),
                 new DiscordEgressGuard(), new DiscordTypingLeases(),
                 NullLogger<DiscordConversationCoordinator>.Instance,
-                decide is null ? null : sentinel, clock);
+                decide is null ? null : sentinel, clock,
+                approvals: approvalKeys is null ? null : new DiscordOutreachApprovalStore(entities, approvalKeys));
             var harness = new Harness
             {
                 Entities = entities,
@@ -1536,9 +1795,18 @@ public sealed class DiscordOutboundReviewTests
                 ReviewAttempts = (int)JsonRead.Long(entity.Data, "review_attempts", 0),
             }).OrderBy(item => item.ChunkIndex).ToList();
 
-        public async Task SeedBotConfigurationAsync()
+        public Harness RebuildForOutreach(
+            Func<UntrustedContentReviewRequest, UntrustedContentVerdict> decide,
+            IComputeGateway gateway, IDataProtectionProvider keys)
+        {
+            Coordinator.Dispose();
+            return Build(Entities, Bindings, Binding, decide, Provider, Clock, gateway, keys);
+        }
+
+        public async Task SeedBotConfigurationAsync(bool enabled = false)
             => await new DiscordBotConfigurationStore(new LeafDiscordConfigStore(Entities)).CreateAsync(
-                new LeafDiscordConfigUpdate("100000000000000001", new string('a', 64), null, false, false,
+                new LeafDiscordConfigUpdate("100000000000000001", new string('a', 64),
+                    enabled ? "fixture-token" : null, false, enabled,
                     [], [], 10 * 1024 * 1024, "nova", "deep-codex"),
                 ownerUserId: "owner-1");
     }

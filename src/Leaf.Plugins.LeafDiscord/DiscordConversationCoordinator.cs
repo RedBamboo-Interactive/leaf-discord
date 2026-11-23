@@ -43,9 +43,10 @@ public sealed class DiscordSentinelRefusedException(bool unavailable, JsonObject
 {
     public bool Unavailable { get; } = unavailable;
     public JsonObject Review { get; } = review;
+    internal string? ApprovalMessageUid { get; init; }
 }
 
-public sealed class DiscordConversationCoordinator(
+public sealed partial class DiscordConversationCoordinator(
     DiscordBindingStore bindings,
     DiscordDeliveryStore deliveries,
     DiscordBotConfigurationStore botConfigurations,
@@ -60,7 +61,8 @@ public sealed class DiscordConversationCoordinator(
     ILogger<DiscordConversationCoordinator> logger,
     IUntrustedContentReview? sentinel = null,
     TimeProvider? time = null,
-    DiscordConversationLeadStore? leads = null) : IDisposable
+    DiscordConversationLeadStore? leads = null,
+    DiscordOutreachApprovalStore? approvals = null) : IDisposable
 {
     private readonly TimeProvider clock = time ?? TimeProvider.System;
     private readonly DiscordConversationLeadStore leadStore =
@@ -631,85 +633,105 @@ public sealed class DiscordConversationCoordinator(
                     "The Discord binding session changed before the message was admitted");
 
             var prepared = PrepareOutreach(content, deliveryContent, outputAssets);
+            if (expectedGeneration is not null && OutreachApprovals is { } store
+                && await store.FindByKeyAsync(binding.EntityId, requestId, ct) is not null)
+                throw new ArgumentException("This idempotency key belongs to private discussion outreach.");
 
-            var (_, handle, attached) = await EnsureConversationAsync(binding, ct);
-            binding = attached;
-            var messageUid = OutreachMessageUid(binding, requestId);
-            using var inject = new HttpRequestMessage(
-                HttpMethod.Post, $"/ai-session/sessions/{handle.SessionId}/inject")
-            {
-                Content = JsonContent.Create(new
-                {
-                    role = "assistant",
-                    content = prepared.Content,
-                    messageUid,
-                    metadata = new
-                    {
-                        app = "leaf-discord",
-                        bindingId = binding.BindingId,
-                        generation = binding.Generation,
-                        origin = "agent-outreach",
-                    },
-                }),
-            };
-            using var response = await compute.SendAsync(inject, provenance: null, ct);
-            await EnsureInjectionAcceptedAsync(response, messageUid, ct);
-
-            var message = new ExternalConversationMessage(
-                new ExternalConversationCursor("leaf-discord-outreach", 0),
-                messageUid, "assistant", "text", prepared.Content, DateTimeOffset.UtcNow,
-                new JsonObject { ["origin"] = "agent-outreach" })
-            {
-                DeliveryContent = prepared.DeliveryContent,
-                OutputAssets = prepared.OutputAssets,
-            };
-            var chunks = DiscordMessageChunker.Split(prepared.DeliveryContent);
-            var assetGroups = prepared.OutputAssets.Chunk(10).ToArray();
-            var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
-            for (var i = 0; i < deliveryCount; i++)
-            {
-                var extra = review is null
-                    ? new JsonObject
-                    {
-                        ["review_exempt"] = DiscordDeliveryStore.DeliveredBeforeTranscriptExemption,
-                    }
-                    : new JsonObject
-                    {
-                        ["outbound_review"] = review.DeepClone(),
-                        ["review_action"] = JsonRead.String(review, "outcome"),
-                    };
-                if (provenance is not null)
-                {
-                    extra["announcement"] = provenance.Announcement;
-                    extra["outreach_caller"] = provenance.CallerJson();
-                }
-                var delivery = await deliveries.EnqueueOutboundAsync(
-                    binding,
-                    message,
-                    i,
-                    i < chunks.Count ? chunks[i] : "",
-                    i < assetGroups.Length ? assetGroups[i] : [],
-                    extra,
-                    ct);
-                // An exact retry finds the first request's rows; its intent must not change.
-                if (provenance is not null && delivery.Announcement != provenance.Announcement)
-                    throw new ArgumentException(
-                        "This idempotency key was already used with a different announcement intent.");
-                if (deliveredDiscordMessageId is not null)
-                {
-                    if (deliveryCount != 1)
-                        throw new InvalidOperationException(
-                            "An already-delivered Discord message must fit in one chunk");
-                    await deliveries.MarkSentAsync(delivery, deliveredDiscordMessageId, ct);
-                }
-            }
-            await RelayOwnerMessageAsync(binding, messageUid, prepared, ct);
-            return (binding, messageUid);
+            return await AdmitProactiveAsync(binding, requestId, prepared, review,
+                deliveredDiscordMessageId, provenance, null, ct);
         }
         finally
         {
             gate.Release();
         }
+    }
+
+    private async Task<(DiscordBinding Binding, string MessageUid)> AdmitProactiveAsync(
+        DiscordBinding binding, string requestId, DiscordPreparedOutreach prepared, JsonObject? review,
+        string? deliveredDiscordMessageId, DiscordOutreachProvenance? provenance,
+        DiscordOutreachApproval? approval, CancellationToken ct)
+    {
+        var (_, handle, attached) = await EnsureConversationAsync(binding, ct);
+        binding = attached;
+        var messageUid = OutreachMessageUid(binding, requestId);
+        using var inject = new HttpRequestMessage(
+            HttpMethod.Post, $"/ai-session/sessions/{handle.SessionId}/inject")
+        {
+            Content = JsonContent.Create(new
+            {
+                role = "assistant",
+                content = prepared.Content,
+                messageUid,
+                metadata = new
+                {
+                    app = "leaf-discord",
+                    bindingId = binding.BindingId,
+                    generation = binding.Generation,
+                    origin = "agent-outreach",
+                },
+            }),
+        };
+        using var response = approval?.ReleasedAt is null
+            ? await compute.SendAsync(inject, provenance: null, ct)
+            : await InjectReleasedOutreachAsync(binding, approval, inject, ct);
+        await EnsureInjectionAcceptedAsync(response, messageUid, ct);
+
+        var message = new ExternalConversationMessage(
+            new ExternalConversationCursor("leaf-discord-outreach", 0),
+            messageUid, "assistant", "text", prepared.Content, DateTimeOffset.UtcNow,
+            new JsonObject { ["origin"] = "agent-outreach" })
+        {
+            DeliveryContent = prepared.DeliveryContent,
+            OutputAssets = prepared.OutputAssets,
+        };
+        var chunks = DiscordMessageChunker.Split(prepared.DeliveryContent);
+        var assetGroups = prepared.OutputAssets.Chunk(10).ToArray();
+        var deliveryCount = Math.Max(chunks.Count, assetGroups.Length);
+        for (var i = 0; i < deliveryCount; i++)
+        {
+            var extra = review is null
+                ? new JsonObject
+                {
+                    ["review_exempt"] = DiscordDeliveryStore.DeliveredBeforeTranscriptExemption,
+                }
+                : new JsonObject
+                {
+                    ["outbound_review"] = review.DeepClone(),
+                    ["review_action"] = JsonRead.String(review, "outcome"),
+                };
+            if (provenance is not null)
+            {
+                extra["announcement"] = provenance.Announcement;
+                extra["outreach_caller"] = provenance.CallerJson();
+            }
+            if (approval?.ReleasedAt is { } releasedAt)
+            {
+                extra["fixed_generation"] = true;
+                extra["released_by"] = approval.ReleasedBy;
+                extra["released_at"] = releasedAt.ToString("O");
+            }
+            var delivery = await deliveries.EnqueueOutboundAsync(
+                binding,
+                message,
+                i,
+                i < chunks.Count ? chunks[i] : "",
+                i < assetGroups.Length ? assetGroups[i] : [],
+                extra,
+                ct);
+            // An exact retry finds the first request's rows; its intent must not change.
+            if (provenance is not null && delivery.Announcement != provenance.Announcement)
+                throw new ArgumentException(
+                    "This idempotency key was already used with a different announcement intent.");
+            if (deliveredDiscordMessageId is not null)
+            {
+                if (deliveryCount != 1)
+                    throw new InvalidOperationException(
+                        "An already-delivered Discord message must fit in one chunk");
+                await deliveries.MarkSentAsync(delivery, deliveredDiscordMessageId, ct);
+            }
+        }
+        await RelayOwnerMessageAsync(binding, messageUid, prepared, ct);
+        return (binding, messageUid);
     }
 
     /// <summary>
@@ -925,6 +947,12 @@ public sealed class DiscordConversationCoordinator(
                          .Where(message => message.Role == "assistant"))
             {
                 if (DiscordControlMessages.IsNoReply(message.Content)) continue;
+                // These injections have their own durable admission. In particular a restart
+                // between injection and enqueue must never project canonical Markdown to Discord.
+                if (message.MessageUid.StartsWith("discord-outreach-", StringComparison.Ordinal)
+                    && OutreachApprovals is { } store
+                    && await store.FindAsync(binding.EntityId, message.MessageUid, ct) is not null)
+                    continue;
                 if (holdReplies && message.Kind is "tool_use" or "tool_result" or "commentary")
                     continue;
                 if (holdReplies && message.Kind == "text"

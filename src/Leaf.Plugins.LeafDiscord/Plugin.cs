@@ -44,6 +44,10 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
         services.AddSingleton(sp => new DiscordDeliveryStore(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
+        services.AddDataProtection();
+        services.AddSingleton(sp => new DiscordOutreachApprovalStore(
+            sp.GetRequiredKeyedService<IEntityStore>(PluginId),
+            sp.GetRequiredService<Microsoft.AspNetCore.DataProtection.IDataProtectionProvider>()));
         services.AddSingleton(sp => new DiscordCommonsConfigurationStore(
             sp.GetRequiredKeyedService<IEntityStore>(PluginId)));
         services.AddSingleton(sp => new DiscordCommonsIngestStore(
@@ -107,6 +111,17 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
             catch (DiscordSentinelRefusedException ex)
             {
                 // The calling session wrote the content; it gets what the Sentinel did and why.
+                if (ex.ApprovalMessageUid is { } messageUid)
+                    return Results.Json(new
+                    {
+                        error = ex.Unavailable ? "sentinel_unavailable" : "sentinel_held",
+                        message = ex.Message,
+                        sentinel = ex.Review,
+                        approvalPending = true,
+                        messageUid,
+                    }, statusCode: ex.Unavailable
+                        ? StatusCodes.Status503ServiceUnavailable
+                        : StatusCodes.Status422UnprocessableEntity);
                 return Results.Json(new
                 {
                     error = ex.Unavailable ? "sentinel_unavailable" : "sentinel_held",

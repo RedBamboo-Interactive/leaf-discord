@@ -21,6 +21,7 @@ const PERMISSIONS = [
 ]
 const SLOTS = [
   { surface: "frontend", role: "contributes", id: "discord", target: "nova", slot: "app-section" },
+  { surface: "frontend", role: "contributes", id: "discord-outreach-approvals", target: "nova", slot: "discussion-notices" },
 ]
 
 function fail(message) { throw new Error(message) }

@@ -311,6 +311,17 @@ public sealed class DiscordBotService(
         }
     }
 
+    internal async Task DrainApprovedOutreachAsync(DiscordBinding binding, CancellationToken ct)
+    {
+        DiscordBotRuntime runtime;
+        try { runtime = await ResolveRuntimeAsync(binding.ApplicationId, ct); }
+        catch (InvalidOperationException) { return; }
+        await runtime.DrainBindingAsync(binding, ct);
+    }
+
+    internal async Task RequireConnectedAsync(DiscordBinding binding, CancellationToken ct)
+        => (await ResolveRuntimeAsync(binding.ApplicationId, ct)).RequireConnected();
+
     public async Task<DiscordMessageMutationResult> EditExistingBindingMessageAsync(
         DiscordBinding binding,
         string messageUid,
@@ -2196,6 +2207,22 @@ internal sealed class DiscordBotRuntime(
         DiscordOutreachProvenance? provenance = null,
         CancellationToken ct = default)
     {
+        ValidateExistingBindingMessage(content, idempotencyKey, deliveryContent, outputAssets);
+        RequireConnected();
+        var config = await GetConfigAsync(ct);
+        ValidateExistingBindingTarget(binding, config.DmAllowlist);
+
+        var sent = await conversations.SendExistingProactiveAsync(
+            binding, idempotencyKey.Trim(), content.Trim(), deliveryContent,
+            outputAssets, provenance, ct);
+        await DrainBindingAsync(sent.Binding, ct);
+        return new DiscordDirectMessageResult(sent.Binding, sent.MessageUid);
+    }
+
+    internal static void ValidateExistingBindingMessage(
+        string content, string idempotencyKey, string? deliveryContent,
+        IReadOnlyList<ExternalConversationOutputAsset> outputAssets)
+    {
         if (string.IsNullOrWhiteSpace(content))
             throw new ArgumentException("Discord message content is required.");
         if (content.Length > 32_000)
@@ -2210,18 +2237,12 @@ internal sealed class DiscordBotRuntime(
         if (outputAssets.Count > 0 && deliveryContent is null)
             throw new ArgumentException(
                 "Discord output Assets require explicit delivery content.");
+    }
 
-        var activeClient = client;
-        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+    internal void RequireConnected()
+    {
+        if (client?.ConnectionState != ConnectionState.Connected)
             throw new InvalidOperationException("Discord bridge is not connected.");
-        var config = await GetConfigAsync(ct);
-        ValidateExistingBindingTarget(binding, config.DmAllowlist);
-
-        var sent = await conversations.SendExistingProactiveAsync(
-            binding, idempotencyKey.Trim(), content.Trim(), deliveryContent,
-            outputAssets, provenance, ct);
-        await DrainBindingAsync(sent.Binding, ct);
-        return new DiscordDirectMessageResult(sent.Binding, sent.MessageUid);
     }
 
     internal static void ValidateExistingBindingTarget(
@@ -4851,7 +4872,7 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
-    private async Task DrainBindingAsync(DiscordBinding binding, CancellationToken ct)
+    internal async Task DrainBindingAsync(DiscordBinding binding, CancellationToken ct)
     {
         if (await IsCommonsBindingAsync(binding, ct)) return;
         var gate = outboxGates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));

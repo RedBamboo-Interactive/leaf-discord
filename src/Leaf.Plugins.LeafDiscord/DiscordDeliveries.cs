@@ -41,6 +41,7 @@ public sealed record DiscordDelivery(
     /// <summary>Why a message row may leave without an outbound review: a fixed bridge notice, or a
     /// message reviewed and delivered before its transcript copy existed.</summary>
     public string? ReviewExempt { get; init; }
+    internal bool FixedGeneration { get; init; }
 
     /// <summary>The egress guard removed hidden characters from this chunk.</summary>
     public bool HiddenCharacters { get; init; }
@@ -339,7 +340,7 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
         }, ct)).Select(Map).ToList();
         waiting.AddRange(await OutboundInStatesAsync(
             bindingId, [ReviewingState, "queued", "retry"], ct));
-        foreach (var delivery in waiting.Where(item => item.Generation == fromGeneration))
+        foreach (var delivery in waiting.Where(item => item.Generation == fromGeneration && !item.FixedGeneration))
             _ = await store.PatchAsync(delivery.EntityId, new JsonObject
             {
                 ["generation"] = toGeneration,
@@ -896,20 +897,7 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             : message.Cursor;
         var slug = $"discord-out-{DiscordBindingStore.Hash(
             $"{binding.BindingId}:{binding.Generation}:{cursor.Epoch}:{cursor.Sequence}:{message.MessageUid}:{chunkIndex}")}";
-        var payload = new JsonObject { ["content"] = content };
-        if (outputAssets.Count > 0)
-        {
-            payload["assets"] = new JsonArray(outputAssets.Select(asset => (JsonNode?)new JsonObject
-            {
-                ["asset_id"] = asset.AssetId,
-                ["description"] = asset.Description,
-            }).ToArray());
-        }
-        // Preserve the historical text-only payload hash so queued deliveries and
-        // replayed transcript rows remain ABI-compatible across this upgrade.
-        var payloadHash = outputAssets.Count == 0
-            ? Hash(content)
-            : Hash(payload.ToJsonString());
+        var (payload, payloadHash) = OutboundPayload(content, outputAssets);
         var existing = await store.GetBySlugAsync(TypeSlug, slug, ct);
         if (existing is not null)
         {
@@ -1203,6 +1191,7 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
             ChunkCount = data["chunk_count"] is null ? null : checked((int)JsonRead.Long(data, "chunk_count", 0)),
             ReplyTurn = JsonRead.String(data, "reply_turn"),
             ReviewExempt = JsonRead.String(data, "review_exempt"),
+            FixedGeneration = JsonRead.Bool(data, "fixed_generation"),
             HiddenCharacters = data["hidden_characters"] is JsonValue hidden
                 && hidden.TryGetValue<bool>(out var hasHidden) && hasHidden,
             Announcement = data["announcement"] is JsonValue announcement
@@ -1216,6 +1205,38 @@ public sealed class DiscordDeliveryStore(IEntityStore store)
 
     private static string Hash(string value)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+
+    private static (JsonObject Payload, string Hash) OutboundPayload(
+        string content, IReadOnlyList<ExternalConversationOutputAsset> assets)
+    {
+        var payload = new JsonObject { ["content"] = content };
+        if (assets.Count == 0) return (payload, Hash(content)); // Historical text-only receipt.
+        payload["assets"] = new JsonArray(assets.Select(asset => (JsonNode?)new JsonObject
+        {
+            ["asset_id"] = asset.AssetId,
+            ["description"] = asset.Description,
+        }).ToArray());
+        return (payload, Hash(payload.ToJsonString()));
+    }
+
+    internal async Task ValidateOutreachReplayAsync(
+        DiscordBinding binding, string messageUid, DiscordPreparedOutreach prepared, bool announcement,
+        CancellationToken ct)
+    {
+        var rows = await MessageRowsAsync(binding, messageUid, ct);
+        if (rows.Count == 0) return;
+        var chunks = DiscordMessageChunker.Split(prepared.DeliveryContent);
+        var count = Math.Max(chunks.Count, prepared.OutputAssets.Count > 0 ? 1 : 0);
+        foreach (var row in rows)
+        {
+            var i = row.ChunkIndex;
+            var (_, hash) = OutboundPayload(i < chunks.Count ? chunks[i] : "",
+                i == 0 ? prepared.OutputAssets : []);
+            if (i >= count || row.PayloadHash != hash || row.Announcement != announcement)
+                throw new DiscordOutreachConflictException("idempotency_key_conflict",
+                    "This idempotency key already belongs to a different Discord delivery.");
+        }
+    }
 
     private static string Truncate(string value, int length)
         => value.Length <= length ? value : value[..length];

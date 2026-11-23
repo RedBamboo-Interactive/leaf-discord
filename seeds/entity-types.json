@@ -157,6 +157,18 @@
   },
   {
     "typeSlug": "entity-type",
+    "slug": "leaf-discord-outreach-approval",
+    "name": "Discord Outreach Approval",
+    "data": {
+      "icon": "ph-bold ph-shield-warning",
+      "color": "indigo",
+      "folder": "runtime",
+      "versioning": false,
+      "description": "Protected private outreach draft and owner decision"
+    }
+  },
+  {
+    "typeSlug": "entity-type",
     "slug": "leaf-discord-delivery",
     "name": "Discord Delivery",
     "data": {

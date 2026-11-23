@@ -362,6 +362,42 @@ public sealed class DiscordEndpointAuthorizationTests
         Assert.False(DiscordEndpoints.CanReleaseHeldReply(AgentSession(appId), new FakeAuthContext("owner-1", [])));
     }
 
+    [Theory]
+    [InlineData("Cookies", "owner-1", "device-session", null, true)]
+    [InlineData("LocalDefault", "owner-1", "device-session", null, false)]
+    [InlineData("LocalDefault", "local-user", "device-session", null, false)]
+    [InlineData(null, "owner-1", "device-session", null, false)]
+    [InlineData("Bearer", "owner-1", null, null, false)]
+    [InlineData("Bearer", "owner-1", "device-session", "execution", false)]
+    [InlineData("Bearer", "service:redleaf", "device-session", null, false)]
+    [InlineData("Bearer", "system", "device-session", null, false)]
+    [InlineData("Bearer", "owner-1", "device-session", "service", false)]
+    public void Private_outreach_requires_a_real_authenticated_person_session(
+        string? scheme, string subject, string? sid, string? tokenUse, bool expected)
+    {
+        var claims = new List<Claim> { new("sub", subject) };
+        if (sid is not null) claims.Add(new Claim("sid", sid));
+        if (tokenUse is not null) claims.Add(new Claim("token_use", tokenUse));
+        var http = new DefaultHttpContext { User = new ClaimsPrincipal(new ClaimsIdentity(claims, scheme)) };
+        Assert.Equal(expected, DiscordEndpoints.CanApprovePrivateOutreach(http,
+            new FakeAuthContext(subject, ["owner", "admin"])));
+    }
+
+    [Fact]
+    public async Task A_signed_in_admin_can_only_manage_their_own_private_outreach_origin()
+    {
+        var store = new MemoryEntityStore();
+        var origin = await store.CreateAsync("discussion", "Nova", new System.Text.Json.Nodes.JsonObject
+        {
+            ["owner_id"] = "owner-1",
+        });
+        var http = new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity([new("sub", "owner-2"), new("sid", "device")], "Cookies")),
+        };
+        Assert.False(DiscordEndpoints.CanManageOutreachOrigin(http, new FakeAuthContext("owner-2", ["admin"]), origin));
+    }
+
     private sealed class FakeAuthContext(
         string? userId,
         IReadOnlyList<string>? roles = null) : IAuthContext

@@ -25,6 +25,13 @@
           "description": "Persistent external Discord conversations, filtered by Agent",
           "legacyRoute": "/apps/leaf-discord"
         }
+      },
+      {
+        "id": "discord-outreach-approvals",
+        "target": "nova",
+        "slot": "discussion-notices",
+        "order": 2,
+        "description": "Owner review of held Discord outreach from the current private discussion"
       }
     ]
   },

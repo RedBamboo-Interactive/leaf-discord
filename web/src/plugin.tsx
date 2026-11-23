@@ -34,7 +34,10 @@ import {
 import { DISCORD_PRODUCT_COPY } from "./discord-product"
 import {
   blockMessageUid,
+  discardHeldOutreachPath,
   heldReplyReason,
+  outreachApprovalsPath,
+  outreachAssetImagePath,
   releaseHeldReplyPath,
   type DiscordOutboundStatus,
 } from "./discord-held-reply"
@@ -157,8 +160,146 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     headers: init?.body ? { "Content-Type": "application/json", ...init.headers } : init?.headers,
   })
   const payload = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(payload.message ?? payload.error ?? `HTTP ${response.status}`)
+  if (!response.ok) throw new DiscordApiError(response.status, payload.message ?? payload.error ?? `HTTP ${response.status}`)
   return payload as T
+}
+
+class DiscordApiError extends Error {
+  constructor(readonly status: number, message: string) { super(message) }
+}
+
+type OutreachDraft = {
+  bindingEntityId: string
+  messageUid: string
+  channelId: string
+  channelName: string
+  channelKind: string
+  guildName?: string
+  deliveryChunks: string[]
+  outputAssets: Array<{ assetId: string; description: string }>
+  sentinel: DiscordOutboundStatus
+  canRelease: boolean
+  canDiscard: boolean
+  releasePending: boolean
+}
+
+function OutreachApprovalNotices({ context }: {
+  context?: Readonly<Record<string, unknown>>
+}) {
+  const discussionId = context?.discussionId
+  if (typeof discussionId !== "string" || !discussionId) return null
+  return <DiscussionOutreachApprovals key={discussionId} discussionId={discussionId} isStreaming={context?.isStreaming === true} />
+}
+
+function DiscussionOutreachApprovals({ discussionId, isStreaming }: {
+  discussionId: string
+  isStreaming: boolean
+}) {
+  const [items, setItems] = useState<OutreachDraft[]>([])
+  const [error, setError] = useState("")
+  const [loadError, setLoadError] = useState("")
+  const [busy, setBusy] = useState<string | null>(null)
+  const listRequest = useRef<AbortController | null>(null)
+  const refresh = useCallback(async () => {
+    listRequest.current?.abort()
+    const controller = new AbortController()
+    listRequest.current = controller
+    try {
+      const response = await api<{ items: OutreachDraft[] }>(outreachApprovalsPath(discussionId), {
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted) {
+        setItems(response.items)
+        setLoadError("")
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return
+      if (err instanceof DiscordApiError && [403, 404].includes(err.status)) {
+        setItems([])
+        setLoadError("")
+      } else {
+        setLoadError("Could not load Discord outreach approvals.")
+      }
+    }
+  }, [discussionId])
+
+  useEffect(() => {
+    void refresh()
+    return () => listRequest.current?.abort()
+  }, [refresh])
+
+  const wasStreaming = useRef(isStreaming)
+  useEffect(() => {
+    if (wasStreaming.current && !isStreaming) void refresh()
+    wasStreaming.current = isStreaming
+  }, [isStreaming, refresh])
+
+  async function decide(draft: OutreachDraft, action: "release" | "discard") {
+    setBusy(draft.messageUid)
+    setError("")
+    try {
+      const path = action === "release"
+        ? releaseHeldReplyPath(draft.bindingEntityId, draft.messageUid, discussionId)
+        : discardHeldOutreachPath(draft.bindingEntityId, draft.messageUid, discussionId)
+      await api(path, { method: "POST" })
+      setItems(current => current.filter(item => item.messageUid !== draft.messageUid))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update Discord outreach.")
+    } finally {
+      await refresh()
+      setBusy(null)
+    }
+  }
+
+  if (items.length === 0 && !error && !loadError) return null
+  return (
+    <section aria-label="Discord outreach approvals" tabIndex={0}
+      className="max-h-[min(45dvh,26rem)] shrink-0 space-y-2 overflow-y-auto overscroll-contain">
+      {loadError && <div role="alert">{loadError}</div>}
+      {error && <div role="alert">{error}</div>}
+      {items.map(draft => {
+        const destination = draft.channelKind === "dm"
+          ? draft.channelName : `${draft.guildName ? `${draft.guildName} / ` : ""}#${draft.channelName}`
+        return (
+          <article key={draft.messageUid} aria-busy={busy === draft.messageUid}
+            className="rounded-md border px-3 py-2 text-xs text-text"
+            style={{ borderColor: "var(--color-accent-gold)" }}>
+            <div className="flex items-start gap-2 font-medium">
+              <i className="ph-bold ph-shield-warning mt-0.5" aria-hidden="true"
+                style={{ color: "var(--color-accent-gold)" }} />
+              <span>Discord outreach to {destination} <span className="font-normal text-text-muted">({draft.channelId})</span></span>
+            </div>
+            <p className="mt-1 text-text-muted">{heldReplyReason(draft.sentinel, "post")}</p>
+            {draft.deliveryChunks.map((chunk, index) => (
+              <p key={index} className="mt-2 whitespace-pre-wrap break-words">{chunk}</p>
+            ))}
+            {draft.outputAssets.length > 0 && (
+              <ul aria-label="Discord attachments" className="mt-2 flex flex-wrap gap-2">
+                {draft.outputAssets.map((asset, index) => {
+                  const preview = outreachAssetImagePath(asset.assetId)
+                  return <li key={`${asset.assetId}-${index}`} className="max-w-40 break-words">
+                    {preview && <img className="max-h-24 rounded object-contain" loading="lazy" src={preview} alt="" />}
+                    <span>{asset.description} <span className="text-text-muted">({asset.assetId})</span></span>
+                  </li>
+                })}
+              </ul>
+            )}
+            {!draft.canRelease && <p className="mt-2" role="status">The original Discord session is unavailable.</p>}
+            {draft.releasePending && draft.canRelease && <p className="mt-2" role="status">Release was approved. Retry to finish sending.</p>}
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="secondary" disabled={busy !== null || !draft.canRelease}
+                onClick={() => void decide(draft, "release")}>
+                <i className="ph-bold ph-paper-plane-tilt" aria-hidden="true" />
+                {draft.releasePending ? "Retry release" : "Release"}
+              </Button>
+              {draft.canDiscard && <Button size="sm" variant="ghost" disabled={busy !== null}
+                onClick={() => void decide(draft, "discard")}>Discard</Button>}
+            </div>
+          </article>
+        )
+      })}
+    </section>
+  )
 }
 
 export function Page() {
@@ -647,6 +788,6 @@ function AgentFilter({ agents, selectedId, onSelect }: {
 
 export const plugin: LeafAppPlugin = {
   id: "leaf-discord",
-  extensions: { discord: Page },
+  extensions: { discord: Page, "discord-outreach-approvals": OutreachApprovalNotices },
   settingsPanel: { Component: DiscordSettingsPanel },
 }

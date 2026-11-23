@@ -1,4 +1,5 @@
 [
+  { "parentType": "leaf-discord-outreach-approval", "slug": "protected_draft", "name": "Protected Draft", "fieldType": "secret", "sortOrder": 0 },
   { "parentType": "leaf-discord-config", "slug": "application_id", "name": "Application ID", "fieldType": "string", "sortOrder": 0, "defaultValue": "" },
   { "parentType": "leaf-discord-config", "slug": "interaction_public_key", "name": "Interaction Public Key", "fieldType": "string", "sortOrder": 1, "defaultValue": "" },
   { "parentType": "leaf-discord-config", "slug": "bot_token", "name": "Bot Token", "fieldType": "secret", "sortOrder": 2, "description": "Encrypted by RedLeaf and never returned by plugin APIs" },

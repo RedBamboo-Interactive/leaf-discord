@@ -1,11 +1,32 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  discardHeldOutreachPath,
+  outreachApprovalsPath,
+  outreachAssetImagePath,
   blockMessageUid,
   heldReplyReason,
   outboundStatuses,
   releaseHeldReplyPath,
 } from "./discord-held-reply.ts"
+
+test("outreach approval actions scope and encode the origin discussion", () => {
+  assert.equal(outreachApprovalsPath("a/b + c"), "/outreach/approvals?discussionId=a%2Fb%20%2B%20c")
+  assert.equal(releaseHeldReplyPath("binding", "outreach", "origin"),
+    "/bindings/binding/messages/outreach/release?discussionId=origin")
+  assert.equal(discardHeldOutreachPath("binding", "outreach", "origin"),
+    "/bindings/binding/messages/outreach/discard?discussionId=origin")
+})
+
+test("previews accept only canonical local Leaf image asset identifiers", () => {
+  const image = "019a8140-fcae-4887-911d-eb24c2c787e4.webp"
+  assert.equal(outreachAssetImagePath(image), `/api/assets/${image}`)
+  assert.equal(outreachAssetImagePath(`/api/assets/${image}`), `/api/assets/${image}`)
+  assert.equal(outreachAssetImagePath(`stable-${"a".repeat(64)}.png`), `/api/assets/stable-${"a".repeat(64)}.png`)
+  for (const value of [`https://example.org/${image}`, `//example.org/${image}`, `../${image}`,
+    `/api/assets/${image}?redirect=1`, `/api/assets/%2f${image}`, image.replace(".webp", ".svg")])
+    assert.equal(outreachAssetImagePath(value), null)
+})
 
 test("only assistant text replies with a review are listed, by message uid", () => {
   const statuses = outboundStatuses([

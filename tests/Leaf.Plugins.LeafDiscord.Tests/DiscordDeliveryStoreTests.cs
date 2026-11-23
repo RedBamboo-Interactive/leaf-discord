@@ -646,6 +646,15 @@ internal sealed class MemoryEntityStore(
         return Task.FromResult(Hydrate(updated)!);
     }
 
+    public async Task<LeafEntity?> CompareExchangeBySlugAsync(
+        string typeSlug, string slug, string name, JsonObject data, DateTimeOffset? expectedUpdatedAt,
+        CancellationToken ct = default)
+    {
+        var current = await GetBySlugAsync(typeSlug, slug, ct);
+        if (current?.UpdatedAt != expectedUpdatedAt) return null;
+        return await UpsertBySlugAsync(typeSlug, slug, name, data, ct);
+    }
+
     public Task DeleteAsync(Guid id, CancellationToken ct = default)
     {
         items.RemoveAll(item => item.Id == id);

@@ -58,12 +58,13 @@ public sealed record DiscordBehaviorRequest(
     string? GuildId = null,
     string? ConversationId = null);
 
-public static class DiscordEndpoints
+public static partial class DiscordEndpoints
 {
     private const int MaxTranscriptDiscordLookups = 50;
 
     public static void Map(RouteGroupBuilder group)
     {
+        MapOutreachApprovals(group);
         group.MapGet("/config", async (
             IAuthContext auth, DiscordBotConfigurationStore configurations,
             DiscordAgentResolver agents,
@@ -1547,18 +1548,44 @@ public static class DiscordEndpoints
         group.MapPost("/bindings/{id:guid}/messages/{messageUid}/release", async (
             Guid id,
             string messageUid,
+            string? discussionId,
             HttpContext http,
             IAuthContext auth,
             DiscordBindingStore bindings,
             DiscordConversationCoordinator conversations,
+            DiscordOutreachApprovalStore approvals,
+            DiscordReplySubscriptionStore subscriptions,
             DiscordBotService bot,
             CancellationToken ct) =>
         {
+            if (discussionId is not null && !CanApprovePrivateOutreach(http, auth))
+                return Forbidden("Sign in as the owner to release held Discord outreach.");
             if (!CanReleaseHeldReply(http, auth))
                 return Forbidden("Only the owner or an administrator in the Leaf UI can release a held reply; an Agent session cannot.");
             var binding = await bindings.GetAsync(id, ct);
             if (binding is null) return Results.NotFound();
-            var result = await conversations.ReleaseHeldReplyAsync(binding, messageUid, auth.UserId!, ct);
+            DiscordReleaseResult result;
+            if (discussionId is not null)
+            {
+                var origin = await approvals.FindOriginAsync(discussionId, ct);
+                if (!CanManageOutreachOrigin(http, auth, origin)) return Results.NotFound();
+                try
+                {
+                    result = await conversations.ReleasePrivateOutreachAsync(
+                        binding, origin!, messageUid, auth.UserId!, subscriptions, ct);
+                }
+                catch (Exception ex) when (IsOutreachEndpointFailure(ex))
+                {
+                    return OutreachEndpointFailure(ex);
+                }
+            }
+            else
+            {
+                if (messageUid.StartsWith("discord-outreach-", StringComparison.Ordinal)
+                    && await approvals.FindAsync(binding.EntityId, messageUid, ct) is not null)
+                    return Results.NotFound();
+                result = await conversations.ReleaseHeldReplyAsync(binding, messageUid, auth.UserId!, ct);
+            }
             switch (result.Outcome)
             {
                 case DiscordReleaseOutcome.NotFound:
@@ -1631,6 +1658,8 @@ public static class DiscordEndpoints
             DiscordBindingStore bindings,
             DiscordAgentResolver agents,
             DiscordBotService bot,
+            DiscordConversationCoordinator conversations,
+            DiscordOutreachApprovalStore approvals,
             DiscordReplySubscriptionStore replySubscriptions,
             DiscordConversationLeadStore leads,
             ILoggerFactory loggers,
@@ -1653,6 +1682,10 @@ public static class DiscordEndpoints
                 return Forbidden("This Agent cannot address that Discord binding.");
             if (ValidateLeadRequest(request, caller) is { } invalidLead)
                 return invalidLead;
+            if (caller.DiscussionId is { } discussionId && !caller.HasAutomationContext)
+                return await SubmitPrivateOutreachAsync(
+                    request, caller, discussionId, binding, approvals, conversations,
+                    replySubscriptions, bot, agents, ct);
             // Claim before sending, so the session also hears the message that takes the lead.
             // A send that fails puts the previous row back. A discussion that already leads is
             // renewed only after its message is delivered.
@@ -3422,6 +3455,7 @@ public static class DiscordEndpoints
                 return new LeafAgentCaller(actorEntityId, beneficiaryId)
                 {
                     DiscussionId = discussionId,
+                    HasAutomationContext = automationIds.Count > 0,
                     AppId = appId,
                     ActorKind = actorKind,
                 };
@@ -3459,6 +3493,7 @@ internal sealed record LeafAgentCaller(
 {
     /// <summary>The signed private discussion the call came from, when there is one.</summary>
     public string? DiscussionId { get; init; }
+    public bool HasAutomationContext { get; init; }
 
     /// <summary>The signed execution app and actor kind (only <c>nova</c> agents are read).</summary>
     public string AppId { get; init; } = "nova";
