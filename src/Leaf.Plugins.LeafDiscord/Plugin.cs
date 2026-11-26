@@ -94,6 +94,10 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         services.AddSingleton<DiscordAttachmentIngestor>();
         services.AddSingleton<DiscordRestTransport>();
         services.AddSingleton<DiscordBotService>();
+        // Closes the gateway sessions while the host stops, before the container is disposed
+        // (DiscordBotShutdown). It stops only a bot OnStartupAsync started.
+        services.AddSingleton(sp => new DiscordBotShutdown(sp.GetService<ILogger<DiscordBotShutdown>>()));
+        services.AddHostedService(sp => sp.GetRequiredService<DiscordBotShutdown>());
         services.AddSingleton<DiscordSettingsProvider>();
         services.AddSingleton<IPluginSettingsProvider>(sp =>
             sp.GetRequiredService<DiscordSettingsProvider>());
@@ -148,6 +152,7 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         host.GetRequiredService<DiscordCommonsRelayService>()
             .Start(lifetime.ApplicationStopping);
         var bot = host.GetRequiredService<DiscordBotService>();
+        host.GetRequiredService<DiscordBotShutdown>().Started(bot);
         _ = Task.Run(() => bot.StartAsync(lifetime.ApplicationStopping), CancellationToken.None);
     }
 }
