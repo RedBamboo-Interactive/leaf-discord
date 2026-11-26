@@ -165,17 +165,94 @@ public sealed class DiscordBotService(
               + (missing.Count == 1 ? "is" : "are") + " missing.";
     }
 
-    public async Task StartAsync(CancellationToken stoppingToken)
+    internal static readonly TimeSpan StartRetryFirstDelay = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan StartRetryMaxDelay = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Starts every configured bot. A start that fails before it reaches Discord (the bot list or
+    /// a bot's configuration could not be read, typically a database blip at boot) is retried with
+    /// backoff until it succeeds or the host stops. A failed login is never retried: it waits for
+    /// its settings to change. Ends only when every bot has settled or on cancellation.
+    /// </summary>
+    public Task StartAsync(CancellationToken stoppingToken) => StartAsync(stoppingToken, null);
+
+    internal Task StartAsync(CancellationToken stoppingToken, TimeSpan? firstRetryDelay)
+    {
+        var logger = loggerFactory.CreateLogger<DiscordBotService>();
+        return RunStartWithRetryAsync(
+            StartPendingAsync,
+            (delay, ct) => Task.Delay(delay, ct),
+            (error, delay) =>
+            {
+                if (error is null)
+                    logger.LogWarning(
+                        "A Discord bot could not read its configuration to start; retrying in {Delay}", delay);
+                else
+                    logger.LogWarning(error,
+                        "The Discord bots could not be listed to start; retrying in {Delay}", delay);
+            },
+            stoppingToken,
+            firstRetryDelay ?? StartRetryFirstDelay,
+            firstRetryDelay is null ? StartRetryMaxDelay : firstRetryDelay.Value * 4);
+    }
+
+    /// <summary>One pass: starts the bots not yet tried and those waiting to retry. True when none waits.</summary>
+    private async Task<bool> StartPendingAsync(CancellationToken stoppingToken)
     {
         await lifecycle.WaitAsync(stoppingToken);
         try
         {
+            var settled = true;
             foreach (var config in await configurations.ListAsync(stoppingToken))
-                await GetOrCreateRuntime(config).StartAsync(stoppingToken);
+            {
+                var runtime = GetOrCreateRuntime(config);
+                if (runtime.StartAttempted && !runtime.StartRetryPending) continue;
+                await runtime.StartAsync(stoppingToken);
+                if (runtime.StartRetryPending) settled = false;
+            }
+            return settled;
         }
         finally
         {
             lifecycle.Release();
+        }
+    }
+
+    // attempt: true when nothing is left to retry. A throw is retried like false. reportRetry gets
+    // the exception (null for a pass that returned false) and the delay before the next pass.
+    internal static async Task RunStartWithRetryAsync(
+        Func<CancellationToken, Task<bool>> attempt,
+        Func<TimeSpan, CancellationToken, Task> wait,
+        Action<Exception?, TimeSpan> reportRetry,
+        CancellationToken ct,
+        TimeSpan firstDelay,
+        TimeSpan maxDelay)
+    {
+        var delay = firstDelay;
+        try
+        {
+            while (true)
+            {
+                Exception? failure = null;
+                try
+                {
+                    if (await attempt(ct)) return;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+                reportRetry(failure, delay);
+                await wait(delay, ct);
+                delay = delay * 2 < maxDelay ? delay * 2 : maxDelay;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
         }
     }
 
@@ -790,7 +867,15 @@ internal sealed class DiscordBotRuntime(
     // Set when Discord refused the member intents; cleared by an explicit restart.
     private bool commonsMemberIntentsDisallowed;
     private string state = "stopped";
+    private volatile bool startAttempted;
+    private volatile bool startRetryPending;
     private DateTimeOffset? connectedAt;
+
+    /// <summary>A start has run past the "already running" check at least once.</summary>
+    internal bool StartAttempted => startAttempted;
+
+    /// <summary>The last start could not read the configuration and waits to be retried.</summary>
+    internal bool StartRetryPending => startRetryPending;
     private string? lastError;
     private string? profileWarning;
 
@@ -1904,7 +1989,29 @@ internal sealed class DiscordBotRuntime(
         try
         {
             if (client is not null) return;
-            var config = await GetConfigAsync(stoppingToken);
+            startAttempted = true;
+            // Before anything reaches Discord: a configuration that cannot be read (a database
+            // blip, typically at boot) is retried by DiscordBotService.StartAsync. A configuration
+            // that is gone, and every failure from the login on, are not.
+            LeafDiscordConfig? read;
+            try
+            {
+                read = await configStore.GetAsync(configId, stoppingToken);
+            }
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+            {
+                state = "error";
+                lastError = ex.Message;
+                startRetryPending = true;
+                logger.LogWarning(ex,
+                    "Discord bot configuration {ConfigId} could not be read to start; the start is retried",
+                    configId);
+                return;
+            }
+            startRetryPending = false;
+            var config = read
+                ?? throw new InvalidOperationException(
+                    $"Discord bot configuration '{configId}' no longer exists.");
             if (!config.Ready)
             {
                 state = config.Enabled ? "not-configured" : "disabled";
