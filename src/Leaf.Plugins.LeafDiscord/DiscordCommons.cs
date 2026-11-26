@@ -977,8 +977,11 @@ public sealed class DiscordCommonsRelayService(
     DiscordCommonsConfigurationStore configurations,
     DiscordCommonsIngestStore deliveries,
     ILogger<DiscordCommonsRelayService> logger,
-    HttpMessageHandler? handler = null) : IAsyncDisposable
+    HttpMessageHandler? handler = null,
+    TimeSpan? retryDelay = null) : IAsyncDisposable
 {
+    private static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(30);
+    private readonly TimeSpan firstRetryDelay = retryDelay ?? TimeSpan.FromSeconds(5);
     private readonly HttpClient http = new(handler ?? new HttpClientHandler
     {
         AllowAutoRedirect = false,
@@ -1301,7 +1304,14 @@ public sealed class DiscordCommonsRelayService(
         await runCts.CancelAsync();
         if (loop is not null)
         {
-            try { await loop; } catch (OperationCanceledException) { }
+            // Never throws: this runs inside the host's container disposal, and a fault rethrown
+            // there aborted an in-process restart with Kestrel already stopped (2026-11-26).
+            try { await loop; }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "The Leaf Community relay loop had failed before it stopped");
+            }
         }
         runCts.Dispose();
         runCts = null;
@@ -1516,13 +1526,38 @@ public sealed class DiscordCommonsRelayService(
 
     private async Task RunAsync(CancellationToken ct)
     {
+        var failures = 0;
         while (!ct.IsCancellationRequested)
         {
-            await DrainAsync(ct);
-            var delay = Task.Delay(TimeSpan.FromSeconds(30), ct);
+            var next = IdleDelay;
+            try
+            {
+                await DrainAsync(ct);
+                failures = 0;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                // A transient failure (a database timeout, the relay unreachable) must not end the
+                // loop: the pending rows stay queued and the next drain sends them.
+                failures++;
+                next = RetryDelay(failures);
+                logger.LogWarning(ex, "Leaf Community relay drain failed; retrying in {Delay}", next);
+            }
+            var delay = Task.Delay(next, ct);
             var wake = signal.WaitAsync(ct);
             await Task.WhenAny(delay, wake);
         }
+    }
+
+    /// <summary>Doubles from the first retry delay, never beyond the loop's ordinary 30-second cadence.</summary>
+    private TimeSpan RetryDelay(int failures)
+    {
+        var delay = firstRetryDelay * Math.Pow(2, Math.Min(failures - 1, 10));
+        return delay < IdleDelay ? delay : IdleDelay;
     }
 
     private async Task DrainAsync(CancellationToken ct)
