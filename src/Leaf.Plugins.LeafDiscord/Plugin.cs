@@ -156,7 +156,9 @@ public sealed class LeafDiscordPlugin : ILeafPlugin
         // StartAsync retries what a boot-time blip broke and never faults for it; anything else
         // that escapes is logged rather than lost with the discarded task.
         var startLogger = host.GetRequiredService<ILoggerFactory>().CreateLogger<DiscordBotService>();
-        _ = Task.Run(() => bot.StartAsync(lifetime.ApplicationStopping), CancellationToken.None)
+        // The run's own token, not ApplicationStopping: the kernel ends it first, before it stops RedCompute and the
+        // web host, so the bot's loops stop while what they use still answers.
+        _ = Task.Run(() => bot.StartAsync(ct), CancellationToken.None)
             .ContinueWith(
                 task => startLogger.LogError(task.Exception, "The Discord bots did not start"),
                 CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);

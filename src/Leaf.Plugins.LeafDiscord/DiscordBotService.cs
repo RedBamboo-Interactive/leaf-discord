@@ -4533,6 +4533,23 @@ internal sealed class DiscordBotRuntime(
         }
     }
 
+    /// <summary>
+    /// How a failed maintenance phase is logged. While the run ends (the host stops, or restarts in process), not at
+    /// all: what failed goes away with it, and the next run requests the binding again. RedCompute not answering
+    /// (stopping, draining for a deploy, restarting: an HttpRequestException) is a Warning, and the binding is
+    /// retried. Anything else is an Error.
+    /// </summary>
+    internal static void ReportMaintenanceFailure(ILogger logger, string phase, string bindingId, Exception error,
+        CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested) return;
+        if (error is HttpRequestException)
+            logger.LogWarning("Discord {Phase} for {BindingId} waits for RedCompute and is retried: {Reason}",
+                phase, bindingId, error.Message);
+        else
+            logger.LogError(error, "Discord {Phase} failed for {BindingId}", phase, bindingId);
+    }
+
     private async Task RunMaintenanceSweepAsync(bool recoverySweep, CancellationToken ct)
     {
         var config = await GetConfigAsync(ct);
@@ -4574,8 +4591,7 @@ internal sealed class DiscordBotRuntime(
                 catch (Exception ex)
                 {
                     retryFull = true;
-                    logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
-                        "inbound retry", activeBinding.BindingId);
+                    ReportMaintenanceFailure(logger, "inbound retry", activeBinding.BindingId, ex, ct);
                 }
 
                 try
@@ -4590,8 +4606,7 @@ internal sealed class DiscordBotRuntime(
                 catch (Exception ex)
                 {
                     retryFull = true;
-                    logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
-                        "transcript reconciliation", activeBinding.BindingId);
+                    ReportMaintenanceFailure(logger, "transcript reconciliation", activeBinding.BindingId, ex, ct);
                 }
 
                 if (retryFull)
@@ -4609,8 +4624,7 @@ internal sealed class DiscordBotRuntime(
             catch (Exception ex)
             {
                 maintenance.RetryDrain(activeBinding.BindingId);
-                logger.LogError(ex, "Discord {Phase} failed for {BindingId}",
-                    "outbound drain", activeBinding.BindingId);
+                ReportMaintenanceFailure(logger, "outbound drain", activeBinding.BindingId, ex, ct);
             }
         }
     }
