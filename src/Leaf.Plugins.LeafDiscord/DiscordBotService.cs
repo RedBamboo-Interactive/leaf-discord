@@ -4532,10 +4532,40 @@ internal sealed class DiscordBotRuntime(
         DiscordSocketClient source,
         CancellationToken ct)
     {
-        await ReconcileCommonsRolesAsync(source, ct);
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(2));
-        while (await timer.WaitForNextTickAsync(ct))
-            await ReconcileCommonsRolesAsync(source, ct);
+        await RunPeriodicReconciliationAsync(
+            token => ReconcileCommonsRolesAsync(source, token),
+            token => timer.WaitForNextTickAsync(token),
+            ex => logger.LogWarning(ex,
+                "Public Agent role reconciliation failed for bot configuration {ConfigId}; retrying at the next tick",
+                configId),
+            ct);
+    }
+
+    // One reconciliation per tick. A failure (a database timeout, a Discord error, or the write
+    // of the error state itself) is reported and the next tick tries again: an exception escaping
+    // here would end role reconciliation silently until the next restart. Only cancellation ends it.
+    internal static async Task RunPeriodicReconciliationAsync(
+        Func<CancellationToken, Task> reconcile,
+        Func<CancellationToken, ValueTask<bool>> nextTick,
+        Action<Exception> reportFailure,
+        CancellationToken ct)
+    {
+        do
+        {
+            try
+            {
+                await reconcile(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                reportFailure(ex);
+            }
+        } while (await nextTick(ct));
     }
 
     private async Task RunCommonsWebhookLoopAsync(
