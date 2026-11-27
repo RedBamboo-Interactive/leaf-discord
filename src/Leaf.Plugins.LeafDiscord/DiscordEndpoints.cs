@@ -889,6 +889,21 @@ public static partial class DiscordEndpoints
         })
             .WithSummary("Creates a text channel in a Discord server. Requires a signed private Agent discussion of the bot's Agent and the Manage Channels permission.");
 
+        group.MapPost("/bots/{id:guid}/guilds/{guildId}/outage-alerts", async (
+            Guid id,
+            string guildId,
+            HttpContext http,
+            IAuthContext auth,
+            DiscordBotConfigurationStore configurations,
+            DiscordAgentResolver agents,
+            DiscordUserIdentityResolver userIdentities,
+            DiscordBotService bot,
+            CancellationToken ct) =>
+            await SetUpOutageAlertsAsync(id, guildId, http, auth, configurations, agents, userIdentities,
+                http.RequestServices.GetService(typeof(IOutageAlerts)) as IOutageAlerts,
+                (alerts, owner) => bot.SetUpOutageAlertsAsync(id, guildId, owner, alerts, ct), ct))
+            .WithSummary("Turns on Leaf's outage alerts in a Discord server: creates #leaf-alerts, private to the owner's linked Discord user and the bot (server administrators can see it: Discord lets them past channel overwrites), and reuses an existing one only if it has exactly those overwrites, creates a webhook there and hands its URL straight to the kernel, which stores it protected and schedules the outage watcher. The URL is never returned or logged; a repeat replaces the webhook. Returns guildId, channelId, channelName, channelCreated, scheduled, problem and replacedWebhooks. The owner's act: a signed private Agent discussion of the bot's Agent with its owner as beneficiary, or the owner or an administrator directly; never a Discord session. 409 when the owner has no linked Discord user, or a #leaf-alerts exists without exactly those overwrites; 501 when the kernel has no outage alerts. Needs Manage Channels and Manage Webhooks.");
+
         group.MapPost("/bots/{id:guid}/guilds/{guildId}/categories", async (
             Guid id,
             string guildId,
@@ -2784,6 +2799,91 @@ public static partial class DiscordEndpoints
     /// the row, or for a row sent before channels were recorded, from the guild's
     /// <c>#announcements</c> as the connected bot sees it.
     /// </summary>
+    /// <summary>
+    /// Outage alerts are the owner's to turn on (they create a channel in the owner's server and a credential
+    /// the kernel keeps): a private Agent discussion acting for the bot's owner, or the owner directly.
+    /// </summary>
+    internal static async Task<IResult> SetUpOutageAlertsAsync(
+        Guid id,
+        string guildId,
+        HttpContext http,
+        IAuthContext auth,
+        DiscordBotConfigurationStore configurations,
+        DiscordAgentResolver agents,
+        DiscordUserIdentityResolver userIdentities,
+        IOutageAlerts? alerts,
+        Func<IOutageAlerts, string, Task<DiscordOutageAlertsResult>> setUp,
+        CancellationToken ct)
+    {
+        var config = await configurations.GetAsync(id, ct);
+        if (string.Equals(http.User.FindFirst("token_use")?.Value, "execution", StringComparison.OrdinalIgnoreCase))
+        {
+            var caller = ReadPrivateLeafAgentCaller(http);
+            if (caller is null)
+                return Forbidden("A signed private Nova Agent discussion is required; a Discord session cannot turn on outage alerts.");
+            if (config is null) return Results.NotFound();
+            var agent = await agents.ResolveAsync(config.AgentId, ct);
+            if (!MatchesBotOwnerAndAgent(caller, config, agent?.Id.ToString()))
+                return Forbidden("This Agent cannot address that Discord bot.");
+        }
+        else
+        {
+            if (!IsAdmin(auth) || string.IsNullOrWhiteSpace(auth.UserId))
+                return Forbidden("An authenticated owner or administrator is required.");
+            if (config is null) return Results.NotFound();
+            if (!CanManageBot(auth, config))
+                return Forbidden("You cannot manage this Discord bot.");
+        }
+        if (alerts is null)
+            return Results.Json(new
+            {
+                error = "outage_alerts_unavailable",
+                message = "This Leaf kernel has no outage alerts (kernel API 0.1.18 or later).",
+            }, statusCode: StatusCodes.Status501NotImplemented);
+
+        var ownerUserId = config.OwnerUserId ?? await agents.ResolveOwnerUserIdAsync(config.AgentId, ct);
+        var ownerDiscordId = ownerUserId is null ? null : await userIdentities.ResolveExternalIdAsync(ownerUserId, ct);
+        if (ownerDiscordId is null)
+            return Results.Json(new
+            {
+                error = "owner_discord_user_unlinked",
+                message = "The bot's owner has no linked Discord user, so a channel only they can read cannot be made.",
+            }, statusCode: StatusCodes.Status409Conflict);
+
+        try
+        {
+            return Results.Ok(await setUp(alerts, ownerDiscordId));
+        }
+        catch (DiscordOutageAlertsConflictException ex)
+        {
+            return Results.Json(new { error = "outage_alerts_channel_conflict", message = ex.Message },
+                statusCode: StatusCodes.Status409Conflict);
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = "invalid_outage_alerts_request", message = ex.Message });
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return Results.NotFound(new { error = "discord_guild_not_found", message = ex.Message });
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Results.Json(new { error = "outage_alerts_forbidden", message = ex.Message },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+        catch (DiscordRestException ex)
+        {
+            return Results.Json(new { error = "outage_alerts_rejected", message = ex.Message },
+                statusCode: (int)ex.StatusCode);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Json(new { error = "outage_alerts_unavailable", message = ex.Message },
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
     internal static async Task<IResult> RetractAnnouncementAsync(
         Guid id,
         string messageId,

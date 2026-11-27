@@ -251,6 +251,36 @@ public sealed class DiscordRestTransport : IDisposable
                 ?? throw new InvalidOperationException("Discord webhook response has no token"));
     }
 
+    /// <summary>A channel's webhooks: id, name and the user that made each. Their tokens are never read.</summary>
+    public async Task<IReadOnlyList<(string Id, string? Name, string? CreatorId)>> ListChannelWebhooksAsync(
+        string botToken, string channelId, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Get, $"channels/{channelId}/webhooks", botToken);
+        using var response = await http.SendAsync(request, ct);
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode) throw DiscordRestException.From(response, raw);
+        using var document = JsonDocument.Parse(raw);
+        return document.RootElement.EnumerateArray()
+            .Select(item => (
+                item.GetProperty("id").GetString() ?? "",
+                item.TryGetProperty("name", out var name) ? name.GetString() : null,
+                item.TryGetProperty("user", out var user) && user.TryGetProperty("id", out var userId)
+                    ? userId.GetString()
+                    : null))
+            .Where(item => item.Item1.Length > 0)
+            .ToArray();
+    }
+
+    public async Task DeleteWebhookAsync(string botToken, string webhookId, string auditReason, CancellationToken ct = default)
+    {
+        using var request = Authorized(HttpMethod.Delete, $"webhooks/{webhookId}", botToken);
+        request.Headers.TryAddWithoutValidation("X-Audit-Log-Reason", Uri.EscapeDataString(auditReason));
+        using var response = await http.SendAsync(request, ct);
+        if (response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.NotFound) return;
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        throw DiscordRestException.From(response, raw);
+    }
+
     public async Task<IReadOnlyList<DiscordManagedRole>> ListGuildRolesAsync(
         string botToken, string guildId, CancellationToken ct = default)
     {

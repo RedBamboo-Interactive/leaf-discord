@@ -557,6 +557,22 @@ public sealed class DiscordBotService(
         return await runtime.CreateGuildTextChannelAsync(guildId, request, ct);
     }
 
+    /// <summary>Outage alerts: a private #leaf-alerts and its webhook, handed to the kernel (see the runtime's).</summary>
+    public async Task<DiscordOutageAlertsResult> SetUpOutageAlertsAsync(
+        Guid botId,
+        string guildId,
+        string ownerDiscordUserId,
+        IOutageAlerts alerts,
+        CancellationToken ct = default)
+    {
+        var config = await configurations.GetAsync(botId, ct)
+            ?? throw new KeyNotFoundException("Discord bot configuration was not found.");
+        var runtime = runtimes.TryGetValue(config.EntityId, out var current)
+            ? current
+            : throw new InvalidOperationException("Discord bot is not running.");
+        return await runtime.SetUpOutageAlertsAsync(guildId, ownerDiscordUserId, alerts, ct);
+    }
+
     public async Task<DiscordGuildChannelCreateResult> CreateGuildCategoryAsync(
         Guid botId,
         string guildId,
@@ -1238,6 +1254,90 @@ internal sealed class DiscordBotRuntime(
                 "Leaf owner requested this channel creation through Nova",
                 ct);
             return ProjectCreatedTextChannel(guild, response);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Outage alerts (2026-11-27): a #leaf-alerts private to the owner and the bot (server administrators can see
+    /// it: Discord lets them past channel overwrites; an existing one is reused only if it has exactly those overwrites), a webhook there, and its URL handed straight to the kernel's
+    /// protected store through <see cref="IOutageAlerts"/>. The URL is never returned or logged. The bot's
+    /// earlier alert webhooks in that channel are deleted once the new one is stored, so a repeat replaces.
+    /// </summary>
+    public async Task<DiscordOutageAlertsResult> SetUpOutageAlertsAsync(
+        string guildId,
+        string ownerDiscordUserId,
+        IOutageAlerts alerts,
+        CancellationToken ct = default)
+    {
+        if (!ulong.TryParse(guildId, out var parsedGuildId) || parsedGuildId == 0)
+            throw new ArgumentException("Discord guild ID must be a snowflake.");
+        if (!ulong.TryParse(ownerDiscordUserId, out var ownerId) || ownerId == 0)
+            throw new ArgumentException("The owner's Discord user ID must be a snowflake.");
+        var activeClient = client;
+        if (activeClient is null || activeClient.ConnectionState != ConnectionState.Connected)
+            throw new InvalidOperationException("Discord bridge is not connected.");
+        var guild = activeClient.GetGuild(parsedGuildId)
+            ?? throw new KeyNotFoundException("Discord guild was not found for this bot.");
+        var botId = activeClient.CurrentUser.Id;
+        var permissions = guild.CurrentUser.GuildPermissions;
+        if (!permissions.ManageChannels || !permissions.ManageWebhooks || !permissions.ViewChannel
+            || !permissions.SendMessages || !permissions.ReadMessageHistory)
+            throw new UnauthorizedAccessException(
+                "The Discord bot needs Manage Channels, Manage Webhooks, View Channel, Send Messages and Read Message History in that server.");
+
+        var config = await GetConfigAsync(ct);
+        var botToken = config.BotToken
+            ?? throw new InvalidOperationException("Discord bot token is unavailable.");
+        var gate = channelCreateGates.GetOrAdd($"outage-alerts:{config.ApplicationId}:{guildId}", _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var existing = guild.TextChannels
+                .Where(channel => string.Equals(channel.Name, DiscordOutageAlerts.ChannelName, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (existing.Length > 1)
+                throw new DiscordOutageAlertsConflictException(
+                    $"There are {existing.Length} #{DiscordOutageAlerts.ChannelName} channels; keep one and try again.");
+            string channelId, channelName;
+            var created = existing.Length == 0;
+            if (existing is [var reuse])
+            {
+                var overwrites = reuse.PermissionOverwrites.Select(item => new DiscordOverwrite(
+                    item.TargetId, item.TargetType == PermissionTarget.Role,
+                    item.Permissions.AllowValue, item.Permissions.DenyValue));
+                if (!DiscordOutageAlerts.IsPrivate(overwrites, parsedGuildId, ownerId, botId))
+                    throw new DiscordOutageAlertsConflictException(
+                        $"#{reuse.Name} exists without the overwrites outage alerts need (hidden from everyone, readable by you, writable by the bot); fix or remove it and try again.");
+                (channelId, channelName) = (reuse.Id.ToString(), reuse.Name);
+            }
+            else
+            {
+                var response = await rest.CreateGuildChannelAsync(botToken, guildId,
+                    DiscordOutageAlerts.ChannelPayload(guildId, ownerDiscordUserId, botId.ToString()),
+                    DiscordOutageAlerts.AuditReason, ct);
+                channelId = response["id"]?.GetValue<string>()
+                    ?? throw new InvalidOperationException("Discord channel creation response has no id.");
+                channelName = response["name"]?.GetValue<string>() ?? DiscordOutageAlerts.ChannelName;
+            }
+
+            var earlier = (await rest.ListChannelWebhooksAsync(botToken, channelId, ct))
+                .Where(hook => hook.Name == DiscordOutageAlerts.WebhookName && hook.CreatorId == botId.ToString())
+                .Select(hook => hook.Id)
+                .ToArray();
+            var webhook = await rest.CreateWebhookAsync(botToken, channelId, DiscordOutageAlerts.WebhookName, null, ct);
+            var configured = await alerts.ConfigureDiscordWebhookAsync(
+                DiscordOutageAlerts.WebhookUrl(webhook.Id, webhook.Token), ct);
+            foreach (var id in earlier)
+                await rest.DeleteWebhookAsync(botToken, id, DiscordOutageAlerts.AuditReason, ct);
+            logger.LogInformation(
+                "Outage alerts set up in guild {GuildId} channel {ChannelId} (created {Created}, scheduled {Scheduled})",
+                guildId, channelId, created, configured.Scheduled);
+            return new DiscordOutageAlertsResult(guildId, channelId, channelName, created,
+                configured.Scheduled, configured.Problem, earlier.Length);
         }
         finally
         {
