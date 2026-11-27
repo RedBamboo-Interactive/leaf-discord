@@ -22,19 +22,9 @@ public sealed partial class DiscordConversationCoordinator
     {
         var store = OutreachApprovals
             ?? throw new InvalidOperationException("Discord outreach approval storage is unavailable.");
-        if (request.OutputAssets?.Any(asset => asset is null
-            || string.IsNullOrWhiteSpace(asset.AssetId) || asset.Description is null) == true)
-            throw new ArgumentException("Discord attachments need an Asset ID and description.");
-        var assets = (request.OutputAssets ?? [])
-            .Select(asset => new ExternalConversationOutputAsset(asset.AssetId, asset.Description)).ToArray();
-        DiscordBotRuntime.ValidateExistingBindingMessage(
-            request.Content, request.IdempotencyKey, request.DeliveryContent, assets);
+        var prepared = PreparePrivateOutreach(request);
         request = request with { OutputAssets = request.OutputAssets ?? [] };
         var key = request.IdempotencyKey.Trim();
-        var prepared = PrepareOutreach(request.Content.Trim(), request.DeliveryContent, assets);
-        if (string.IsNullOrWhiteSpace(prepared.Content)
-            || (string.IsNullOrWhiteSpace(prepared.DeliveryContent) && prepared.OutputAssets.Count == 0))
-            throw new ArgumentException("Discord outreach needs text or an attachment after egress checks.");
         var messageUid = OutreachMessageUid(binding, key);
 
         // Run Sentinel off the binding gate. Incoming turns, typing and outbound reconciliation
@@ -47,19 +37,7 @@ public sealed partial class DiscordConversationCoordinator
             if (recorded is not null && JsonRead.String(recorded, "outcome") == "delivered")
                 review = recorded;
             else
-            {
-                try
-                {
-                    review = await ReviewOutgoingOrThrowAsync(
-                        await OutgoingContextAsync(binding, ct), prepared.DeliveryContent,
-                        prepared.OutputAssets, prepared.HiddenCharacters,
-                        $"outreach:{binding.BindingId}:{key}", ct);
-                }
-                catch (DiscordSentinelRefusedException ex)
-                {
-                    review = ex.Review;
-                }
-            }
+                review = await ReviewPrivateOutreachAsync(binding, prepared, key, ct);
         }
 
         var gate = gates.GetOrAdd(binding.BindingId, _ => new SemaphoreSlim(1, 1));
@@ -68,7 +46,7 @@ public sealed partial class DiscordConversationCoordinator
         {
             var existing = await store.FindByKeyAsync(binding.EntityId, key, ct);
             var draft = existing?.Draft;
-            if (draft is not null && (draft.OriginEntityId != origin.Id
+            if (draft is not null && (draft.OwnerTurn is not null || draft.OriginEntityId != origin.Id
                 || draft.Caller != caller
                 || JsonSerializer.Serialize(draft.Request) != JsonSerializer.Serialize(request)))
                 throw new DiscordOutreachConflictException("idempotency_key_conflict",
@@ -138,7 +116,14 @@ public sealed partial class DiscordConversationCoordinator
             if (current is null || !draft.Matches(current))
                 throw OutreachStale();
 
-            await ValidatePrivateTargetAsync(current, ct);
+            if (draft.OwnerTurn is { } proof)
+            {
+                await DiscordOwnerTurnPolicy.ValidateOriginAsync(origin, proof, botConfigurations.EntityStore, ct);
+                ValidateOwnerTurnBinding(current, draft.Generation);
+                await ValidateOwnerTurnTargetAsync(current, draft.Caller, draft.Prepared, readBytes: true, ct);
+            }
+            else
+                await ValidatePrivateTargetAsync(current, ct);
             ValidatePreparedDraft(draft);
             await CheckLeadBeforeOutreachAsync(current, draft, ct);
             var firstDecision = draft.ReleasedAt is null;
@@ -191,6 +176,7 @@ public sealed partial class DiscordConversationCoordinator
 
     internal static bool OwnsOutreach(LeafEntity origin, DiscordOutreachApproval draft)
         => DiscordOutreachApprovalStore.IsActivePrivateOrigin(origin.Data)
+           && (draft.OwnerTurn is not { } proof || DiscordOwnerTurnPolicy.MatchesDiscussion(origin, proof))
            && origin.Id == draft.OriginEntityId
            && JsonRead.String(origin.Data, "discussion_id") == draft.Caller.DiscussionId
            && string.Equals(JsonRead.String(origin.Data, "owner_id"), draft.Caller.BeneficiaryId,
@@ -291,6 +277,37 @@ public sealed partial class DiscordConversationCoordinator
              new ComputeContextReference("session", draft.SessionId),
              new ComputeContextReference("discussion", draft.Caller.DiscussionId!)], draft.MessageUid, ct);
         return await compute.SendAsync(inject, provenance, ct);
+    }
+
+    private DiscordPreparedOutreach PreparePrivateOutreach(DiscordBindingMessageRequest request)
+    {
+        if (request.OutputAssets?.Any(asset => asset is null
+            || string.IsNullOrWhiteSpace(asset.AssetId) || asset.Description is null) == true)
+            throw new ArgumentException("Discord attachments need an Asset ID and description.");
+        var assets = (request.OutputAssets ?? [])
+            .Select(asset => new ExternalConversationOutputAsset(asset.AssetId, asset.Description)).ToArray();
+        DiscordBotRuntime.ValidateExistingBindingMessage(
+            request.Content, request.IdempotencyKey, request.DeliveryContent, assets);
+        var prepared = PrepareOutreach(request.Content.Trim(), request.DeliveryContent, assets);
+        if (string.IsNullOrWhiteSpace(prepared.Content)
+            || (string.IsNullOrWhiteSpace(prepared.DeliveryContent) && prepared.OutputAssets.Count == 0))
+            throw new ArgumentException("Discord outreach needs text or an attachment after egress checks.");
+        return prepared;
+    }
+
+    private async Task<JsonObject> ReviewPrivateOutreachAsync(DiscordBinding binding,
+        DiscordPreparedOutreach prepared, string key, CancellationToken ct)
+    {
+        try
+        {
+            return await ReviewOutgoingOrThrowAsync(
+                await OutgoingContextAsync(binding, ct), prepared.DeliveryContent,
+                prepared.OutputAssets, prepared.HiddenCharacters, $"outreach:{binding.BindingId}:{key}", ct);
+        }
+        catch (DiscordSentinelRefusedException ex)
+        {
+            return ex.Review;
+        }
     }
 
     private static DiscordOutreachConflictException OutreachStale()

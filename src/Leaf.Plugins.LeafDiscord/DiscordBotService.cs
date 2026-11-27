@@ -5624,7 +5624,7 @@ internal sealed class DiscordBotRuntime(
 
     /// <summary>The allowlist for what a reply may attach: the image types and the video types the
     /// Sentinel reviews. The extension follows the type, never the Asset's name.</summary>
-    private static bool TryAttachmentExtension(string contentType, out string extension)
+    internal static bool TryAttachmentExtension(string contentType, out string extension)
     {
         extension = contentType.ToLowerInvariant() switch
         {

@@ -18,6 +18,7 @@ internal sealed record DiscordOutreachApproval(
     public DateTimeOffset? DiscardedAt { get; init; }
     public string? DiscardedBy { get; init; }
     public DiscordOutreachReceipt? Receipt { get; init; }
+    public DiscordOwnerTurnProof? OwnerTurn { get; init; }
     public bool NeedsApproval => JsonRead.String(Review, "outcome") != "delivered";
     public bool IsOpen => NeedsApproval && DiscardedAt is null && Receipt is null;
 
@@ -25,6 +26,7 @@ internal sealed record DiscordOutreachApproval(
         => binding.Enabled && BindingEntityId == binding.EntityId && BindingId == binding.BindingId
            && Generation == binding.Generation && SessionId == binding.SessionId
            && HandleId == binding.ConversationHandleId && ChannelId == binding.ConversationId
+           && (OwnerTurn is null || GuildId == binding.GuildId && ChannelKind == binding.Kind)
            && string.Equals(AgentRef, binding.AgentId, StringComparison.OrdinalIgnoreCase)
            && string.Equals(Caller.BeneficiaryId, binding.OwnerId, StringComparison.OrdinalIgnoreCase);
 }
@@ -119,6 +121,11 @@ public sealed class DiscordOutreachApprovalStore(IEntityStore entities, IDataPro
 
     internal async Task<DiscordStoredOutreach> SaveAsync(
         DiscordOutreachApproval draft, DiscordStoredOutreach? previous, CancellationToken ct)
+        => await TrySaveAsync(draft, previous, ct)
+            ?? throw new InvalidOperationException("The Discord outreach approval changed. Retry the same action.");
+
+    internal async Task<DiscordStoredOutreach?> TrySaveAsync(
+        DiscordOutreachApproval draft, DiscordStoredOutreach? previous, CancellationToken ct)
     {
         var slug = Slug(draft.BindingEntityId, draft.Request.IdempotencyKey);
         var data = new JsonObject
@@ -131,9 +138,7 @@ public sealed class DiscordOutreachApprovalStore(IEntityStore entities, IDataPro
         };
         var entity = await entities.CompareExchangeBySlugAsync(TypeSlug, slug, "Discord outreach approval",
             data, previous?.Entity.UpdatedAt, ct);
-        return entity is null
-            ? throw new InvalidOperationException("The Discord outreach approval changed. Retry the same action.")
-            : Read(entity);
+        return entity is null ? null : Read(entity);
     }
 
     private async Task<DiscordStoredOutreach?> ReadBySlugAsync(string slug, CancellationToken ct)

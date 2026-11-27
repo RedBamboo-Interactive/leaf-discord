@@ -3,14 +3,16 @@ using Leaf.Sdk;
 using Leaf.Sdk.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 
 namespace Leaf.Plugins.LeafDiscord;
 
 public static partial class DiscordEndpoints
 {
-    private static void MapOutreachApprovals(RouteGroupBuilder group)
+    internal static void MapOutreachApprovals(RouteGroupBuilder group)
     {
+        MapOwnerTurnDraftEndpoint(group);
         group.MapGet("/outreach/approvals", async (
             string discussionId, HttpContext http, IAuthContext auth,
             DiscordOutreachApprovalStore approvals, DiscordBindingStore bindings, CancellationToken ct) =>
@@ -69,6 +71,28 @@ public static partial class DiscordEndpoints
                 return OutreachEndpointFailure(ex);
             }
         }).WithSummary("Discards an open outreach draft from its originating private Nova discussion. Human owner or administrator only.");
+    }
+
+    internal static void MapOwnerTurnDraftEndpoint(RouteGroupBuilder group)
+    {
+        group.MapPost("/outreach/owner-turn-drafts", async (
+            DiscordOwnerTurnAdmission input, HttpContext http, IAuthContext auth,
+            DiscordConversationCoordinator conversations, CancellationToken ct) =>
+        {
+            if (!DiscordOwnerTurnPolicy.IsRedComputeService(http, auth))
+                return Forbidden("An authenticated loopback RedCompute service is required.");
+            try
+            {
+                var keys = http.Request.Headers["Idempotency-Key"];
+                return Results.Ok(await conversations.SubmitOwnerTurnDraftAsync(
+                    input, keys.Count == 1 ? keys[0] : null, ct));
+            }
+            catch (Exception ex) when (IsOutreachEndpointFailure(ex))
+            {
+                return OutreachEndpointFailure(ex);
+            }
+        }).WithMetadata(new RequestSizeLimitAttribute(128 * 1024))
+            .WithSummary("Version 1 draft-only service admission. Authenticated loopback RedCompute only. A Sentinel hold becomes an owner-reviewable private draft. This endpoint never releases or sends.");
     }
 
     internal static bool CanManageOutreachOrigin(HttpContext http, IAuthContext auth, LeafEntity? origin)

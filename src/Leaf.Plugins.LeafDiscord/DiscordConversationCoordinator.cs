@@ -62,7 +62,8 @@ public sealed partial class DiscordConversationCoordinator(
     IUntrustedContentReview? sentinel = null,
     TimeProvider? time = null,
     DiscordConversationLeadStore? leads = null,
-    DiscordOutreachApprovalStore? approvals = null) : IDisposable
+    DiscordOutreachApprovalStore? approvals = null,
+    IAssets? ownerTurnAssets = null) : IDisposable
 {
     private readonly TimeProvider clock = time ?? TimeProvider.System;
     private readonly DiscordConversationLeadStore leadStore =
