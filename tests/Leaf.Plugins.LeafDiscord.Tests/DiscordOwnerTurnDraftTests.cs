@@ -94,6 +94,46 @@ public sealed class DiscordOwnerTurnDraftTests
             await File.WriteAllTextAsync(artifact, json);
     }
 
+    [Fact]
+    public async Task Origin_check_requires_the_exact_private_scope_and_creates_no_draft()
+    {
+        var f = await Fixture.CreateAsync();
+        await using var host = await f.StartAsync();
+        var draft = f.Input();
+        var input = new DiscordOwnerTurnOrigin(draft.DiscussionId, draft.SessionId,
+            draft.OwnerId, draft.AgentId, draft.ThreadId);
+
+        using var accepted = await host.CheckOriginAsync(input);
+        Assert.Equal(HttpStatusCode.NoContent, accepted.StatusCode);
+        Assert.Empty(await accepted.Content.ReadAsStringAsync());
+
+        foreach (var changed in new[]
+        {
+            input with { DiscussionId = "different" },
+            input with { SessionId = "different" },
+            input with { OwnerId = Guid.NewGuid().ToString() },
+            input with { AgentId = Guid.NewGuid().ToString() },
+            input with { ThreadId = "different" },
+        })
+        {
+            using var rejected = await host.CheckOriginAsync(changed);
+            Assert.Equal(HttpStatusCode.NotFound, rejected.StatusCode);
+        }
+
+        foreach (var identity in new[] { "anonymous", "owner", "execution", "wrong-client", "nonloopback" })
+        {
+            using var rejected = await host.CheckOriginAsync(input, identity);
+            Assert.Equal(HttpStatusCode.Forbidden, rejected.StatusCode);
+        }
+
+        await f.PatchAsync(f.Origin, "confidential", true);
+        using var confidential = await host.CheckOriginAsync(input);
+        Assert.Equal(HttpStatusCode.NotFound, confidential.StatusCode);
+        Assert.Empty(await f.Store.ListOpenAsync(f.Origin.Id, default));
+        Assert.Empty(f.Sentinel.Requests);
+        await f.AssertNoTargetChangesAsync();
+    }
+
     [Theory]
     [InlineData("anonymous")]
     [InlineData("owner")]
@@ -318,6 +358,7 @@ public sealed class DiscordOwnerTurnDraftTests
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0));
             builder.Services.AddSingleton(bindings);
+            builder.Services.AddSingleton(configs);
             builder.Services.AddSingleton(Store);
             builder.Services.AddSingleton(coordinator);
             builder.Services.AddHttpContextAccessor();
@@ -382,6 +423,10 @@ public sealed class DiscordOwnerTurnDraftTests
 
         public Task<HttpResponseMessage> PostAsync(DiscordOwnerTurnAdmission input, string identity = "service", string? key = null)
             => SendAsync(Route, HttpMethod.Post, identity, JsonContent.Create(input, options: Wire), key ?? input.IntentId);
+
+        public Task<HttpResponseMessage> CheckOriginAsync(DiscordOwnerTurnOrigin input, string identity = "service")
+            => SendAsync("/api/apps/leaf-discord/outreach/owner-turn-origin", HttpMethod.Post,
+                identity, JsonContent.Create(input, options: Wire), null);
 
         public Task<HttpResponseMessage> GetListAsync(string identity) => SendAsync(ListRoute, HttpMethod.Get, identity, null, null);
 

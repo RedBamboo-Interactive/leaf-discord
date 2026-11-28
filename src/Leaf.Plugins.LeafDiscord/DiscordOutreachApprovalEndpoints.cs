@@ -75,6 +75,29 @@ public static partial class DiscordEndpoints
 
     internal static void MapOwnerTurnDraftEndpoint(RouteGroupBuilder group)
     {
+        group.MapPost("/outreach/owner-turn-origin", async (
+            DiscordOwnerTurnOrigin input, HttpContext http, IAuthContext auth,
+            DiscordOutreachApprovalStore approvals, DiscordBotConfigurationStore configs, CancellationToken ct) =>
+        {
+            if (!DiscordOwnerTurnPolicy.IsRedComputeService(http, auth))
+                return Forbidden("An authenticated loopback RedCompute service is required.");
+            if (!DiscordOwnerTurnPolicy.IsValidOrigin(input))
+                return Results.BadRequest();
+            var origin = await approvals.FindOriginAsync(input.DiscussionId, ct);
+            if (origin is null || JsonRead.String(origin.Data, "agent") is not { } agentRef)
+                return Results.NotFound();
+            try
+            {
+                await DiscordOwnerTurnPolicy.ValidateOriginAsync(origin, input, agentRef, configs.EntityStore, ct);
+                return Results.NoContent();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return Results.NotFound();
+            }
+        }).WithMetadata(new RequestSizeLimitAttribute(4096))
+            .WithSummary("Checks the exact private Nova origin for RedCompute draft attribution without returning discussion data.");
+
         group.MapPost("/outreach/owner-turn-drafts", async (
             DiscordOwnerTurnAdmission input, HttpContext http, IAuthContext auth,
             DiscordConversationCoordinator conversations, CancellationToken ct) =>

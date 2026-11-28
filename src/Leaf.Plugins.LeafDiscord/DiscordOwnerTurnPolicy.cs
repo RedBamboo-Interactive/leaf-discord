@@ -28,6 +28,10 @@ internal sealed record DiscordOwnerTurnAdmission(
 
 internal sealed record DiscordOwnerTurnResult(string Status, string? MessageUid = null);
 
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+internal sealed record DiscordOwnerTurnOrigin(
+    string DiscussionId, string SessionId, string OwnerId, string AgentId, string ThreadId);
+
 /// <summary>Only stored in the existing protected envelope. A new call ID can retry the same turn intent.</summary>
 internal sealed record DiscordOwnerTurnProof(
     string IntentId, string PayloadSha256, string DiscussionId, string SessionId, string OwnerId,
@@ -106,12 +110,18 @@ internal static partial class DiscordOwnerTurnPolicy
     // Nova canonically treats a missing confidential field as false on ordinary discussions.
     // The corresponding Compute mirror must still explicitly say false.
     internal static bool MatchesDiscussion(LeafEntity origin, DiscordOwnerTurnProof proof)
+        => MatchesDiscussion(origin, OriginOf(proof), proof.OriginAgentRef);
+
+    private static DiscordOwnerTurnOrigin OriginOf(DiscordOwnerTurnProof proof)
+        => new(proof.DiscussionId, proof.SessionId, proof.OwnerId, proof.AgentId, proof.ThreadId);
+
+    private static bool MatchesDiscussion(LeafEntity origin, DiscordOwnerTurnOrigin proof, string agentRef)
         => origin.TypeSlug == "discussion"
            && JsonRead.String(origin.Data, "app") == "nova"
            && JsonRead.String(origin.Data, "discussion_id") == proof.DiscussionId
            && JsonRead.String(origin.Data, "session_id") == proof.SessionId
            && SameId(JsonRead.String(origin.Data, "owner_id"), proof.OwnerId)
-           && SameId(JsonRead.String(origin.Data, "agent"), proof.OriginAgentRef)
+           && SameId(JsonRead.String(origin.Data, "agent"), agentRef)
            && JsonRead.String(origin.Data, "type") is "chat" or "live"
            && JsonRead.String(origin.Data, "status") is "idle" or "thinking" or "starting" or "stopped"
            && (origin.Data["source_app"] is null || JsonRead.String(origin.Data, "source_app") == "nova")
@@ -119,16 +129,25 @@ internal static partial class DiscordOwnerTurnPolicy
            && origin.Data["external_conversation_id"] is null
            && (origin.Data["confidential"] is null || IsFalse(origin.Data["confidential"]));
 
-    internal static async Task ValidateOriginAsync(
+    internal static Task ValidateOriginAsync(
         LeafEntity origin, DiscordOwnerTurnProof proof, IEntityStore entities, CancellationToken ct)
+        => ValidateOriginAsync(origin, OriginOf(proof), proof.OriginAgentRef, entities, ct);
+
+    internal static bool IsValidOrigin(DiscordOwnerTurnOrigin origin)
+        => Identifier(origin.DiscussionId, 100) && Identifier(origin.SessionId, 100)
+           && CanonicalGuid(origin.OwnerId) && CanonicalGuid(origin.AgentId)
+           && Identifier(origin.ThreadId, 256);
+
+    internal static async Task ValidateOriginAsync(
+        LeafEntity origin, DiscordOwnerTurnOrigin proof, string agentRef, IEntityStore entities, CancellationToken ct)
     {
-        if (!MatchesDiscussion(origin, proof))
+        if (!MatchesDiscussion(origin, proof, agentRef))
             throw InvalidOrigin();
         if (await entities.GetAsync(Guid.Parse(proof.OwnerId), ct) is not { TypeSlug: "user" } owner
             || JsonRead.String(owner.Data, "status") != "active")
             throw InvalidOrigin();
         var agents = new DiscordAgentResolver(entities);
-        var agent = await agents.ResolveAsync(proof.OriginAgentRef, ct);
+        var agent = await agents.ResolveAsync(agentRef, ct);
         if (agent is null || !SameId(agent.Id.ToString(), proof.AgentId)
             || JsonRead.String(agent.Data, "status") is "disabled" or "deleted" or "stopped"
             || IsFalse(agent.Data["enabled"]))
@@ -150,7 +169,7 @@ internal static partial class DiscordOwnerTurnPolicy
         if (bindings.Count != 0) throw InvalidOrigin();
     }
 
-    private static bool MatchesSession(JsonObject data, DiscordOwnerTurnProof proof)
+    private static bool MatchesSession(JsonObject data, DiscordOwnerTurnOrigin proof)
         => JsonRead.String(data, "app") == "redcompute" && JsonRead.String(data, "provider") == "codex"
            && JsonRead.String(data, "active_provider") is null or "codex"
            && JsonRead.String(data, "session_id") == proof.SessionId
